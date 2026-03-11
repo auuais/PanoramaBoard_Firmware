@@ -1,0 +1,274 @@
+--- main.c
++++ main_fixed.c
+@@ -264,93 +264,166 @@
+ // send_imu_command_ex — full version with optional response buffer out.
+ // rx_out: if non-NULL, receives (rx_size+1) bytes of raw response.
+ //         Caller must provide a buffer of at least (rx_size+1) bytes.
++
++#define IMU_CMD_FRAME_LEN     20u
++#define IMU_MAX_RESP_LEN      96u  /* enough for READ_REG response (max 82B) */
++
++static void imu_build_cmd_frame(uint8_t out[IMU_CMD_FRAME_LEN],
++                                const uint8_t *pkt,
++                                uint32_t pkt_len)
++{
++    memset(out, 0, IMU_CMD_FRAME_LEN);
++
++    if (pkt == NULL || pkt_len == 0u) {
++        return;
++    }
++
++    if (pkt_len > IMU_CMD_FRAME_LEN) {
++        pkt_len = IMU_CMD_FRAME_LEN;
++    }
++
++    memcpy(out, pkt, pkt_len);
++}
++
++/**
++ * @brief Read an IMU response/ACK packet that starts with 0x23 0x23.
++ *
++ * Notes:
++ * - We clock bytes until we find the response header 0x23 0x23 (discarding any leading garbage/echo).
++ * - Then we read the length byte and read exactly (len-3) remaining bytes.
++ * - out_max is a hard cap to avoid overruns.
++ *
++ * @return number of bytes copied into out, or RET_ERROR.
++ */
++static int imu_spi_read_resp_packet(uint8_t *out,
++                                    uint16_t out_max,
++                                    uint32_t timeout_ms)
++{
++    uint8_t tx = 0x00u;
++    uint8_t b  = 0x00u;
++    uint8_t prev = 0x00u;
++
++    if (out == NULL || out_max < 10u) {
++        return RET_ERROR;
++    }
++
++    uint32_t t0 = HAL_GetTick();
++
++    /* Sync to 0x23 0x23 */
++    while ((HAL_GetTick() - t0) < timeout_ms) {
++        if (HAL_SPI_TransmitReceive(&hspi2, &tx, &b, 1u, timeout_ms) != HAL_OK) {
++            return RET_ERROR;
++        }
++        if (prev == 0x23u && b == 0x23u) {
++            out[0] = 0x23u;
++            out[1] = 0x23u;
++            break;
++        }
++        prev = b;
++    }
++
++    if (out[0] != 0x23u || out[1] != 0x23u) {
++        return RET_ERROR;
++    }
++
++    /* Read length byte */
++    uint8_t len = 0u;
++    if (HAL_SPI_TransmitReceive(&hspi2, &tx, &len, 1u, timeout_ms) != HAL_OK) {
++        return RET_ERROR;
++    }
++    out[2] = len;
++
++    if (len < 10u || len > out_max) {
++        return RET_ERROR;
++    }
++
++    /* Read the remaining bytes (len includes header+len byte) */
++    uint16_t remaining = (uint16_t)(len - 3u);
++    for (uint16_t i = 0; i < remaining; i++) {
++        if (HAL_SPI_TransmitReceive(&hspi2, &tx, &out[3u + i], 1u, timeout_ms) != HAL_OK) {
++            return RET_ERROR;
++        }
++    }
++
++    return (int)len;
++}
++
+ int send_imu_command_ex(uint8_t *tx_packet, uint32_t tx_size,
+                         uint32_t rx_size, const char *cmd_name,
+                         uint8_t *rx_out)
+ {
+-    uint8_t rx_packet[70] = {0};
+-
+-    if (tx_packet == NULL || tx_size == 0) return RET_ERR_SPI;
+-
+-    Send_UART3_Debug("IMU: send %s\r\n", cmd_name);
+-
+-    // Clear DRDY flag BEFORE TX so we cannot miss a fast response.
++    /* rx_size is passed around as (expected_len - 1) in this project.
++       Keep compatibility by allowing (rx_size + 1) bytes max here. */
++    uint16_t rx_max = (uint16_t)((rx_size < (IMU_MAX_RESP_LEN - 1u)) ? (rx_size + 1u) : IMU_MAX_RESP_LEN);
++
++    uint8_t tx_frame[IMU_CMD_FRAME_LEN];
++    uint8_t tx_echo[IMU_CMD_FRAME_LEN];
++
++    uint8_t rx_packet[IMU_MAX_RESP_LEN];
++    memset(rx_packet, 0, sizeof(rx_packet));
++
++    imu_build_cmd_frame(tx_frame, tx_packet, tx_size);
++
+     drdy_interrupt = 0;
+ 
+-    // -----------------------------------------------------------------------
+-    // TX phase: use TransmitReceive so the STM32 SPI RX FIFO is drained
+-    // simultaneously during TX. The sensor echoes bytes on MISO while we
+-    // clock out the command — with plain HAL_SPI_Transmit those echo bytes
+-    // pile up in the RX FIFO and contaminate the next HAL_SPI_Receive call.
+-    // We discard the echo bytes (tx_echo buffer) and only use the response
+-    // read in the second NSS transaction after DRDY fires.
+-    // -----------------------------------------------------------------------
+-    uint8_t tx_echo[20] = {0};  // big enough for any command (max WRITE_REG = 16 bytes)
+-    if (tx_size > sizeof(tx_echo)) {
+-        Send_UART3_Debug("IMU: TX packet too large (%lu)\r\n", (unsigned long)tx_size);
+-        return RET_ERR_SPI;
+-    }
+-
++    /* ---- TX (always 20 bytes; datasheet requirement) ---- */
+     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+-    __NOP(); __NOP(); __NOP(); __NOP();
+-
+-    HAL_StatusTypeDef spi_status = HAL_SPI_TransmitReceive(&hspi2,
+-                                                           tx_packet,
+-                                                           tx_echo,
+-                                                           (uint16_t)tx_size,
+-                                                           HAL_MAX_DELAY);
+-//    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+-
+-    if (spi_status != HAL_OK) {
+-        Send_UART3_Debug("IMU: SPI TX fail (%s)\r\n", cmd_name);
+-        return RET_ERR_SPI;
+-    }
+-
+-    // Wait for DRDY
+-    const uint32_t timeout_ms = 500;
+-    uint32_t start_time = HAL_GetTick();
+-    while (!drdy_interrupt && ((HAL_GetTick() - start_time) < timeout_ms)) { }
+-
+-    if (!drdy_interrupt) {
+-        Send_UART3_Debug("IMU: DRDY timeout (%s)\r\n", cmd_name);
+-        return RET_ERR_TIMEOUT;
+-    }
+-
+-    // DRDY confirmed — read response in a new NSS transaction.
+-    // RX FIFO is clean (drained during TransmitReceive above) so first byte
+-    // read is the real first byte of the sensor response.
++    for (volatile int i = 0; i < 64; i++) { __NOP(); } /* CS setup time */
++
++    if (HAL_SPI_TransmitReceive(&hspi2, tx_frame, tx_echo, IMU_CMD_FRAME_LEN, IMU_SPI_TIMEOUT_MS) != HAL_OK) {
++        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
++        return RET_ERROR;
++    }
++
++    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
++    for (volatile int i = 0; i < 64; i++) { __NOP(); } /* CS hold time */
++
++    /* If caller expects no response/ACK, we're done. */
++    if (rx_size == 0u) {
++        return RET_OK;
++    }
++
++    /* ---- Response ready signaling ----
++       Per datasheet/Atmel ref:
++       - WRITE_REGISTER (0x12) returns a 10-byte ACK immediately (no DRDY pulse).
++       - READ_REGISTER and other commands may assert DRDY when the response is ready. */
++    uint8_t cmd_type = (tx_packet != NULL && tx_size > 3u) ? tx_packet[3] : 0x00u;
++    uint8_t wait_drdy = (cmd_type != 0x12u) ? 1u : 0u;
++
++    if (wait_drdy) {
++        uint32_t start = HAL_GetTick();
++        while (drdy_interrupt == 0) {
++            if ((HAL_GetTick() - start) > IMU_DRDY_TIMEOUT_MS) {
++                return RET_ERROR;
++            }
++        }
++    }
++
++    /* ---- RX (read a single ACK/response packet; auto-sync on 0x23 0x23) ---- */
+     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+-    __NOP(); __NOP(); __NOP(); __NOP();
+-
+-    uint32_t read_len = rx_size + 1u;
+-    if (read_len > sizeof(rx_packet)) read_len = sizeof(rx_packet);
+-
+-    HAL_StatusTypeDef rx_status = HAL_SPI_Receive(&hspi2, rx_packet,
+-                                                  (uint16_t)read_len,
+-                                                  HAL_MAX_DELAY);
+-//    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+-
+-    if (rx_status != HAL_OK) {
+-        Send_UART3_Debug("IMU: SPI RX fail (%s)\r\n", cmd_name);
+-        return RET_ERR_SPI;
+-    }
+-
+-    // Dump raw response bytes for debug
+-    {
++    for (volatile int i = 0; i < 64; i++) { __NOP(); }
++
++    int pkt_len = imu_spi_read_resp_packet(rx_packet, rx_max, IMU_SPI_TIMEOUT_MS);
++
++    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
++
++    if (pkt_len < 0) {
++        return RET_ERROR;
++    }
++
++    if (rx_out != NULL) {
++        memcpy(rx_out, rx_packet, (size_t)pkt_len);
++    }
++
++    /* Optional UART debug dump */
++    if (cmd_name != NULL) {
+         char dbg[200];
+-        int  off = 0;
+-        off += snprintf(dbg + off, sizeof(dbg) - (size_t)off,
+-                        "IMU: DRDY ok (%s) rx[%lu]:", cmd_name, (unsigned long)read_len);
+-        for (uint32_t i = 0; i < read_len && off < (int)(sizeof(dbg) - 4); i++) {
+-            off += snprintf(dbg + off, sizeof(dbg) - (size_t)off,
+-                            " %02X", rx_packet[i]);
++        int off = snprintf(dbg, sizeof(dbg), "\r\n[%s] RX (%dB): ", cmd_name, pkt_len);
++        for (int i = 0; i < pkt_len && off < (int)sizeof(dbg) - 4; i++) {
++            off += snprintf(dbg + off, sizeof(dbg) - (size_t)off, "%02X ", rx_packet[i]);
+         }
+         snprintf(dbg + off, sizeof(dbg) - (size_t)off, "\r\n");
+         Send_UART3_Debug(dbg);
+-    }
+-
+-    if (rx_out != NULL) {
+-        memcpy(rx_out, rx_packet, read_len);
+     }
+ 
+     return RET_OK;
+
+--- mcu_fsm.c
++++ mcu_fsm_fixed.c
+@@ -81,7 +81,7 @@
+ #define ORIENT_CLAMP_DEG   (90.0f)
+ 
+ // ---- IMU command packets (from your code) ----
+-static uint8_t who_am_i_packet[]        = {0x24,0x24,0x0C,0x11,0x00,0x01,0x00,0x00,0x00,0x12};
++static uint8_t who_am_i_packet[]        = {0x24,0x24,0x0C,0x11,0x00,0x01,0x00,0x00,0x00,0x12,0x0D,0x0A};
+ static uint8_t start_streaming_packet[] = {0x24,0x24,0x08,0x27,0x00,0x27,0x0D,0x0A};
+ 
+ 
+@@ -307,7 +307,7 @@
+                                     wai_rx);
+ 
+         if (r == 0) {
+-            uint8_t wai_val = wai_rx[13]; // +1 offset: 0x0D echo at [0] shifts response
++            uint8_t wai_val = wai_rx[6];  // 0x23 0x23 LEN TYPE PKTNUM(2) then data[0]
+             char msg[80];
+             snprintf(msg, sizeof(msg), "[IMU] WHO_AM_I=0x%02X (%s)\r\n", wai_val,
+                      (wai_val == 0xEAu) ? "IIM46234 OK" :
+@@ -360,7 +360,7 @@
+ 
+         int rs = send_imu_command(start_streaming_packet,
+                                   sizeof(start_streaming_packet),
+-                                  SIZE_STREAM_INIT_RESPONSE - 1,
++                                  0,
+                                   "START_STREAM");
+ 
+         if (rs == 0) {

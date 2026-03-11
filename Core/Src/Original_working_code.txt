@@ -1,0 +1,1563 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Complete IMU + Day Camera + IR Camera Control System
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdbool.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+// IMU Sensor Defines
+#define BYTE_HEADER_CMD    0x24
+#define BYTE_FOOTER_1      0x0D
+#define BYTE_FOOTER_2      0x0A
+#define CMD_TYPE_READ_REG  0x11
+#define CMD_TYPE_GET_VERSION 0x20
+#define CMD_TYPE_START_STREAMING 0x27
+#define CMD_TYPE_STOP_STREAMING 0x28
+#define CMD_TYPE_STREAM_DATA 0xAB
+#define SIZE_CMD_READ_REGS 11
+#define SIZE_CMD_COMMON    8
+#define SIZE_RESP_READ_REGS_BASE 16
+#define SIZE_RESP_GET_VERSION 20
+#define SIZE_STREAM_PACKET 45
+#define SIZE_STREAM_INIT_RESPONSE 46
+#define IIM46234_WHO_AM_I  0xEA
+
+// IR Camera Protocol Defines
+#define FRAME_SOM 0x6D
+#define FRAME_EOM 0xFE
+#define MSG_ID_CAMERA_CONTROL      0x02
+#define MSG_ID_ACK_CAMERA_CONTROL  0xA2
+#define MSG_ID_NACK_CAMERA_CONTROL 0xA3
+#define MSG_ID_GET_SENSOR_DATA     0x11
+#define MSG_ID_ENV_DATA_REPORT     0x70
+
+#define PARAM_ID_NUC_COMMAND       0x0101
+#define PARAM_ID_ROTATION          0x0202
+#define PARAM_ID_FRAMERATE         0x0303
+#define PARAM_ID_PALETTE           0x0909
+#define PARAM_ID_POLARITY          0x2829
+#define PARAM_ID_D_ZOOM            0x00A4
+#define PARAM_ID_TNR_ENABLE        0x1213
+#define PARAM_ID_POWER_RESET       0x1515
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c2;
+SPI_HandleTypeDef hspi2;
+
+UART_HandleTypeDef huart1;  // IR cameras
+UART_HandleTypeDef huart2;  // Day cameras
+UART_HandleTypeDef huart3;  // Debug output
+
+/* USER CODE BEGIN PV */
+// Global system variables
+uint32_t test_counter = 0;
+volatile int drdy_interrupt = 0;
+
+// Day camera (VISCA) variables
+uint8_t visca_rx_buffer[64];
+volatile uint8_t visca_rx_idx = 0;
+volatile uint8_t visca_rx_ready = 0;
+uint8_t visca_rx_byte;
+uint8_t current_day_camera = 0;  // Currently selected day camera (0-5)
+
+// IR camera variables
+volatile bool ir_camera_data_received_flag = false;
+volatile uint16_t ir_camera_received_bytes = 0;
+uint8_t ir_camera_rx_buffer[128];
+uint8_t current_ir_camera = 0;  // Currently selected IR camera (0-5)
+
+// Temperature sensor variables
+volatile bool temp_sensor_request_flag = false;
+volatile uint16_t temp_sensor_received_bytes = 0;
+uint8_t temp_sensor_rx_buffer[128];
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_I2C2_Init(void);
+static void MX_SPI2_Init(void);
+
+/* USER CODE BEGIN PFP */
+// System Functions
+void Enable_All_Camera_Power(void);
+void Send_UART3_Debug(const char *format, ...);
+
+// IMU Functions
+uint16_t calc_checksum(uint8_t *buff, uint32_t length);
+void hardware_reset(void);
+void send_imu_command(uint8_t *tx_packet, uint32_t tx_size, uint32_t rx_size, const char *cmd_name);
+float decode_float(const uint8_t *bytes, int is_big_endian);
+
+// Day Camera (VISCA) Functions
+void select_day_camera(uint8_t camera_num);
+void send_visca_command(uint8_t* cmd, uint8_t cmd_len, int parse_version);
+void wait_for_visca_ack_and_completion(uint32_t timeout_ms, int parse_version);
+void parse_and_print_version_response(uint8_t* data, uint8_t len);
+void test_day_camera_controls(uint8_t camera_num);
+
+// IR Camera Functions
+void select_ir_camera(uint8_t camera_num);
+void Send_IR_Camera_Command(uint8_t message_id, uint8_t *params, uint32_t param_size);
+void Process_IR_Camera_Received_Data(uint8_t* data, uint16_t length);
+void Translate_And_Send_IR_Camera_Command(uint16_t param_id, uint16_t value);
+void Initialize_IR_Camera(uint8_t camera_num);
+bool Validate_IR_Parameter(uint16_t param_id, uint16_t value);
+uint8_t ComputeChecksum(uint8_t* message_buffer, uint32_t length);
+
+// Temperature sensor
+void Read_HDC3022_Sensor(float* temp, float* hum);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+// ===================== SYSTEM FUNCTIONS =====================
+void Enable_All_Camera_Power(void) {
+    // Port C GPIO outputs (SW_EN signals)
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);   // +12V_SW_EN
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_SET);   // +12V_SW_EN
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11, GPIO_PIN_SET);  // +12V_SW_EN
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_12, GPIO_PIN_SET);  // +12V_SW_EN
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);  // +12V_SW_EN
+
+    // Port A GPIO outputs (SW_EN signals)
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);   // +4V_SW_EN
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET);  // +4V_SW_EN
+
+    // Port D GPIO outputs (SW_EN signals)
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_0, GPIO_PIN_SET);   // +4V_SW_EN
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_1, GPIO_PIN_SET);   // +4V_SW_EN
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_3, GPIO_PIN_SET);   // +4V_SW_EN
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_4, GPIO_PIN_SET);   // +4V_SW_EN
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_5, GPIO_PIN_SET);   // +4V_SW_EN
+}
+
+void Send_UART3_Debug(const char *format, ...) {
+    char buffer[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    HAL_UART_Transmit(&huart3, (uint8_t *)buffer, strlen(buffer), HAL_MAX_DELAY);
+}
+
+
+
+
+// ===================== IMU SENSOR FUNCTIONS =====================
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    HAL_UART_Transmit(&huart3, (uint8_t *)"Callback called!\r\n", 18, 100);
+
+    if (GPIO_Pin == GPIO_PIN_9) {
+        drdy_interrupt = 1;
+        HAL_UART_Transmit(&huart3, (uint8_t *)"PB9 callback hit!\r\n", 19, 100);
+    } else {
+        char msg[30];
+        snprintf(msg, sizeof(msg), "Wrong pin: %d\r\n", GPIO_Pin);
+        HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), 100);
+    }
+}
+
+
+
+uint16_t calc_checksum(uint8_t *buff, uint32_t length) {
+    uint16_t sum = 0;
+    for (uint32_t i = 0; i < length; i++) sum += (uint16_t)buff[i];
+    return sum;
+}
+
+void hardware_reset(void) {
+    Send_UART3_Debug("Resetting IMU sensor...\r\n");
+    // PA0 is reset pin (keep low then high)
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
+    HAL_Delay(300);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
+    HAL_Delay(300);
+    Send_UART3_Debug("IMU sensor reset complete.\r\n");
+}
+
+float decode_float(const uint8_t *bytes, int is_big_endian) {
+    union {
+        float f;
+        uint32_t i;
+    } u;
+
+    if (is_big_endian) {
+        u.i = ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
+              ((uint32_t)bytes[2] << 8)  | (uint32_t)bytes[3];
+    } else {
+        u.i = ((uint32_t)bytes[3] << 24) | ((uint32_t)bytes[2] << 16) |
+              ((uint32_t)bytes[1] << 8)  | (uint32_t)bytes[0];
+    }
+    return u.f;
+}
+
+void send_imu_command(uint8_t *tx_packet, uint32_t tx_size, uint32_t rx_size, const char *cmd_name) {
+    uint8_t rx_packet[70] = {0};
+    uint8_t echo_byte = 0;
+
+    Send_UART3_Debug("Sending IMU %s command\r\n", cmd_name);
+
+    // PB12 is NSS pin
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+    HAL_Delay(10);
+    HAL_StatusTypeDef spi_status = HAL_SPI_Transmit(&hspi2, tx_packet, tx_size, HAL_MAX_DELAY);
+    if (spi_status != HAL_OK) {
+        Send_UART3_Debug("IMU SPI Transmit Failed!\r\n");
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+        return;
+    }
+
+    HAL_SPI_Receive(&hspi2, &echo_byte, 1, HAL_MAX_DELAY);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+
+    // Wait for DRDY interrupt
+    drdy_interrupt = 0;
+    uint32_t timeout = 500;
+    uint32_t start_time = HAL_GetTick();
+    while (!drdy_interrupt && (HAL_GetTick() - start_time < timeout)) {
+        HAL_Delay(1);
+    }
+
+    if (drdy_interrupt) {
+        Send_UART3_Debug("IMU DRDY received for %s\r\n", cmd_name);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+        HAL_Delay(10);
+        HAL_SPI_Receive(&hspi2, rx_packet, rx_size + 1, HAL_MAX_DELAY);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+
+        uint8_t *actual_packet = rx_packet + 1;
+        if (actual_packet[3] == CMD_TYPE_READ_REG && actual_packet[12] == IIM46234_WHO_AM_I) {
+            Send_UART3_Debug("IMU IIM46234 sensor detected\r\n");
+        }
+    } else {
+        Send_UART3_Debug("IMU DRDY timeout for %s\r\n", cmd_name);
+    }
+}
+
+// ===================== DAY CAMERA (VISCA) FUNCTIONS =====================
+void select_day_camera(uint8_t camera_num) {
+    if (camera_num > 5) camera_num = 5;
+    current_day_camera = camera_num;
+
+    // Set day camera multiplexer control pins (A=PC3, B=PB1, C=PB2)
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, (camera_num & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);  // A
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, (camera_num & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);  // B
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, (camera_num & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);  // C
+
+    HAL_Delay(10);
+    Send_UART3_Debug("Selected day camera %d\r\n", camera_num);
+}
+
+void parse_and_print_version_response(uint8_t* data, uint8_t len) {
+    if (len < 10) {
+        Send_UART3_Debug("Day camera incomplete version response\r\n");
+        return;
+    }
+    uint8_t address = (data[0] & 0x0F);
+    uint16_t model_code = (data[2] << 8) | data[3];
+    uint8_t fw_major = data[4];
+    uint8_t fw_minor = data[5];
+
+    Send_UART3_Debug("Day Camera %d - Model: 0x%04X, FW: %d.%03d\r\n",
+                     current_day_camera, model_code, fw_major, fw_minor);
+}
+
+void wait_for_visca_ack_and_completion(uint32_t timeout_ms, int parse_version) {
+    uint8_t got_ack = 0, got_completion = 0;
+    uint32_t start = HAL_GetTick();
+    while ((HAL_GetTick() - start) < timeout_ms && !(got_ack && got_completion)) {
+        if (visca_rx_ready) {
+            if (visca_rx_idx >= 3 && visca_rx_buffer[0] == 0x90 && visca_rx_buffer[1] == 0x41) {
+                Send_UART3_Debug("Day Camera %d: ACK received\r\n", current_day_camera);
+                got_ack = 1;
+            } else if (visca_rx_idx >= 3 && visca_rx_buffer[0] == 0x90 && visca_rx_buffer[1] == 0x50) {
+                Send_UART3_Debug("Day Camera %d: Completion received\r\n", current_day_camera);
+                got_completion = 1;
+                if (parse_version)
+                    parse_and_print_version_response(visca_rx_buffer, visca_rx_idx);
+            }
+            visca_rx_ready = 0;
+            visca_rx_idx = 0;
+            memset(visca_rx_buffer, 0, sizeof(visca_rx_buffer));
+        }
+    }
+    if (!got_ack && !got_completion) {
+        Send_UART3_Debug("Day Camera %d: No response\r\n", current_day_camera);
+    }
+}
+
+void send_visca_command(uint8_t* cmd, uint8_t cmd_len, int parse_version) {
+    visca_rx_idx = 0;
+    visca_rx_ready = 0;
+    memset(visca_rx_buffer, 0, sizeof(visca_rx_buffer));
+    HAL_UART_Receive_IT(&huart2, &visca_rx_byte, 1);
+    HAL_UART_Transmit(&huart2, cmd, cmd_len, 1000);
+    wait_for_visca_ack_and_completion(1000, parse_version);
+}
+
+void test_day_camera_controls(uint8_t camera_num) {
+    select_day_camera(camera_num);
+    HAL_Delay(100);
+
+    Send_UART3_Debug("Testing Day Camera %d controls...\r\n", camera_num);
+
+    // Version Inquiry
+    uint8_t visca_version_inquiry[] = {0x81, 0x09, 0x00, 0x02, 0xFF};
+    send_visca_command(visca_version_inquiry, sizeof(visca_version_inquiry), 1);
+    HAL_Delay(500);
+
+    // Test basic zoom
+//    Send_UART3_Debug("Day Camera %d: Setting zoom\r\n", camera_num);
+//    uint8_t zoom_cmd[] = {0x81, 0x01, 0x04, 0x46, 0x00, 0x00, 0x00, 0x1E, 0xFF};
+//    send_visca_command(zoom_cmd, sizeof(zoom_cmd), 0);
+//    HAL_Delay(500);
+}
+
+// ===================== IR CAMERA FUNCTIONS =====================
+void select_ir_camera(uint8_t camera_num) {
+    if (camera_num > 5) camera_num = 5;
+    current_ir_camera = camera_num;
+
+    // Set IR camera multiplexer control pins (A=PC0, B=PC1, C=PC2)
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, (camera_num & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);  // A
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, (camera_num & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);  // B
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, (camera_num & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);  // C
+
+    HAL_Delay(10);
+    Send_UART3_Debug("Selected IR camera %d\r\n", camera_num);
+}
+
+uint8_t ComputeChecksum(uint8_t* message_buffer, uint32_t length) {
+    uint8_t sum = 0;
+    for(uint32_t i = 0; i < length; i++) sum += message_buffer[i];
+    return (uint8_t)((~sum) + 1);
+}
+
+void Send_IR_Camera_Command(uint8_t message_id, uint8_t *params, uint32_t param_size) {
+    uint8_t command_buffer[32];
+    command_buffer[0] = 0x01;
+    command_buffer[1] = message_id;
+    command_buffer[2] = param_size;
+    if (param_size > 0 && params != NULL) memcpy(&command_buffer[3], params, param_size);
+    uint32_t body_length = 3 + param_size;
+    command_buffer[body_length] = ComputeChecksum(command_buffer, body_length);
+    HAL_UART_Transmit(&huart1, command_buffer, body_length + 1, 100);
+
+    Send_UART3_Debug("IR Camera %d CMD Sent: 0x%02X, PayloadLen: %lu\r\n", current_ir_camera, message_id, param_size);
+}
+
+bool Validate_IR_Parameter(uint16_t param_id, uint16_t value) {
+    switch(param_id) {
+        case PARAM_ID_NUC_COMMAND:   return value <= 2;
+        case PARAM_ID_ROTATION:      return value <= 3;
+        case PARAM_ID_FRAMERATE:     return value <= 8;
+        case PARAM_ID_PALETTE:       return value >= 1 && value <= 6;
+        case PARAM_ID_POLARITY:      return value <= 1;
+        case PARAM_ID_D_ZOOM:        return value <= 12;
+        case PARAM_ID_TNR_ENABLE:    return value <= 1;
+        case PARAM_ID_POWER_RESET:   return value <= 1;
+        default: return false;
+    }
+}
+
+void Translate_And_Send_IR_Camera_Command(uint16_t param_id, uint16_t value) {
+    uint8_t payload[4];
+    switch(param_id) {
+    case PARAM_ID_POLARITY:
+        if (value == 1) {
+            Send_IR_Camera_Command(0x29, NULL, 0);
+            Send_UART3_Debug("IR Camera %d: Set Polarity WHITE HOT\r\n", current_ir_camera);
+        } else {
+            Send_IR_Camera_Command(0x28, NULL, 0);
+            Send_UART3_Debug("IR Camera %d: Set Polarity BLACK HOT\r\n", current_ir_camera);
+        }
+        break;
+    case PARAM_ID_D_ZOOM:
+        payload[0] = 0x00;
+        payload[1] = (uint8_t)value;
+        Send_IR_Camera_Command(0xA4, payload, 2);
+        Send_UART3_Debug("IR Camera %d: Set Digital Zoom: %d\r\n", current_ir_camera, value);
+        break;
+    case PARAM_ID_PALETTE:
+        payload[0] = 0x00;
+        payload[1] = value;
+        Send_IR_Camera_Command(0x58, payload, 2);
+        Send_UART3_Debug("IR Camera %d: Set Palette: %d\r\n", current_ir_camera, value);
+        break;
+    default:
+        Send_UART3_Debug("IR Camera %d: Unknown Param ID 0x%04X\r\n", current_ir_camera, param_id);
+        break;
+    }
+}
+
+void Process_IR_Camera_Received_Data(uint8_t* data, uint16_t length) {
+    uint16_t current_pos = 0;
+    while (current_pos < length) {
+        if (data[current_pos] == 0x01) {
+            if (current_pos + 3 < length) {
+                uint8_t message_id = data[current_pos + 1];
+                uint8_t param_len = data[current_pos + 2];
+                uint32_t total_msg_len = 4 + param_len;
+                if (current_pos + total_msg_len <= length) {
+                    uint8_t* msg_ptr = &data[current_pos];
+                    if (msg_ptr[total_msg_len - 1] == ComputeChecksum(msg_ptr, total_msg_len - 1)) {
+                        if (message_id == 0x00) {
+                            Send_UART3_Debug("IR Camera %d Text: %.*s\r\n", current_ir_camera, param_len, (char*)&msg_ptr[3]);
+                        } else if (message_id == 0x02) {
+                            Send_UART3_Debug("IR Camera %d ACK received\r\n", current_ir_camera);
+                        }
+                        current_pos += total_msg_len; continue;
+                    }
+                }
+            }
+        }
+        current_pos++;
+    }
+}
+
+
+int IR_FactoryResetNV(void)
+{
+    uint8_t cmd[4];
+    cmd[0] = 0x01;
+    cmd[1] = 0xB3;
+    cmd[2] = 0x00;
+    cmd[3] = ComputeChecksum(cmd, 3);
+
+    // Arm RX cleanly
+    ir_camera_data_received_flag = false;
+    ir_camera_received_bytes = 0;
+    memset(ir_camera_rx_buffer, 0, sizeof ir_camera_rx_buffer);
+    HAL_UARTEx_ReceiveToIdle_IT(&huart1, ir_camera_rx_buffer, sizeof ir_camera_rx_buffer);
+
+    HAL_UART_Transmit(&huart1, cmd, sizeof(cmd), 200);
+
+    uint32_t t0 = HAL_GetTick();
+    while (HAL_GetTick() - t0 < 1000) {
+        if (!ir_camera_data_received_flag) continue;
+        ir_camera_data_received_flag = false;
+
+        for (uint16_t i = 0; i + 5 < ir_camera_received_bytes; i++) {
+            if (ir_camera_rx_buffer[i]     == 0x01 &&
+                ir_camera_rx_buffer[i + 1] == 0x02 &&   // ACK
+                ir_camera_rx_buffer[i + 3] == 0x00 &&
+                ir_camera_rx_buffer[i + 4] == 0xB3) {
+                return 0; // SUCCESS
+            }
+        }
+    }
+    return -1; // FAILED
+}
+
+
+int IR_DisableSuperFrame(void)
+{
+    uint8_t cmd[8];
+    uint16_t param_id = 0x0036;   // Super Frame Enable
+    uint16_t value    = 0x0000;   // Disable
+
+    cmd[0] = 0x01;
+    cmd[1] = 0xB4;                // Customer Setting Set
+    cmd[2] = 0x04;
+    cmd[3] = (uint8_t)(param_id >> 8);
+    cmd[4] = (uint8_t)(param_id & 0xFF);
+    cmd[5] = (uint8_t)(value >> 8);
+    cmd[6] = (uint8_t)(value & 0xFF);
+    cmd[7] = ComputeChecksum(cmd, 7);
+
+    // Arm RX
+    ir_camera_data_received_flag = false;
+    ir_camera_received_bytes = 0;
+    memset(ir_camera_rx_buffer, 0, sizeof ir_camera_rx_buffer);
+    HAL_UARTEx_ReceiveToIdle_IT(&huart1, ir_camera_rx_buffer, sizeof ir_camera_rx_buffer);
+
+    HAL_UART_Transmit(&huart1, cmd, sizeof(cmd), 200);
+
+    // Wait for ACK
+    uint32_t t0 = HAL_GetTick();
+    while (HAL_GetTick() - t0 < 500) {
+        if (!ir_camera_data_received_flag) continue;
+        ir_camera_data_received_flag = false;
+
+        for (uint16_t i = 0; i + 5 < ir_camera_received_bytes; i++) {
+            if (ir_camera_rx_buffer[i]     == 0x01 &&
+                ir_camera_rx_buffer[i + 1] == 0x02 &&  // ACK
+                ir_camera_rx_buffer[i + 3] == 0x00 &&
+                ir_camera_rx_buffer[i + 4] == 0xB4) {
+                return 0; // SUCCESS
+            }
+        }
+    }
+    return -1; // FAILED
+}
+
+
+
+//IR Init Helpers
+
+static void IR_ArmRx(void) {
+    ir_camera_data_received_flag = false;
+    ir_camera_received_bytes = 0;
+    memset(ir_camera_rx_buffer, 0, sizeof ir_camera_rx_buffer);
+    HAL_UARTEx_ReceiveToIdle_IT(&huart1, ir_camera_rx_buffer, sizeof ir_camera_rx_buffer);
+}
+
+static int IR_WaitPacket(uint32_t timeout_ms) {
+    uint32_t t0 = HAL_GetTick();
+    while (HAL_GetTick() - t0 < timeout_ms) {
+        if (ir_camera_data_received_flag) return 0;
+    }
+    return -1;
+}
+
+/* Parse packets of form:
+   [0]=0x01, [1]=msg_id, [2]=len, [3..3+len-1]=payload, [last]=checksum
+*/
+static int IR_FindPacket(uint8_t wanted_id, uint8_t wanted_len, uint16_t *out_payload_u16) {
+    uint16_t n = ir_camera_received_bytes;
+    for (uint16_t i = 0; i + 4u <= n; i++) {
+        if (ir_camera_rx_buffer[i] != 0x01) continue;
+
+        uint8_t id  = ir_camera_rx_buffer[i+1];
+        uint8_t len = ir_camera_rx_buffer[i+2];
+        uint16_t total = (uint16_t)(4u + len);
+        if (i + total > n) continue;
+
+        uint8_t *p = &ir_camera_rx_buffer[i];
+        if (p[total-1] != ComputeChecksum(p, total-1)) continue;
+
+        if (id == wanted_id && (wanted_len == 0xFF || len == wanted_len)) {
+            if (out_payload_u16 && len >= 2) {
+                *out_payload_u16 = ((uint16_t)p[3] << 8) | p[4]; // big-endian payload
+            }
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int IR_SetNV(uint16_t id, uint16_t val) {
+    uint8_t p[4] = { (uint8_t)(id>>8), (uint8_t)(id&0xFF), (uint8_t)(val>>8), (uint8_t)(val&0xFF) };
+
+    IR_ArmRx();
+    Send_IR_Camera_Command(0xB0, p, 4);
+
+    if (IR_WaitPacket(500) != 0) return -1;
+
+    // Accept either ACK(0x02) or specific ACK id if your camera uses another one
+    if (IR_FindPacket(0x02, 0xFF, NULL) == 0) return 0;
+
+    // If your camera responds differently, temporarily dump raw buffer:
+    Send_UART3_Debug("SetNV no ACK. RX bytes=%u\r\n", ir_camera_received_bytes);
+    return -1;
+}
+
+static int IR_GetNV(uint16_t id, uint16_t *out) {
+    uint8_t p[2] = { (uint8_t)(id>>8), (uint8_t)(id&0xFF) };
+
+    IR_ArmRx();
+    Send_IR_Camera_Command(0xB5, p, 2);
+
+    if (IR_WaitPacket(500) != 0) return -1;
+
+    // You assumed VALUE packet id=0x45, len=2.
+    // Keep that, but if it fails, print raw and adjust.
+    uint16_t v=0;
+    if (IR_FindPacket(0x45, 0x02, &v) == 0) { *out = v; return 0; }
+
+    Send_UART3_Debug("GetNV: VALUE not found. RX bytes=%u\r\n", ir_camera_received_bytes);
+    return -1;
+}
+
+static int IR_SetMux(uint16_t sel) {
+    uint8_t p[2] = { sel>>8, sel&0xFF };
+    Send_IR_Camera_Command(0xD7, p, 2);               // Digital Video Mux Select
+    // ACK to 0xD7 will arrive; no value to read back
+    return 0;
+}
+
+
+
+
+void Initialize_IR_Camera(uint8_t camera_num) {
+    select_ir_camera(camera_num);
+    HAL_Delay(100);
+
+    Send_UART3_Debug("Initializing IR Camera %d...\r\n", camera_num);
+
+    // Enable Verbose Mode
+    uint8_t verbose_params[] = {0x00, 0x01};
+    Send_IR_Camera_Command(0xFF, verbose_params, sizeof(verbose_params));
+    HAL_Delay(100);
+    if (ir_camera_data_received_flag) {
+        Process_IR_Camera_Received_Data(ir_camera_rx_buffer, ir_camera_received_bytes);
+        ir_camera_data_received_flag = false;
+    }
+
+    Send_UART3_Debug("\r\n--- STEP 2: Here Performing Handshake ---\r\n");
+    Send_IR_Camera_Command(0x07, NULL, 0);
+    HAL_Delay(100);
+
+    bool handshake_success = false;
+    if (ir_camera_data_received_flag) {
+        // Parse and validate the response
+        uint16_t current_pos = 0;
+        while (current_pos < ir_camera_received_bytes) {
+            if (ir_camera_rx_buffer[current_pos] == 0x01) {
+                if (current_pos + 3 < ir_camera_received_bytes) {
+                    uint8_t message_id = ir_camera_rx_buffer[current_pos + 1];
+                    uint8_t param_len = ir_camera_rx_buffer[current_pos + 2];
+                    uint32_t total_msg_len = 4 + param_len;
+
+                    if (current_pos + total_msg_len <= ir_camera_received_bytes) {
+                        uint8_t* msg_ptr = &ir_camera_rx_buffer[current_pos];
+                        // Validate checksum
+                        if (msg_ptr[total_msg_len - 1] == ComputeChecksum(msg_ptr, total_msg_len - 1)) {
+                            if (message_id == 0x02) { // ACK message
+                                handshake_success = true;
+                                Send_UART3_Debug("\r\n--- !!!!!!!!!!!!! Handshake successful - Valid ACK received ---\r\n");
+                                break;
+                            } else if (message_id == 0x00) { // Text message
+                                Send_UART3_Debug("Camera %d Text: %.*s\r\n", camera_num, param_len, (char*)&msg_ptr[3]);
+                                handshake_success = true; // Text response also indicates camera is responding
+                            }
+                        }
+                    }
+                }
+            }
+            current_pos++;
+        }
+        ir_camera_data_received_flag = false;
+    }
+
+    if (!handshake_success) {
+        Send_UART3_Debug("\r\n--- ERROR: Camera %d handshake failed - No valid response ---\r\n", camera_num);
+        return; // Exit if handshake failed
+    }
+
+    // Enable NTSC Analog Video
+//    uint8_t payload[] = {0x00, 0x04, 0x00, 0x01};
+//    Send_IR_Camera_Command(0xB0, payload, 4);
+//    HAL_Delay(100);
+//    if (ir_camera_data_received_flag) {
+//        Process_IR_Camera_Received_Data(ir_camera_rx_buffer, ir_camera_received_bytes);
+//        ir_camera_data_received_flag = false;
+//    }
+
+
+
+
+
+   IR_SetMux(9);
+   IR_SetNV(7, 9);
+   IR_SetNV(6,0);
+   IR_SetNV(14,1);
+
+
+    // --- Parallel 8-bit post-AGC on PDVO ---
+    IR_SetNV(4, 0);        // NV#4 RS-170 = disable
+    IR_SetNV(5, 1);        // NV#5 PDVO = enable
+
+
+
+
+
+
+
+    // Verify
+    uint16_t nv4=5,nv5=5,nv7=5,nv76=5;
+    IR_GetNV(4,&nv4); IR_GetNV(5,&nv5); IR_GetNV(7,&nv7); IR_GetNV(76,&nv76);
+    Send_UART3_Debug("Verify PDVO: NV4=%u NV5=%u NV7=%u NV76=%u\r\n", nv4,nv5,nv7,nv76);
+
+    // --- 30 fps ---
+    IR_SetNV(16,0);       // NV#16 Frame Rate = 1 => 30 Hz
+    uint16_t nv16=0; IR_GetNV(16,&nv16);
+    Send_UART3_Debug("Verify FrameRate: NV16=%u\r\n", nv16);
+
+//    IR_DisableSuperFrame();
+//
+//    int ret = IR_DisableSuperFrame();
+//
+//    if (ret == 0) {
+//        Send_UART3_Debug("✓ Super Frame DISABLED (ACK received)\r\n");
+//    } else {
+//        Send_UART3_Debug("✗ Super Frame disable FAILED (no ACK)\r\n");
+//    }
+
+
+
+//   if (camera_num == 0){
+//    // --- Genlock slave/input (LAST; requires external sync) ---
+//	IR_SetNV(76, 0);
+//	IR_SetNV(17, 1);       // NV#17 Genlock Direction = input
+//    IR_SetNV(18, 0);       // NV#18 Genlock Mode = slave
+//
+//   }
+//	else {
+		IR_SetNV(76, 0);
+		IR_SetNV(17, 1);       // NV#17 Genlock Direction = input 1
+		IR_SetNV(18, 0);       // NV#18 Genlock Mode = slave 0
+
+//	}
+	uint16_t nv17=5,nv18=5;
+    IR_GetNV(17,&nv17); IR_GetNV(18,&nv18);
+    Send_UART3_Debug("Verify Genlock: NV17=%u NV18=%u\r\n", nv17,nv18);
+
+
+
+
+    Send_UART3_Debug("IR Camera %d initialization complete\r\n", camera_num);
+}
+
+// Enhanced function to test IR camera responsiveness
+void Test_IR_Camera_Response(uint8_t camera_num) {
+    select_ir_camera(camera_num);
+    HAL_Delay(100);
+
+    Send_UART3_Debug("\r\n=== Testing IR Camera %d Responsiveness ===\r\n", camera_num);
+
+    // Clear flags
+    ir_camera_data_received_flag = false;
+    ir_camera_received_bytes = 0;
+
+    // Send handshake command
+    Send_UART3_Debug("Sending handshake to Camera %d...\r\n", camera_num);
+    Send_IR_Camera_Command(0x07, NULL, 0);
+
+    // Wait for response with timeout
+    uint32_t start_time = HAL_GetTick();
+    uint32_t timeout_ms = 1000; // 1 second timeout
+
+    while ((HAL_GetTick() - start_time) < timeout_ms) {
+        if (ir_camera_data_received_flag) {
+            Process_IR_Camera_Received_Data(ir_camera_rx_buffer, ir_camera_received_bytes);
+            Send_UART3_Debug("✓ Camera %d is RESPONDING\r\n", camera_num);
+            ir_camera_data_received_flag = false;
+            return;
+        }
+        HAL_Delay(10);
+    }
+
+    Send_UART3_Debug("✗ Camera %d is NOT RESPONDING (timeout)\r\n", camera_num);
+}
+
+void Read_HDC3022_Sensor(float* temp, float* hum) {
+    uint8_t sensor_data_buffer[6];
+    uint8_t trigger_cmd[] = {0x24, 0x00};
+    if (HAL_I2C_Master_Transmit(&hi2c2, (0x44 << 1), trigger_cmd, 2, 1000) != HAL_OK) {
+        Send_UART3_Debug("I2C Transmit Error\r\n");
+        *temp = -999.0f;
+        *hum = -999.0f;
+        return;
+    }
+    HAL_Delay(20);
+    if (HAL_I2C_Master_Receive(&hi2c2, (0x44 << 1), sensor_data_buffer, 6, 1000) != HAL_OK) {
+        Send_UART3_Debug("I2C Receive Error\r\n");
+        *temp = -999.0f;
+        *hum = -999.0f;
+        return;
+    }
+    uint16_t raw_temp = (sensor_data_buffer[0] << 8) | sensor_data_buffer[1];
+    uint16_t raw_hum = (sensor_data_buffer[3] << 8) | sensor_data_buffer[4];
+    *temp = 175.0f * ((float)raw_temp / 65535.0f) - 45.0f;
+    *hum = 100.0f * ((float)raw_hum / 65535.0f);
+}
+
+// ===================== INTERRUPT CALLBACKS =====================
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART2) {  // Day camera (VISCA)
+        if (visca_rx_idx < sizeof(visca_rx_buffer)) {
+            visca_rx_buffer[visca_rx_idx++] = visca_rx_byte;
+            if (visca_rx_byte == 0xFF) visca_rx_ready = 1;
+        }
+        HAL_UART_Receive_IT(&huart2, &visca_rx_byte, 1);
+    }
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+    if (huart->Instance == USART1) {  // IR camera
+        ir_camera_data_received_flag = true;
+        ir_camera_received_bytes = Size;
+        HAL_UARTEx_ReceiveToIdle_IT(&huart1, ir_camera_rx_buffer, 128);
+    } else if (huart->Instance == USART3) {  // Temperature sensor requests
+        temp_sensor_request_flag = true;
+        temp_sensor_received_bytes = Size;
+        HAL_UARTEx_ReceiveToIdle_IT(&huart3, temp_sensor_rx_buffer, 128);
+    }
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART1_UART_Init();
+  MX_USART2_UART_Init();
+  MX_USART3_UART_Init();
+  MX_I2C2_Init();
+  MX_SPI2_Init();
+  /* USER CODE BEGIN 2 */
+
+  // Enable all camera power switches
+  Enable_All_Camera_Power();
+  HAL_Delay(100);
+
+  // Send startup message
+
+  Send_UART3_Debug("\r\n=== Hello! This is the new program from Neucleo STLink ===\r\n");
+
+  Send_UART3_Debug("\r\n=== Complete IMU + Day + IR Camera System Started ===\r\n");
+  Send_UART3_Debug("System Clock: %lu Hz\r\n", HAL_RCC_GetHCLKFreq());
+
+  // Start UART interrupt reception
+  HAL_UART_Receive_IT(&huart2, &visca_rx_byte, 1);  // Day cameras
+  HAL_UARTEx_ReceiveToIdle_IT(&huart1, ir_camera_rx_buffer, 128);  // IR cameras
+  HAL_UARTEx_ReceiveToIdle_IT(&huart3, temp_sensor_rx_buffer, 128);  // Temp sensor
+
+  // Wait for cameras to boot
+  Send_UART3_Debug("Waiting for cameras to boot (5 seconds)...\r\n");
+  HAL_Delay(3000);
+
+  // Initialize IMU Sensor
+  Send_UART3_Debug("\r\n--- IMU Sensor Initialization ---\r\n");
+
+  uint8_t who_am_i_packet[] = {0x24, 0x24, 0x0C, 0x11, 0x00, 0x01, 0x00, 0x00, 0x00, 0x12, 0x0D};
+  uint8_t get_version_packet[] = {0x24, 0x24, 0x08, 0x20, 0x00, 0x20, 0x0D, 0x0A};
+  uint8_t start_streaming_packet[] = {0x24, 0x24, 0x08, 0x27, 0x00, 0x27, 0x0D, 0x0A};
+
+
+  hardware_reset();
+  HAL_Delay(100);
+
+  send_imu_command(who_am_i_packet, SIZE_CMD_READ_REGS, SIZE_RESP_READ_REGS_BASE + 1, "WHO_AM_I");
+
+  hardware_reset();
+  HAL_Delay(100);
+  send_imu_command(start_streaming_packet, SIZE_CMD_COMMON, SIZE_STREAM_INIT_RESPONSE, "START_STREAMING");
+
+
+  // Test all day cameras
+  Send_UART3_Debug("\r\n--- Day Camera System Test ---\r\n");
+  for (uint8_t cam = 0; cam < 6; cam++) {
+      test_day_camera_controls(cam);
+      HAL_Delay(1000);
+  }
+
+  // Initialize all IR cameras
+  Send_UART3_Debug("\r\n--- IR Camera System Initialization ---\r\n");
+  for (uint8_t cam = 0; cam < 6; cam++) {
+
+	  //Factory reset
+	  select_ir_camera(cam);
+	  IR_FactoryResetNV();
+	  HAL_Delay(1000);
+
+	  Initialize_IR_Camera(cam);
+      HAL_Delay(1000);
+  }
+
+  Send_UART3_Debug("\r\n--- System Ready - Entering Main Loop ---\r\n");
+
+
+  char msg[50];
+
+      char dump[256];
+          int offset;
+          uint8_t stream_packet[70] = {0};
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+
+
+	  drdy_interrupt = 0;
+	          uint32_t timeout = 1000;
+	          uint32_t start_time = HAL_GetTick();
+	          while (!drdy_interrupt && (HAL_GetTick() - start_time < timeout)) {
+	              // Wait for DRDY
+	          }
+
+	          if (drdy_interrupt) {
+	              strcpy(msg, "DRDY for streaming data...\r\n");
+	              HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+
+	              HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+	              HAL_Delay(10);
+	              HAL_SPI_Receive(&hspi2, stream_packet, 70, HAL_MAX_DELAY);
+	              HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+
+	              offset = 0;
+	              offset += snprintf(dump + offset, sizeof(dump) - offset, "Raw stream packet: ");
+	              for (uint32_t i = 0; i < 70; i++) {
+	                  offset += snprintf(dump + offset, sizeof(dump) - offset, "%02X ", stream_packet[i]);
+	              }
+	              offset += snprintf(dump + offset, sizeof(dump) - offset, "\r\n");
+	              HAL_UART_Transmit(&huart3, (uint8_t *)dump, strlen(dump), HAL_MAX_DELAY);
+
+	              uint8_t *actual_stream = stream_packet + 1;
+	              // Find the 0x0D 0x0A footer
+	              int packet_end = -1;
+	              for (uint32_t i = 0; i < 70 - 1; i++) {
+	                  if (actual_stream[i] == BYTE_FOOTER_1 && actual_stream[i+1] == BYTE_FOOTER_2) {
+	                      packet_end = i;
+	                      break;
+	                  }
+	              }
+
+	              if (packet_end == -1) {
+	                  strcpy(msg, "Footer 0x0D 0x0A not found!\r\n");
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+	                  continue;
+	              }
+
+	              offset = 0;
+	              offset += snprintf(dump + offset, sizeof(dump) - offset, "Actual stream packet (0-%d): ", packet_end);
+	              for (uint32_t i = 0; i <= packet_end; i++) {
+	                  offset += snprintf(dump + offset, sizeof(dump) - offset, "%02X ", actual_stream[i]);
+	              }
+	              offset += snprintf(dump + offset, sizeof(dump) - offset, "\r\n");
+	              HAL_UART_Transmit(&huart3, (uint8_t *)dump, strlen(dump), HAL_MAX_DELAY);
+
+	              if (packet_end < 2) {
+	                  strcpy(msg, "Packet too short for checksum!\r\n");
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+	                  continue;
+	              }
+
+	              uint16_t checksum_read = (actual_stream[packet_end-2] << 8) | actual_stream[packet_end-1];
+	              uint16_t checksum = calc_checksum(&actual_stream[3], packet_end-3-3+1);
+
+	              offset = 0;
+	              offset += snprintf(dump + offset, sizeof(dump) - offset, "Stream checksum bytes (3-%d): ", packet_end-3);
+	              for (uint32_t i = 3; i <= packet_end-3; i++) {
+	                  offset += snprintf(dump + offset, sizeof(dump) - offset, "%02X ", actual_stream[i]);
+	              }
+	              offset += snprintf(dump + offset, sizeof(dump) - offset, "\r\nCalculated: %d, Received: %d\r\n", checksum, checksum_read);
+	              HAL_UART_Transmit(&huart3, (uint8_t *)dump, strlen(dump), HAL_MAX_DELAY);
+
+	              if (checksum != checksum_read) {
+	                  offset = 0;
+	                  offset += snprintf(dump + offset, sizeof(dump) - offset, "Stream checksum error: received %d, calculated %d\r\n", checksum_read, checksum);
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)dump, strlen(dump), HAL_MAX_DELAY);
+	              } else {
+	                  strcpy(msg, "Starting decoding...\r\n");
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+
+	                  uint8_t sensor_status = actual_stream[4];
+	                  offset = 0;
+	                  offset += snprintf(dump + offset, sizeof(dump) - offset, "Sensor Status: 0x%02X\r\n", sensor_status);
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)dump, strlen(dump), HAL_MAX_DELAY);
+
+	                  uint8_t sample_counter = actual_stream[5];
+	                  offset = 0;
+	                  offset += snprintf(dump + offset, sizeof(dump) - offset, "Sample Counter: %d\r\n", sample_counter);
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)dump, strlen(dump), HAL_MAX_DELAY);
+
+	                  // Split timestamp into two 32-bit parts
+	                  uint32_t timestamp_high = ((uint32_t)actual_stream[6] << 24) | ((uint32_t)actual_stream[7] << 16) |
+	                                           ((uint32_t)actual_stream[8] << 8) | actual_stream[9];
+	                  uint32_t timestamp_low = ((uint32_t)actual_stream[10] << 24) | ((uint32_t)actual_stream[11] << 16) |
+	                                          ((uint32_t)actual_stream[12] << 8) | actual_stream[13];
+	                  offset = 0;
+	                  offset += snprintf(dump + offset, sizeof(dump) - offset, "Timestamp: %lu %lu us\r\n", timestamp_high, timestamp_low);
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)dump, strlen(dump), HAL_MAX_DELAY);
+
+	                  // Check bounds before accessing
+	                  if (packet_end < 41) {
+	                      strcpy(msg, "Packet too short for data decoding!\r\n");
+	                      HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+	                      continue;
+	                  }
+
+	                  float accel_x = 0, accel_y = 0, accel_z = 0;
+	                  float gyro_x = 0, gyro_y = 0, gyro_z = 0;
+	                  float temperature = 0;
+
+	                  int is_big_endian = 1; // Set based on your sensor data format
+
+	                  accel_x = decode_float(&actual_stream[14], is_big_endian);
+	                  accel_y = decode_float(&actual_stream[18], is_big_endian);
+	                  accel_z = decode_float(&actual_stream[22], is_big_endian);
+	                  gyro_x = decode_float(&actual_stream[26], is_big_endian);
+	                  gyro_y = decode_float(&actual_stream[30], is_big_endian);
+	                  gyro_z = decode_float(&actual_stream[34], is_big_endian);
+	                  temperature = decode_float(&actual_stream[38], is_big_endian);
+
+	                  strcpy(msg, "---------------------------------------------------------------\r\n");
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+
+	                  snprintf(dump, sizeof(dump), "Accel: X=%.5f, Y=%.5f, Z=%.5f\r\n", accel_x, accel_y, accel_z);
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)dump, strlen(dump), 100);
+
+	                  snprintf(dump, sizeof(dump), "Gyro: X=%.5f, Y=%.5f, Z=%.5f\r\n", gyro_x, gyro_y, gyro_z);
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)dump, strlen(dump), 100);
+
+	                  snprintf(dump, sizeof(dump), "Temp: %.2f C\r\n", temperature);
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)dump, strlen(dump), 100);
+
+	                  temperature = decode_float(&actual_stream[38], is_big_endian);
+	                                  snprintf(msg, sizeof(msg), "Temp after decode: %.5f\r\n", temperature);
+	                                  HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+
+	                  strcpy(msg, "---------------------------------------------------------------\r\n");
+	                  HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+	              }
+	          } else {
+	              strcpy(msg, "Stream DRDY timeout!\r\n");
+	              HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+	              // Don't break - continue trying to read streaming data
+
+
+	          }
+
+    // Main system operation loop
+    static uint32_t last_status_time = 0;
+    static uint32_t last_imu_read = 0;
+    static uint32_t last_camera_cycle = 0;
+
+    uint32_t current_time = HAL_GetTick();
+
+    // Handle IR camera data reception
+    if (ir_camera_data_received_flag) {
+        Process_IR_Camera_Received_Data(ir_camera_rx_buffer, ir_camera_received_bytes);
+        ir_camera_data_received_flag = false;
+    }
+
+    // Handle temperature sensor requests
+    if (temp_sensor_request_flag) {
+        Send_UART3_Debug("Temperature sensor request received\r\n");
+        float temp_c, hum_rh;
+        Read_HDC3022_Sensor(&temp_c, &hum_rh);
+        Send_UART3_Debug("Temperature: %.2f°C, Humidity: %.2f%%\r\n", temp_c, hum_rh);
+        temp_sensor_request_flag = false;
+    }
+
+    // Periodic status messages every 15 seconds
+    if (current_time - last_status_time > 15000) {
+        test_counter++;
+        Send_UART3_Debug("\r\n=== System Status #%lu ===\r\n", test_counter);
+        Send_UART3_Debug("Uptime: %lu seconds\r\n", current_time / 1000);
+        Send_UART3_Debug("Current Day Camera: %d\r\n", current_day_camera);
+        Send_UART3_Debug("Current IR Camera: %d\r\n", current_ir_camera);
+        Send_UART3_Debug("IMU DRDY Status: %s\r\n", drdy_interrupt ? "ACTIVE" : "IDLE");
+        last_status_time = current_time;
+    }
+
+    // Read IMU streaming data every 3 seconds
+    if (current_time - last_imu_read > 3000) {
+        if (drdy_interrupt) {
+            Send_UART3_Debug("IMU streaming data available\r\n");
+            drdy_interrupt = 0;  // Clear flag
+        }
+        last_imu_read = current_time;
+    }
+
+    // Cycle through cameras every 45 seconds for testing
+    if (current_time - last_camera_cycle > 45000) {
+        // Test next day camera
+        uint8_t next_day_camera = (current_day_camera + 1) % 6;
+        Send_UART3_Debug("\r\n--- Testing Day Camera %d ---\r\n", next_day_camera);
+        select_day_camera(next_day_camera);
+        uint8_t version_cmd[] = {0x81, 0x09, 0x00, 0x02, 0xFF};
+        send_visca_command(version_cmd, sizeof(version_cmd), 1);
+        HAL_Delay(500);
+
+        // Test next IR camera
+        uint8_t next_ir_camera = (current_ir_camera + 1) % 6;
+        Send_UART3_Debug("\r\n--- Testing IR Camera %d ---\r\n", next_ir_camera);
+        select_ir_camera(next_ir_camera);
+
+        // Test IR camera polarity
+        Translate_And_Send_IR_Camera_Command(PARAM_ID_POLARITY, 1);  // White hot
+        HAL_Delay(200);
+
+        last_camera_cycle = current_time;
+    }
+
+    // Small delay to prevent CPU overload
+    HAL_Delay(10);
+  }
+  /* USER CODE END 3 */
+}
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSIDiv = RCC_HSI_DIV1;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C2_Init(void)
+{
+
+  /* USER CODE BEGIN I2C2_Init 0 */
+
+  /* USER CODE END I2C2_Init 0 */
+
+  /* USER CODE BEGIN I2C2_Init 1 */
+
+  /* USER CODE END I2C2_Init 1 */
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.Timing = 0x00503D58;
+  hi2c2.Init.OwnAddress1 = 0;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C2_Init 2 */
+
+  /* USER CODE END I2C2_Init 2 */
+
+}
+
+/**
+  * @brief SPI2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI2_Init(void)
+{
+
+  /* USER CODE BEGIN SPI2_Init 0 */
+
+  /* USER CODE END SPI2_Init 0 */
+
+  /* USER CODE BEGIN SPI2_Init 1 */
+
+  /* USER CODE END SPI2_Init 1 */
+  /* SPI2 parameter configuration*/
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_MASTER;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi2.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 7;
+  hspi2.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi2.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI2_Init 2 */
+
+  /* USER CODE END SPI2_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 57600;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_0
+                          |GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_8
+                          |GPIO_PIN_9, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1|GPIO_PIN_2, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8|GPIO_PIN_15, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_4
+                          |GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : PC11 PC12 PC13 PC0
+                           PC1 PC2 PC3 PC8
+                           PC9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_11|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_0
+                          |GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_8
+                          |GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB1 PB2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PA8 PA15 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  // PB9 interrupt pin (DRDY)
+      GPIO_InitStruct.Pin = GPIO_PIN_9;
+      GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+      GPIO_InitStruct.Pull = GPIO_NOPULL;
+      HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+      // Enable EXTI4_15 interrupt for PB9
+      HAL_NVIC_SetPriority(EXTI4_15_IRQn, 0, 0);
+      HAL_NVIC_EnableIRQ(EXTI4_15_IRQn);
+
+
+      // PA0 reset pin (output)
+          GPIO_InitStruct.Pin = GPIO_PIN_0;
+          GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+          GPIO_InitStruct.Pull = GPIO_PULLUP;
+          GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+          HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+          // PB12 NSS pin (output)
+          GPIO_InitStruct.Pin = GPIO_PIN_12;
+          GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+          GPIO_InitStruct.Pull = GPIO_PULLUP;
+          GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+          HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+          // SPI2 pins (PB13, PB14, PB15)
+          GPIO_InitStruct.Pin = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
+          GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+          GPIO_InitStruct.Pull = GPIO_NOPULL;
+          GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+          GPIO_InitStruct.Alternate = GPIO_AF0_SPI2;
+          HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+
+  /*Configure GPIO pin : PC6 */
+  GPIO_InitStruct.Pin = GPIO_PIN_6;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+
+  /*Configure GPIO pins : PD0 PD1 PD3 PD4
+                           PD5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_4
+                          |GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PD6 */
+  GPIO_InitStruct.Pin = GPIO_PIN_6;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+/* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
