@@ -78,6 +78,23 @@ void Error_Handler(void);
 #define SIZE_STREAM_INIT_RESPONSE 46
 #define IIM46234_WHO_AM_I  0xEA
 
+/* IIM-4623x SPI timing model from datasheet 5.3.1.4 and ATMEL reference.
+ * NSS setup/hold are local MCU chip-select guard times.
+ * Twait/Tnext are protocol timings between transactions. */
+#define IMU_NSS_SETUP_US          1u
+#define IMU_NSS_HOLD_US           1u
+#define IMU_NSS_HIGH_US           7u
+#define IMU_CMD_TWAIT_US_NORMAL  50u
+#define IMU_CMD_TWAIT_US_START  600u
+#define IMU_CMD_TNEXT_US        300u
+#define IMU_CMD_RX_SLACK          6u
+#define IMU_RX_TOTAL             34u
+#define IMU_SIZE_RESP_ACK        10u
+
+int IMU_SPI_WriteSession(const uint8_t *tx, uint16_t len, uint32_t timeout_ms);
+int IMU_SPI_ReadSession(uint8_t *rx, uint16_t len, uint32_t timeout_ms);
+void IMU_SPI_ResetSession(void);
+
 
 #define FRAME_SOM 0x6D
 #define FRAME_EOM 0xFE

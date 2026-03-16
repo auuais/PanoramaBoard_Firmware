@@ -14,14 +14,26 @@
 #define BYTE_FOOTER_1      0x0Du
 #define BYTE_FOOTER_2      0x0Au
 #define CMD_STREAM_DATA    0xABu
+/* Sustain 1 kHz packet ingest on STM32G0 by running the float-heavy fusion
+ * path at a lower effective rate. Packet parsing and sample timestamps remain
+ * at full rate; only the Madgwick update is decimated. */
+#define IMU_FUSION_DECIM   8u
 
 /* -------------------------------------------------------------------------- */
 /* Private state                                                               */
 /* -------------------------------------------------------------------------- */
 
 static MadgwickFilter_t s_filter;
+static float s_packet_sample_freq = 1000.0f;
+static float s_accum_gx = 0.0f;
+static float s_accum_gy = 0.0f;
+static float s_accum_gz = 0.0f;
+static float s_accum_ax = 0.0f;
+static float s_accum_ay = 0.0f;
+static float s_accum_az = 0.0f;
+static uint8_t s_fusion_accum_count = 0u;
 
-/* Gyro bias in deg/s — subtracted from raw gyro before Madgwick update.
+/* Gyro bias in deg/s ??subtracted from raw gyro before Madgwick update.
  * Measured 2026-02-26 at ±250 dps FSR, board stationary.
  * Call IMU_Handler_SetGyroBias() to override at runtime.             */
 static float s_gyro_bias_x =  0.421587f;   /* deg/s */
@@ -51,8 +63,18 @@ static uint16_t calc_checksum(const uint8_t *buf, uint32_t len)
     return sum;
 }
 
+static float imu_get_fusion_sample_freq(float packet_sample_freq)
+{
+    if (packet_sample_freq <= 0.0f) return 1000.0f;
+    if (IMU_FUSION_DECIM <= 1u) return packet_sample_freq;
+
+    float fusion_freq = packet_sample_freq / (float)IMU_FUSION_DECIM;
+    if (fusion_freq < 1.0f) fusion_freq = packet_sample_freq;
+    return fusion_freq;
+}
+
 /**
- * @brief Core parser — operates on a buffer that starts at byte 0 of the
+ * @brief Core parser ??operates on a buffer that starts at byte 0 of the
  *        IIM-46234 stream packet (i.e. 0x23 0x23 ...), NO echo byte.
  *
  * Validates header, cmd type, footer, and checksum, then decodes all
@@ -83,7 +105,7 @@ static int decode_stream_pkt(const uint8_t *pkt, uint32_t pkt_len,
     /* ---- Footer at fixed position ------------------------------------ */
     /* The IIM-46234 stream packet is always exactly IMU_STREAM_PACKET_SIZE
        (46) bytes.  The footer 0x0D 0x0A is always at the last two bytes.
-       DO NOT search for it — sensor float data can contain 0x0D or 0x0A,
+       DO NOT search for it ??sensor float data can contain 0x0D or 0x0A,
        causing a false early match and an IMU_ERR_TOO_SHORT failure.      */
     const int packet_end = (int)IMU_STREAM_PACKET_SIZE - 2;  /* = 44 */
 
@@ -130,13 +152,35 @@ static int decode_stream_pkt(const uint8_t *pkt, uint32_t pkt_len,
     out->temperature = decode_float_be(&pkt[IMU_TEMP_OFFSET]);
 
     /* ---- Madgwick update --------------------------------------------- */
-    /* IIM-46234 gyro output is in deg/s — subtract bias, then convert to rad/s. */
+    /* The STM32G0 cannot sustain full 1 kHz stream service if we run the
+     * Madgwick step on every packet. Keep 1 kHz packet ingest, but fuse at a
+     * lower effective rate using a short average window. */
     const float DEG2RAD = 3.14159265358979f / 180.0f;
-    Madgwick_Update(&s_filter,
-                    (out->gyro_x - s_gyro_bias_x) * DEG2RAD,
-                    (out->gyro_y - s_gyro_bias_y) * DEG2RAD,
-                    (out->gyro_z - s_gyro_bias_z) * DEG2RAD,
-                    out->accel_x, out->accel_y, out->accel_z);
+    s_accum_gx += (out->gyro_x - s_gyro_bias_x) * DEG2RAD;
+    s_accum_gy += (out->gyro_y - s_gyro_bias_y) * DEG2RAD;
+    s_accum_gz += (out->gyro_z - s_gyro_bias_z) * DEG2RAD;
+    s_accum_ax += out->accel_x;
+    s_accum_ay += out->accel_y;
+    s_accum_az += out->accel_z;
+    s_fusion_accum_count++;
+
+    if (s_fusion_accum_count >= IMU_FUSION_DECIM) {
+        const float inv_count = 1.0f / (float)s_fusion_accum_count;
+        Madgwick_Update(&s_filter,
+                        s_accum_gx * inv_count,
+                        s_accum_gy * inv_count,
+                        s_accum_gz * inv_count,
+                        s_accum_ax * inv_count,
+                        s_accum_ay * inv_count,
+                        s_accum_az * inv_count);
+        s_accum_gx = 0.0f;
+        s_accum_gy = 0.0f;
+        s_accum_gz = 0.0f;
+        s_accum_ax = 0.0f;
+        s_accum_ay = 0.0f;
+        s_accum_az = 0.0f;
+        s_fusion_accum_count = 0u;
+    }
 
     Madgwick_GetQuaternion(&s_filter, &out->quaternion);
 
@@ -149,12 +193,21 @@ static int decode_stream_pkt(const uint8_t *pkt, uint32_t pkt_len,
 
 void IMU_Handler_Init(float sample_freq, float beta)
 {
-    Madgwick_Init(&s_filter, sample_freq, beta);
+    s_packet_sample_freq = sample_freq;
+    s_accum_gx = 0.0f;
+    s_accum_gy = 0.0f;
+    s_accum_gz = 0.0f;
+    s_accum_ax = 0.0f;
+    s_accum_ay = 0.0f;
+    s_accum_az = 0.0f;
+    s_fusion_accum_count = 0u;
+    Madgwick_Init(&s_filter, imu_get_fusion_sample_freq(sample_freq), beta);
 }
 
 void IMU_Handler_SetSampleFreq(float sample_freq)
 {
-    Madgwick_SetSampleFreq(&s_filter, sample_freq);
+    s_packet_sample_freq = sample_freq;
+    Madgwick_SetSampleFreq(&s_filter, imu_get_fusion_sample_freq(sample_freq));
 }
 
 void IMU_Handler_SetGyroBias(float bias_x_dps, float bias_y_dps, float bias_z_dps)
@@ -167,7 +220,7 @@ void IMU_Handler_SetGyroBias(float bias_x_dps, float bias_y_dps, float bias_z_dp
 /*
  * Use this in mcu_on_imu_drdy.
  * The buffer must start at byte 0 of the stream packet (0x23 0x23 ...),
- * with NO leading echo byte — exactly what HAL_SPI_Receive gives you when
+ * with NO leading echo byte ??exactly what HAL_SPI_Receive gives you when
  * you call it directly to read the stream data.
  */
 int IMU_Handler_ProcessStreamPacket(const uint8_t *stream_buf,
@@ -195,3 +248,7 @@ const MadgwickFilter_t *IMU_Handler_GetFilter(void)
 {
     return &s_filter;
 }
+
+
+
+

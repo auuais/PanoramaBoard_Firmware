@@ -297,17 +297,6 @@ static void spi2_flush(void)
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* IMU NSS timing constants (derived from ATMEL reference system.c):         */
-/* -------------------------------------------------------------------------- */
-#define IMU_NSS_SETUP_US     5u
-#define IMU_NSS_HOLD_US      5u
-#define IMU_NSS_HIGH_US    500u
-#define IMU_HEADER_SEARCH_MAX  48u
-#define IMU_POST_CMD_DELAY_MS  10u
-#define IMU_RX_TOTAL  34u
-#define IMU_SIZE_RESP_ACK       10u
-
 #ifndef SIZE_RESP_READ_REGS_BASE
 #define SIZE_RESP_READ_REGS_BASE  16u
 #endif
@@ -320,8 +309,11 @@ static inline int imu_drdy_is_idle(void)
     return (HAL_GPIO_ReadPin(IMU_DRDY_PORT, IMU_DRDY_PIN) == GPIO_PIN_SET);
 }
 
+static const uint8_t s_imu_spi_zeros[64] = {0};
+
 void IMU_Reset(void) {
     spi2_flush();
+    __HAL_SPI_DISABLE(&hspi2);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
     HAL_Delay(10);
@@ -381,6 +373,236 @@ static HAL_StatusTypeDef imu_rx_one(uint8_t *out)
     return HAL_SPI_TransmitReceive(&hspi2, &tx, out, 1, 10);
 }
 
+static int imu_spi_wait_sr_set(uint32_t mask, uint32_t timeout_ms)
+{
+    uint32_t t0 = HAL_GetTick();
+    while ((hspi2.Instance->SR & mask) != mask) {
+        if ((HAL_GetTick() - t0) >= timeout_ms) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int imu_spi_xfer_byte(uint8_t tx, uint8_t *rx, uint32_t timeout_ms)
+{
+    if (imu_spi_wait_sr_set(SPI_SR_TXE, timeout_ms) != 0) {
+        return -1;
+    }
+
+    *(__IO uint8_t *)&hspi2.Instance->DR = tx;
+
+    if (imu_spi_wait_sr_set(SPI_SR_RXNE, timeout_ms) != 0) {
+        return -2;
+    }
+
+    if (rx) {
+        *rx = *(__IO uint8_t *)&hspi2.Instance->DR;
+    } else {
+        volatile uint8_t discard = *(__IO uint8_t *)&hspi2.Instance->DR;
+        (void)discard;
+    }
+
+    return 0;
+}
+
+static void imu_spi_begin_transaction(void)
+{
+    IMU_SPI_ResetSession();
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+    __HAL_SPI_ENABLE(&hspi2);
+    delay_us(IMU_NSS_SETUP_US);
+}
+
+static void imu_spi_end_transaction(void)
+{
+    uint32_t t0 = HAL_GetTick();
+    while (hspi2.Instance->SR & SPI_SR_BSY) {
+        if ((HAL_GetTick() - t0) >= 10u) break;
+    }
+    delay_us(IMU_NSS_HOLD_US);
+    __HAL_SPI_DISABLE(&hspi2);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+    delay_us(IMU_NSS_HIGH_US);
+    IMU_SPI_ResetSession();
+}
+
+void IMU_SPI_ResetSession(void)
+{
+    spi2_flush();
+    __HAL_SPI_DISABLE(&hspi2);
+    __HAL_SPI_CLEAR_OVRFLAG(&hspi2);
+    hspi2.Instance->CR2 |= SPI_CR2_FRXTH;
+    spi2_flush();
+}
+
+int IMU_SPI_WriteSession(const uint8_t *tx, uint16_t len, uint32_t timeout_ms)
+{
+    if (tx == NULL || len == 0u) return -1;
+
+    imu_spi_begin_transaction();
+    for (uint16_t i = 0u; i < len; i++) {
+        if (imu_spi_xfer_byte(tx[i], NULL, timeout_ms) != 0) {
+            imu_spi_end_transaction();
+            return -1;
+        }
+    }
+    imu_spi_end_transaction();
+
+    return 0;
+}
+
+int IMU_SPI_ReadSession(uint8_t *rx, uint16_t len, uint32_t timeout_ms)
+{
+    if (rx == NULL || len == 0u) return -1;
+
+    imu_spi_begin_transaction();
+    for (uint16_t i = 0u; i < len; i++) {
+        if (imu_spi_xfer_byte(0x00u, &rx[i], timeout_ms) != 0) {
+            imu_spi_end_transaction();
+            return -1;
+        }
+    }
+    imu_spi_end_transaction();
+
+    return 0;
+}
+
+static uint8_t *imu_find_complete_packet(uint8_t *buf, uint32_t buf_len,
+                                         uint32_t pkt_len, uint32_t *offset_out)
+{
+    if (buf == NULL || pkt_len < 4u || buf_len < pkt_len) {
+        return NULL;
+    }
+
+    for (uint32_t i = 0u; i + pkt_len <= buf_len; i++) {
+        if (buf[i] == 0x23u && buf[i + 1u] == 0x23u &&
+            buf[i + pkt_len - 2u] == 0x0Du &&
+            buf[i + pkt_len - 1u] == 0x0Au) {
+            if (offset_out) *offset_out = i;
+            return &buf[i];
+        }
+    }
+
+    return NULL;
+}
+
+static uint8_t *imu_find_packet_header(uint8_t *buf, uint32_t buf_len, uint32_t *offset_out)
+{
+    if (buf == NULL || buf_len < 2u) {
+        return NULL;
+    }
+
+    for (uint32_t i = 0u; i + 1u < buf_len; i++) {
+        if (buf[i] == 0x23u && buf[i + 1u] == 0x23u) {
+            if (offset_out) *offset_out = i;
+            return &buf[i];
+        }
+    }
+
+    return NULL;
+}
+
+static int imu_spi_write_pulsed(const uint8_t *tx, uint16_t len, uint32_t timeout_ms)
+{
+    HAL_StatusTypeDef st = HAL_OK;
+
+    if (tx == NULL || len == 0u) return -1;
+
+    IMU_SPI_ResetSession();
+    for (uint16_t i = 0u; i < len; i++) {
+        uint8_t discard = 0u;
+        imu_spi_begin_transaction();
+        st = HAL_SPI_TransmitReceive(&hspi2, (uint8_t *)&tx[i], &discard, 1u, timeout_ms);
+        imu_spi_end_transaction();
+        if (st != HAL_OK) {
+            break;
+        }
+    }
+    IMU_SPI_ResetSession();
+
+    return (st == HAL_OK) ? 0 : -1;
+}
+
+static int imu_spi_read_pulsed(uint8_t *rx, uint16_t len, uint32_t timeout_ms)
+{
+    HAL_StatusTypeDef st = HAL_OK;
+
+    if (rx == NULL || len == 0u) return -1;
+
+    IMU_SPI_ResetSession();
+    for (uint16_t i = 0u; i < len; i++) {
+        uint8_t tx_zero = 0x00u;
+        imu_spi_begin_transaction();
+        st = HAL_SPI_TransmitReceive(&hspi2, &tx_zero, &rx[i], 1u, timeout_ms);
+        imu_spi_end_transaction();
+        if (st != HAL_OK) {
+            break;
+        }
+    }
+    IMU_SPI_ResetSession();
+
+    return (st == HAL_OK) ? 0 : -1;
+}
+
+static int imu_spi_read_command_packet(uint8_t *rx,
+                                       uint16_t rx_cap,
+                                       uint16_t pkt_len,
+                                       uint32_t timeout_ms,
+                                       uint16_t *actual_len,
+                                       uint16_t *pkt_offset)
+{
+    uint16_t count = 0u;
+    uint16_t offset = 0u;
+    int header_found = 0;
+
+    if (rx == NULL || rx_cap == 0u || pkt_len < 4u) return -1;
+    if (actual_len) *actual_len = 0u;
+    if (pkt_offset) *pkt_offset = 0u;
+
+    imu_spi_begin_transaction();
+    while (count < rx_cap) {
+        if (imu_spi_xfer_byte(0x00u, &rx[count], timeout_ms) != 0) {
+            imu_spi_end_transaction();
+            if (actual_len) *actual_len = count;
+            if (pkt_offset) *pkt_offset = offset;
+            return -1;
+        }
+
+        count++;
+
+        if (!header_found && count >= 2u) {
+            if (rx[count - 2u] == 0x23u && rx[count - 1u] == 0x23u) {
+                offset = (uint16_t)(count - 2u);
+                header_found = 1;
+            }
+        }
+
+        if (header_found && count >= (uint16_t)(offset + pkt_len)) {
+            uint16_t footer = (uint16_t)(offset + pkt_len - 2u);
+            if (rx[footer] == 0x0Du && rx[footer + 1u] == 0x0Au) {
+                if (actual_len) *actual_len = count;
+                if (pkt_offset) *pkt_offset = offset;
+                imu_spi_end_transaction();
+                return 0;
+            }
+        }
+    }
+    imu_spi_end_transaction();
+
+    if (actual_len) *actual_len = count;
+    if (pkt_offset) *pkt_offset = offset;
+    return -2;
+}
+
+static uint32_t imu_cmd_noresp_gap_us(uint8_t cmd_type)
+{
+    if (cmd_type == CMD_TYPE_START_STREAMING) {
+        return IMU_CMD_TWAIT_US_START;
+    }
+    return IMU_CMD_TNEXT_US;
+}
+
 /* -------------------------------------------------------------------------- */
 /* send_imu_command_ex ? IIM-46234 SPI command/response                      */
 /* Command mode is two separate SPI transactions:                            */
@@ -433,36 +655,18 @@ int send_imu_command_ex(uint8_t *tx_packet, uint32_t tx_size,
     uint32_t edge_base = g_imu_drdy_edges_total;
     drdy_interrupt = 0;
 
-    spi2_flush();
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
-    delay_us(IMU_NSS_SETUP_US);
-
-    HAL_StatusTypeDef st = HAL_OK;
-    for (uint32_t i = 0; i < IMU_CMD_PACKET_SIZE; i++) {
-        uint8_t discard = 0u;
-        st = HAL_SPI_TransmitReceive(&hspi2, &tx20[i], &discard, 1, 10);
-        if (st != HAL_OK) break;
-    }
-
-    if (st != HAL_OK) {
-        delay_us(IMU_NSS_HOLD_US);
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
-        delay_us(IMU_NSS_HIGH_US);
-        spi2_flush();
-        Send_UART3_Debug("IMU: TX fail [%s] hal=%d\r\n", cmd_name, (int)st);
+    if (IMU_SPI_WriteSession(tx20, IMU_CMD_PACKET_SIZE, 10u) != 0) {
+        uint32_t sr = hspi2.Instance->SR;
+        Send_UART3_Debug("IMU: TX fail [%s] SR=0x%04lX\r\n",
+                         cmd_name, (unsigned long)sr);
         return RET_ERR_SPI;
     }
-
-    delay_us(IMU_NSS_HOLD_US);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
-    delay_us(IMU_NSS_HIGH_US);
-    spi2_flush();
 
     if (no_resp_cmd) {
         if (cmd_type == 0x27u) {
             Send_UART3_Debug("IMU: START_STREAM sent\r\n");
         }
-        HAL_Delay(IMU_POST_CMD_DELAY_MS);
+        delay_us(imu_cmd_noresp_gap_us(cmd_type));
         return RET_OK;
     }
 
@@ -479,74 +683,67 @@ int send_imu_command_ex(uint8_t *tx_packet, uint32_t tx_size,
             }
         }
 
-        {
-            uint32_t rx_total = fixed_rx + 2u;
-            if (rx_total > IMU_RX_TOTAL) rx_total = IMU_RX_TOTAL;
+        delay_us(IMU_CMD_TWAIT_US_NORMAL);
 
+        {
             uint8_t rx_buf[IMU_RX_TOTAL] = {0};
             uint8_t *pkt_start = NULL;
-            uint32_t avail = 0u;
-            HAL_StatusTypeDef rx_st = HAL_OK;
-
-            delay_us(60u); /* Twait(min) = 0.05 ms for non-stream commands */
-            spi2_flush();
-            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
-            delay_us(IMU_NSS_SETUP_US);
-
-            for (uint32_t rx_count = 0u; rx_count < rx_total; rx_count++) {
-                uint8_t tx_zero = 0x00u;
-                rx_st = HAL_SPI_TransmitReceive(&hspi2, &tx_zero, &rx_buf[rx_count], 1, 10);
-                if (rx_st != HAL_OK) {
-                    delay_us(IMU_NSS_HOLD_US);
-                    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
-                    delay_us(IMU_NSS_HIGH_US);
-                    spi2_flush();
-                    {
-                        uint32_t sr = hspi2.Instance->SR;
-                        Send_UART3_Debug("IMU: RX fail [%s] hal=%d SR=0x%04lX\r\n",
-                                         cmd_name, (int)rx_st, (unsigned long)sr);
-                    }
-                    return RET_ERR_SPI;
-                }
-            }
-
-            delay_us(IMU_NSS_HOLD_US);
-            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
-            delay_us(IMU_NSS_HIGH_US);
-            spi2_flush();
+            uint32_t pkt_offset = 0u;
+            uint32_t hdr_offset = 0u;
+            uint16_t rx_total = 0u;
+            uint16_t rx_pkt_offset = 0u;
+            int rx_status = imu_spi_read_command_packet(rx_buf,
+                                                        IMU_RX_TOTAL,
+                                                        (uint16_t)fixed_rx,
+                                                        10u,
+                                                        &rx_total,
+                                                        &rx_pkt_offset);
 
             {
                 char dbg[120];
-                int off = snprintf(dbg, sizeof(dbg), "IMU RX20 [%s]:", cmd_name);
-                for (int i = 0; i < 20 && off < (int)(sizeof(dbg) - 4); i++)
+                int off = snprintf(dbg, sizeof(dbg), "IMU RX%u [%s]:",
+                                   (unsigned)rx_total, cmd_name);
+                for (uint32_t i = 0u; i < rx_total && i < 20u && off < (int)(sizeof(dbg) - 4); i++)
                     off += snprintf(dbg + off, sizeof(dbg) - (size_t)off, " %02X", rx_buf[i]);
                 snprintf(dbg + off, sizeof(dbg) - (size_t)off, "\r\n");
                 Send_UART3_Debug(dbg);
             }
 
-            for (uint32_t i = 0u; i + 1u < rx_total; i++) {
-                if (rx_buf[i] == 0x23u && rx_buf[i + 1u] == 0x23u) {
-                    pkt_start = &rx_buf[i];
-                    avail = (uint32_t)(rx_total - i);
-                    break;
-                }
+            if (rx_status < 0) {
+                uint32_t sr = hspi2.Instance->SR;
+                Send_UART3_Debug("IMU: RX fail [%s] SR=0x%04lX status=%d\r\n",
+                                 cmd_name, (unsigned long)sr, rx_status);
+                return RET_ERR_SPI;
+            }
+
+            pkt_start = imu_find_complete_packet(rx_buf, rx_total, fixed_rx, &pkt_offset);
+            if (pkt_start == NULL && rx_total >= (uint16_t)(rx_pkt_offset + fixed_rx)) {
+                pkt_start = &rx_buf[rx_pkt_offset];
+                pkt_offset = rx_pkt_offset;
             }
 
             if (pkt_start == NULL) {
-                Send_UART3_Debug("IMU: no 0x2323 hdr [%s] edge=%lu pin=%d\r\n",
-                                 cmd_name,
-                                 (unsigned long)(g_imu_drdy_edges_total - edge_base),
-                                 (int)HAL_GPIO_ReadPin(IMU_DRDY_PORT, IMU_DRDY_PIN));
-                return RET_ERR_RX;
-            }
-
-            if (avail < fixed_rx) {
-                Send_UART3_Debug("IMU: partial pkt avail=%lu need=%lu [%s]\r\n",
-                                 (unsigned long)avail, (unsigned long)fixed_rx, cmd_name);
+                if (imu_find_packet_header(rx_buf, rx_total, &hdr_offset) != NULL) {
+                    Send_UART3_Debug("IMU: incomplete pkt hdr=%lu need=%lu got=%lu [%s]\r\n",
+                                     (unsigned long)hdr_offset,
+                                     (unsigned long)fixed_rx,
+                                     (unsigned long)(rx_total - hdr_offset),
+                                     cmd_name);
+                } else {
+                    Send_UART3_Debug("IMU: no 0x2323 hdr [%s] edge=%lu pin=%d\r\n",
+                                     cmd_name,
+                                     (unsigned long)(g_imu_drdy_edges_total - edge_base),
+                                     (int)HAL_GPIO_ReadPin(IMU_DRDY_PORT, IMU_DRDY_PIN));
+                }
                 return RET_ERR_RX;
             }
 
             uint8_t *pkt = pkt_start;
+
+            if (pkt_offset > 0u) {
+                Send_UART3_Debug("IMU: WARN echo/shift %lu [%s]\r\n",
+                                 (unsigned long)pkt_offset, cmd_name);
+            }
 
             if (pkt[fixed_rx-2u] != 0x0Du || pkt[fixed_rx-1u] != 0x0Au) {
                 Send_UART3_Debug("IMU: bad footer [%s] %02X %02X\r\n",
@@ -582,8 +779,7 @@ int send_imu_command_ex(uint8_t *tx_packet, uint32_t tx_size,
         }
 
         drdy_interrupt = 0;
-        delay_us(400u); /* Tnext(min) = 0.3 ms */
-        HAL_Delay(IMU_POST_CMD_DELAY_MS);
+        delay_us(IMU_CMD_TNEXT_US);
         return RET_OK;
     }
 }
@@ -1493,9 +1689,10 @@ static void MX_SPI2_Init(void)
    * STM32G0 SPI FIFO default threshold is 16-bit ??RXNE only fires after
    * 2 bytes are received.  For 8-bit transfers this causes HAL_SPI_TransmitReceive
    * to stall on the last byte of any odd-length transfer (10-byte ACK,
-   * 18-byte READ_REG response, 22-byte drain, etc.).
+  * 18-byte READ_REG response, 22-byte drain, etc.).
    * Setting FRXTH=1 makes RXNE fire after every single byte.            */
   hspi2.Instance->CR2 |= SPI_CR2_FRXTH;
+  __HAL_SPI_DISABLE(&hspi2);
 
   /* USER CODE END SPI2_Init 2 */
 
@@ -1726,14 +1923,15 @@ static void MX_GPIO_Init(void)
           GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
           HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-          // PB12 NSS pin (output)
+          // PB12 NSS pin (software-controlled output)
           GPIO_InitStruct.Pin = GPIO_PIN_12;
           GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
           GPIO_InitStruct.Pull = GPIO_PULLUP;
           GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
           HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
 
-          // SPI2 pins (PB13, PB14, PB15)
+          // SPI2 pins (PB13 SCK, PB14 MISO, PB15 MOSI)
           GPIO_InitStruct.Pin = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
           GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
           GPIO_InitStruct.Pull = GPIO_NOPULL;

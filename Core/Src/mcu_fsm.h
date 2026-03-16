@@ -23,6 +23,9 @@ typedef struct {
     uint8_t  ir_idx;
     bool     imu_streaming;
     bool     debug_enabled;
+    bool     log_capture_active;
+    bool     log_capture_save_sent;
+    uint32_t log_capture_start_ms;
 } McuContext;
 
 void mcu_fsm_start_init(McuContext *ctx);

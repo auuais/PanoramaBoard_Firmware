@@ -60,6 +60,7 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define EVT_IMU_STATS   0x22   // drdy_hz + pkt_ts_hz + parse_ok_hz (uint16 LE each)
 #define EVT_CFG_BANK    0x30   // [sub][bank][mode][8*i32 LE quantized params]
 #define EVT_CFG_APPLY   0x31   // [sub][bank][ok][detail]
+#define EVT_LOG_CTRL    0x40   // [sub][cmd]
 
 // ---- Command IDs ----
 #define CMD_CHECK_NODE   0x10
@@ -92,6 +93,9 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define ORIENT_CLAMP_DEG      (90.0f)
 #define IMU_STREAM_BURST_MAX  16u
 #define UI_ORIENT_DECIM       10u
+#define LOG_CTRL_CLEAR        0x01u
+#define LOG_CTRL_SAVE         0x02u
+#define LOG_CAPTURE_SAVE_DELAY_MS 15000u
 
 // ---- IMU command packets (matching ATMEL IIM4623x reference exactly) ----
 // WHO_AM_I = ReadRegister(addr=0x00, len=1, page=0)
@@ -615,6 +619,26 @@ static void ui_send_cfg_apply_result(uint8_t bank, uint8_t ok, uint8_t detail)
     ui_send_frame(MSG_EVT, 0, p, sizeof(p));
 }
 
+static void ui_send_log_ctrl(uint8_t cmd)
+{
+    uint8_t p[2];
+    p[0] = EVT_LOG_CTRL;
+    p[1] = cmd;
+    ui_send_frame(MSG_EVT, 0, p, sizeof(p));
+}
+
+static void mcu_service_log_capture(McuContext *ctx)
+{
+    if (ctx == NULL || !ctx->log_capture_active || ctx->log_capture_save_sent) {
+        return;
+    }
+
+    if ((HAL_GetTick() - ctx->log_capture_start_ms) >= LOG_CAPTURE_SAVE_DELAY_MS) {
+        ui_send_log_ctrl(LOG_CTRL_SAVE);
+        ctx->log_capture_save_sent = true;
+    }
+}
+
 
 // ===================== FPGA helpers =====================
 //static int fpga_write16(uint16_t reg, const uint8_t *data, uint8_t len)
@@ -646,6 +670,9 @@ void mcu_fsm_init(McuContext *ctx)
     ctx->state = ST_WAIT_UI_INIT;   // <-- NEW: wait for UI init command
     ctx->debug_enabled = true;
     g_debug_enabled = true;
+    ctx->log_capture_active = false;
+    ctx->log_capture_save_sent = false;
+    ctx->log_capture_start_ms = 0u;
 
     const bool loaded = cfg_load_from_flash();
     if (!loaded) {
@@ -673,6 +700,8 @@ void mcu_fsm_start_init(McuContext *ctx)
 
 void mcu_fsm_step(McuContext *ctx)
 {
+    mcu_service_log_capture(ctx);
+
 	switch (ctx->state) {
 
 
@@ -687,6 +716,10 @@ void mcu_fsm_step(McuContext *ctx)
 
 
     case ST_BOOT: {
+        ui_send_log_ctrl(LOG_CTRL_CLEAR);
+        ctx->log_capture_active = true;
+        ctx->log_capture_save_sent = false;
+        ctx->log_capture_start_ms = HAL_GetTick();
         ctx->state = ST_INIT_POWER;
         break;
     }
@@ -931,31 +964,6 @@ void mcu_fsm_step(McuContext *ctx)
 // ===================== IMU DRDY handler =====================
 // Called from main loop for each pending DRDY edge counted from EXTI PB9.
 
-/* Local microsecond delay for NSS timing in streaming read path */
-static void fsm_delay_us(uint32_t us) {
-    volatile uint32_t count = us * 4u;
-    while (count--) { __NOP(); }
-}
-
-static void imu_stream_spi_flush(void)
-{
-    hspi2.Instance->CR2 |= SPI_CR2_FRXTH;
-
-    uint32_t t0 = HAL_GetTick();
-    while (hspi2.Instance->SR & SPI_SR_BSY) {
-        if ((HAL_GetTick() - t0) >= 10u) break;
-    }
-
-    while (hspi2.Instance->SR & SPI_SR_RXNE) {
-        volatile uint8_t dummy = *(__IO uint8_t *)&hspi2.Instance->DR;
-        (void)dummy;
-    }
-
-    if (hspi2.Instance->SR & SPI_SR_OVR) {
-        __HAL_SPI_CLEAR_OVRFLAG(&hspi2);
-    }
-}
-
 static void quat_to_roll_pitch_deg(const Quaternion_t *q, float *roll_deg, float *pitch_deg)
 {
     const float RAD2DEG = 180.0f / 3.14159265358979f;
@@ -1002,30 +1010,15 @@ static void update_shadow_roll_pitch(const Quaternion_t *q)
  * SELECT_OUT_DATA = 0x07 (accel+gyro+temp, 7 outputs):
  *   SIZE_PACKET_BASE_DATA(18) + 4×7 = 46 bytes payload
  */
-#define IMU_STREAM_DUMMY_BYTES  1u               /* leading dummy byte  */
+#define IMU_STREAM_DUMMY_BYTES  1u               /* one byte of alignment slack */
 #define IMU_STREAM_PKT_BYTES    46u              /* actual packet bytes */
 #define IMU_STREAM_READ_TOTAL   (IMU_STREAM_DUMMY_BYTES + IMU_STREAM_PKT_BYTES)  /* 47 */
 
 static uint8_t s_imu_rx_buf[IMU_STREAM_READ_TOTAL];
-static const uint8_t s_imu_tx_zeros[IMU_STREAM_READ_TOTAL] = {0};
 
 static int imu_stream_read_raw(uint8_t *dst)
 {
-    imu_stream_spi_flush();
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
-    fsm_delay_us(5u);
-
-    HAL_StatusTypeDef spi_st = HAL_SPI_TransmitReceive(&hspi2,
-                                                       (uint8_t *)s_imu_tx_zeros,
-                                                       dst,
-                                                       IMU_STREAM_READ_TOTAL,
-                                                       10u);
-
-    fsm_delay_us(5u);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
-    imu_stream_spi_flush();
-
-    return (spi_st == HAL_OK) ? 0 : -1;
+    return IMU_SPI_ReadSession(dst, IMU_STREAM_READ_TOTAL, 10u);
 }
 
 static int mcu_process_imu_stream_packet(McuContext *ctx, uint8_t *delta_counter_out)
@@ -1034,12 +1027,14 @@ static int mcu_process_imu_stream_packet(McuContext *ctx, uint8_t *delta_counter
 
     if (imu_stream_read_raw(s_imu_rx_buf) != 0) return -1;
 
-    /* Packet always starts at byte[1] ??validate header */
-    uint8_t *pkt      = &s_imu_rx_buf[IMU_STREAM_DUMMY_BYTES];
+    uint8_t *pkt = NULL;
     uint32_t pkt_avail = IMU_STREAM_PKT_BYTES;
 
-    if (pkt[0] != 0x23u || pkt[1] != 0x23u) {
-        /* Unexpected ??header not where expected, discard */
+    if (s_imu_rx_buf[0] == 0x23u && s_imu_rx_buf[1] == 0x23u) {
+        pkt = &s_imu_rx_buf[0];
+    } else if (s_imu_rx_buf[1] == 0x23u && s_imu_rx_buf[2] == 0x23u) {
+        pkt = &s_imu_rx_buf[1];
+    } else {
         return 0;
     }
 
@@ -1147,6 +1142,16 @@ static int mcu_process_imu_stream_packet(McuContext *ctx, uint8_t *delta_counter
             }
 
             ui_send_imu_stats(drdy_hz, pkt_ts_hz, parse_ok_hz);
+            {
+                char stats_msg[96];
+                snprintf(stats_msg, sizeof(stats_msg),
+                         "[IMU] stats DRDY=%uHz TS=%uHz Parse=%uHz\r\n",
+                         (unsigned)drdy_hz,
+                         (unsigned)pkt_ts_hz,
+                         (unsigned)parse_ok_hz);
+                ui_send_log(ctx, stats_msg);
+            }
+            ui_send_log_ctrl(LOG_CTRL_SAVE);
 
             s_stats_window_start_ms = now_ms;
             s_stats_edges_base = edge_now;

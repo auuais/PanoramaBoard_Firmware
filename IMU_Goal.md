@@ -1071,3 +1071,156 @@ Changes:
 - `sample_counter` jumps should shrink back toward `1`
 - `TS` should move toward `DRDY`/`Parse`
 - if the remaining bottleneck is purely compute budget, this batch should still improve the sustainable rate materially because the trig work is now demand-driven instead of packet-driven
+
+---
+
+## Batch 26 Update (2026-03-16)
+
+### Timing alignment with datasheet and ATMEL reference
+
+Files:
+
+- Core/Inc/main.h
+- Core/Src/main.c
+- Core/Src/mcu_fsm.c
+
+Changes:
+
+1. Replaced the old ad-hoc STM32 IMU timing constants with shared timing values derived from the datasheet command timing model and the ATMEL reference SPI cadence:
+   - IMU_NSS_SETUP_US = 1
+   - IMU_NSS_HOLD_US = 1
+   - IMU_NSS_HIGH_US = 7
+   - IMU_CMD_TWAIT_US_NORMAL = 50
+   - IMU_CMD_TWAIT_US_START = 600
+   - IMU_CMD_TNEXT_US = 300
+
+2. Removed the blanket IMU_POST_CMD_DELAY_MS = 10 behavior from the STM32 command path.
+   - No-response commands now wait only for their protocol-specific gap.
+   - Normal command sequencing now ends with Tnext instead of a large millisecond delay.
+
+3. Updated the streaming read path to use the same shared NSS setup/hold timing instead of hardcoded 5 us / 5 us guards.
+
+### Why this matters
+
+The previous STM32 path mixed protocol timing and local software guard delays. That made it hard to compare directly against either the datasheet or the ATMEL implementation. This batch makes the STM32 transaction timing explicit:
+
+- command Twait is no longer approximated by a blanket 10 ms
+- inter-command gap now matches the manual Tnext = 0.3 ms
+- stream chip-select timing now uses the same constants as command mode
+
+This does not by itself prove the root cause, but it removes one clear timing discrepancy so subsequent logs can be compared more directly against ATMEL behavior.
+
+---
+
+## Batch 27 Update (2026-03-16)
+
+### STM32 SPI session rework for IMU command and stream paths
+
+Files:
+
+- Core/Inc/main.h
+- Core/Src/main.c
+- Core/Src/mcu_fsm.c
+
+Changes:
+
+1. Replaced the previous per-byte HAL SPI loops in command mode with burst session helpers:
+   - IMU_SPI_WriteSession() for the 20-byte command TX phase
+   - IMU_SPI_ReadSession() for the response/stream RX phase
+
+2. Added IMU_SPI_ResetSession() and call it before and after each IMU SPI phase.
+   - waits for the peripheral to drain
+   - disables SPI
+   - clears overrun state
+   - re-enables SPI and restores FRXTH
+
+3. Command response parsing no longer trusts ixed_rx + 2 alone.
+   - RX now clocks ixed_rx + IMU_CMD_RX_SLACK
+   - parser searches for a complete packet with both header and footer
+   - if only a shifted header is present, log now reports it as an incomplete packet instead of accepting a partial payload
+
+4. Stream reads now use the same SPI read-session helper as command responses.
+
+### Why this matters
+
+ATMEL behaves like a clean burst-oriented SPI session machine. The STM32 path was still performing command TX/RX as many 1-byte HAL calls inside a transaction, while the logs showed the response ending one byte early after the echoed leading byte. That is exactly the kind of session desynchronization that can explain:
+
+- leading echo byte
+- next command requiring reset
+- stream cadence collapse if packets are not fully consumed
+
+This batch removes that per-byte session behavior so the next log can tell us whether the root issue is genuine STM32 SPI state carry-over or something lower on the wire.
+
+---
+
+## Batch 28 Update (2026-03-17)
+
+### Real root cause isolated: PB12 NSS ownership bug
+
+Files:
+
+- Core/Src/stm32g0xx_hal_msp.c
+- Core/Src/main.c
+
+Changes:
+
+1. Removed PB12 from the SPI2 alternate-function pin setup in `HAL_SPI_MspInit()`.
+2. Restored PB12 as an explicit GPIO-controlled chip-select in the IMU path.
+3. Kept raw SPI register transfers for the IMU session so PB12 low/high boundaries are fully software-defined.
+
+### Verified result
+
+After this fix:
+
+- the leading echoed command byte disappeared from command responses
+- back-to-back command reads worked without reset
+- the default 1 kHz flash profile was read back cleanly
+- startup stream packets showed `dts_us = 1000`
+
+This matched the scope observation that the previous STM32 build had PB12 held low continuously while the ATMEL reference toggled NSS for each transaction. The PB12 AF override was therefore a genuine protocol bug, not a cosmetic GPIO difference.
+
+---
+
+## Batch 29 Update (2026-03-17)
+
+### Sustained 1 kHz restored by reducing MCU fusion load, not by changing IMU ODR
+
+Files:
+
+- Core/Src/imu_handler.c
+- Core/Src/mcu_fsm.c
+- .cproject
+
+Changes:
+
+1. Added sustained IMU stats logging once per second:
+   - `DRDY`
+   - packet timestamp-derived rate (`TS`)
+   - parse rate (`Parse`)
+
+2. Used a parse-only diagnostic run to prove the transport path can sustain full rate:
+   - with fusion bypassed, STM32 reached about `1000 Hz` for `DRDY/TS/Parse`
+   - this proved the IMU was already configured correctly and the remaining limit was MCU compute budget
+
+3. Switched the Debug configuration from unoptimized `-O0` to `-Os` in `.cproject`.
+
+4. Added fusion decimation in `imu_handler.c` so packet ingest remains at 1 kHz while the Madgwick update runs at a lower effective rate.
+
+### Measured outcome
+
+Observed progression:
+
+- full-rate fusion, old debug build: about `403 Hz`
+- full-rate fusion, optimized build: about `462 Hz`
+- fusion decimation x4, optimized build: about `907 Hz`
+- fusion decimation x8, optimized build: about `998-999 Hz`
+
+Final steady-state log now shows:
+
+- `DRDY ~= 998-999 Hz`
+- `TS = 1000 Hz`
+- `Parse ~= 998-999 Hz`
+
+### Practical note
+
+The IMU ODR did not need another explicit register change. The flash-backed profile was already at factory 1 kHz defaults. The remaining issue was purely host-side processing load on the STM32G0 when running floating-point fusion on every packet.
