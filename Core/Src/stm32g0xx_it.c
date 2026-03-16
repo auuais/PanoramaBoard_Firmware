@@ -59,7 +59,8 @@ extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart3;
 extern volatile int drdy_interrupt;
-extern volatile uint8_t g_imu_drdy_flag;
+extern volatile uint32_t g_imu_drdy_count;
+extern volatile uint32_t g_imu_drdy_edges_total;
 extern volatile uint8_t g_vsync_flag;
 /* USER CODE BEGIN EV */
 
@@ -152,21 +153,20 @@ void SysTick_Handler(void)
 void EXTI4_15_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI4_15_IRQn 0 */
-  // Check line flags latched on EXTI4_15
-  uint32_t pending = EXTI->RPR1;
-
-  if (pending & EXTI_RPR1_RPIF4) {
+  uint32_t pending_rise = EXTI->RPR1;
+  if (pending_rise & EXTI_RPR1_RPIF4) {
     EXTI->RPR1 = EXTI_RPR1_RPIF4;
     g_vsync_flag = 1;
   }
 
-  if (pending & EXTI_RPR1_RPIF9) {
+  if (pending_rise & EXTI_RPR1_RPIF9) {
     EXTI->RPR1 = EXTI_RPR1_RPIF9;
     drdy_interrupt = 1;
-    g_imu_drdy_flag = 1;
+    g_imu_drdy_count++;
+    g_imu_drdy_edges_total++;
   }
 
-  if (pending & EXTI_RPR1_RPIF6) {
+  if (pending_rise & EXTI_RPR1_RPIF6) {
     EXTI->RPR1 = EXTI_RPR1_RPIF6;
   }
   /* USER CODE END EXTI4_15_IRQn 0 */

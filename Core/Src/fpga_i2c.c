@@ -29,6 +29,19 @@ HAL_StatusTypeDef fpga_write_reg8(fpga_i2c_t* dev, uint8_t reg, uint8_t value, u
                            timeout_ms);
 }
 
+HAL_StatusTypeDef fpga_write_regs(fpga_i2c_t* dev, uint8_t reg, const uint8_t* data, uint16_t len, uint32_t timeout_ms)
+{
+  if (!dev || !dev->hi2c || !data || (len == 0u)) return HAL_ERROR;
+
+  return HAL_I2C_Mem_Write(dev->hi2c,
+                           addr8(dev->addr7),
+                           reg,
+                           I2C_MEMADD_SIZE_8BIT,
+                           (uint8_t*)data,
+                           len,
+                           timeout_ms);
+}
+
 HAL_StatusTypeDef fpga_read_reg8(fpga_i2c_t* dev, uint8_t reg, uint8_t* out, uint32_t timeout_ms)
 {
   if (!dev || !dev->hi2c || !out) return HAL_ERROR;

@@ -29,7 +29,7 @@
  * ----- ODR configuration -----
  *  ODR is controlled via SAMPLE_RATE_DIV register (page 0, addr 0x1A, 2 bytes).
  *  The sensor base clock is 1 kHz. ODR = 1000 / divisor.
- *  Examples:  divisor=1 → 1000 Hz,  divisor=2 → 500 Hz,  divisor=8 → 125 Hz
+ *  Examples:  divisor=1 ??1000 Hz,  divisor=2 ??500 Hz,  divisor=8 ??125 Hz
  *
  * ----- LPF (BW_CONFIG register, page 0, addr 0x30, 1 byte) -----
  *  Upper nibble = Accel LPF BW:  0x40=BW4, 0x50=BW5, 0x60=BW6, 0x70=BW7
@@ -47,7 +47,7 @@ extern "C" {
 #include <stdint.h>
 
 /* ---- Command type (from iim4623x.h) ---- */
-#define IMU_CMD_TYPE_WRITE_REG   0x12u   /* NOT 0x14 — that was wrong */
+#define IMU_CMD_TYPE_WRITE_REG   0x12u   /* NOT 0x14 ??that was wrong */
 #define IMU_CMD_TYPE_READ_REG    0x11u
 
 /* ---- Base packet sizes (from iim4623x.h) ---- */
@@ -55,7 +55,7 @@ extern "C" {
 #define IMU_SIZE_RESP_ACK             10u   /* ACK response to any write cmd (SIZE_RESP_ACK) */
 #define IMU_SIZE_RESP_READ_BASE       16u   /* base overhead for read-reg response */
 
-/* ---- Register definitions (page 0) — from iim4623x.c reg map ---- */
+/* ---- Register definitions (page 0) ??from iim4623x.c reg map ---- */
 #define IMU_PAGE0                0x00u
 
 /* SAMPLE_RATE_DIV: addr=0x1A, length=2, page=0
@@ -72,14 +72,20 @@ extern "C" {
 /* SELECT_OUT_DATA: addr=0x1C, length=1, page=0
  * BIT0=accel BIT1=gyro BIT2=temp BIT3=delta_vel BIT4=delta_ang
  * Packet size = 18 + 4 × (number of set bits) bytes.
- * 0x07 (accel+gyro+temp)  = 46 bytes → supports 1 kHz
- * 0x1F (all five outputs) = 62 bytes → sensor throttles DRDY to ~48 Hz */
+ * 0x07 (accel+gyro+temp)  = 46 bytes ??supports 1 kHz
+ * 0x1F (all five outputs) = 62 bytes ??sensor throttles DRDY to ~48 Hz */
 #define IMU_REG_SELECT_OUT_DATA_ADDR  0x1Cu
 #define IMU_SELECT_OUT_ACC_GYRO_TEMP  0x07u   /* recommended for 1 kHz */
 
-/* SAVE_ALL_CONFIG: addr=0x2F, length=1, page=0 — write 0x50 to trigger */
+/* SAVE_ALL_CONFIG: addr=0x2F, length=1, page=0 ??write 0x50 to trigger */
 #define IMU_REG_SAVE_ALL_CONFIG_ADDR  0x2Fu
 #define IMU_SAVE_ALL_CONFIG_CMD       0x50u
+
+/* RESET_ALL_CONFIG: addr=0xA8, length=1, page=0 - write 0xA0 to restore
+ * the factory-backed flash profile (SAMPLE_RATE_DIV=0x0001,
+ * SELECT_OUT_DATA=0x07, BW_CONFIG=0x44). */
+#define IMU_REG_RESET_ALL_CONFIG_ADDR 0xA8u
+#define IMU_RESET_ALL_CONFIG_CMD      0xA0u
 
 /* ---- SAMPLE_RATE_DIV values (divisors of 1 kHz) ---- */
 #define IMU_ODR_DIV_1000HZ   1u    /* 1000 Hz */
@@ -108,8 +114,8 @@ extern "C" {
  * @brief Configure sensor ODR and LPF bandwidth.
  *
  * Sends two WRITE_REG commands (no DRDY wait for either):
- *   1. SAMPLE_RATE_DIV — sets ODR = 1000 / odr_divisor
- *   2. BW_CONFIG       — sets accel + gyro LPF bandwidth
+ *   1. SAMPLE_RATE_DIV ??sets ODR = 1000 / odr_divisor
+ *   2. BW_CONFIG       ??sets accel + gyro LPF bandwidth
  *
  * Call this AFTER reset + WHO_AM_I, BEFORE START_STREAMING.
  *
@@ -138,6 +144,7 @@ extern "C" {
 int imu_read_config(const char *tag);
 
 int imu_configure_odr_lpf(uint16_t odr_divisor, uint8_t bw_config);
+int imu_ensure_default_profile(void);
 
 /** Helper: actual ODR in Hz from divisor */
 static inline float imu_odr_hz_from_div(uint16_t div)
@@ -150,3 +157,4 @@ static inline float imu_odr_hz_from_div(uint16_t div)
 #endif
 
 #endif /* IMU_CONFIG_H */
+

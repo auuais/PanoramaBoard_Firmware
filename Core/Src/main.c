@@ -82,8 +82,9 @@ UART_HandleTypeDef huart3;  // PC UI (binary COBS+CRC)
 // ---- FSM context ----
 static McuContext g_ctx;
 
-// ---- IMU DRDY flag (set in EXTI ISR) ----
-volatile uint8_t g_imu_drdy_flag = 0;
+// ---- IMU DRDY counters (updated in EXTI ISR) ----
+volatile uint32_t g_imu_drdy_count = 0;
+volatile uint32_t g_imu_drdy_edges_total = 0;
 volatile uint8_t g_vsync_flag = 0;
 
 // ---- UART3 UI RX ----
@@ -206,14 +207,9 @@ void Enable_All_Camera_Power(void)
 
 
 
-#include "proto_uart.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-
-extern UART_HandleTypeDef huart3;
-extern SPI_HandleTypeDef hspi2;
-
 
 // same IDs as your FSM
 #define MSG_LOG   0x7F
@@ -259,12 +255,12 @@ void Send_UART3_Debug(const char *format, ...) {
 /* -------------------------------------------------------------------------- */
 static void delay_us(uint32_t us)
 {
-    volatile uint32_t count = us * 4u;   /* 16MHz / 4 cycles ≈ 4 iters/µs */
+    volatile uint32_t count = us * 4u;   /* 16MHz / 4 cycles ? 4 iters/?s */
     while (count--) { __NOP(); }
 }
 
 /* -------------------------------------------------------------------------- */
-/* spi2_flush — drain stale bytes from the SPI2 RX FIFO and wait for BSY=0. */
+/* spi2_flush ? drain stale bytes from the SPI2 RX FIFO and wait for BSY=0. */
 /*                                                                            */
 /* WHY: After each CS transaction the STM32 SPI peripheral may have bytes    */
 /* sitting in the RX FIFO (received during TX or from a partial read).       */
@@ -291,6 +287,9 @@ static void spi2_flush(void)
         volatile uint8_t dummy = *(__IO uint8_t *)&hspi2.Instance->DR;
         (void)dummy;
     }
+    if (hspi2.Instance->SR & SPI_SR_OVR) {
+        __HAL_SPI_CLEAR_OVRFLAG(&hspi2);
+    }
     /* Re-check BSY after drain */
     t0 = HAL_GetTick();
     while (hspi2.Instance->SR & SPI_SR_BSY) {
@@ -300,99 +299,57 @@ static void spi2_flush(void)
 
 /* -------------------------------------------------------------------------- */
 /* IMU NSS timing constants (derived from ATMEL reference system.c):         */
-/*   SPI_DLYBS  = 0x40 (64 peripheral clocks before first SPCK)             */
-/*   SPI_DLYBCT = 0x20 (32 peripheral clocks between byte transfers)        */
-/*   SPI clock  = 6 MHz                                                      */
-/*                                                                            */
-/* On our STM32 with software NSS we must replicate DLYBS manually.          */
-/* DLYBCT is handled by the HAL byte-by-byte SPI engine automatically.       */
 /* -------------------------------------------------------------------------- */
-#define IMU_NSS_SETUP_US     5u    /* delay after CS low before first clock  */
-#define IMU_NSS_HOLD_US      5u    /* delay after last clock before CS high  */
-#define IMU_NSS_HIGH_US    500u    /* CS high hold: sensor needs ~300 µs to
-                                    * latch the command and assert DRDY.
-                                    * 20 µs was too short — Phase 2 DRDY poll
-                                    * started before DRDY ever fired.        */
-
-/* Maximum number of dummy bytes to clock before giving up on header sync.    */
-/* Stream packets may arrive after up to ~5 dummy bytes, but use 48 for      */
-/* extra margin against clock-stretch or any SPI pipeline latency.           */
+#define IMU_NSS_SETUP_US     5u
+#define IMU_NSS_HOLD_US      5u
+#define IMU_NSS_HIGH_US    500u
 #define IMU_HEADER_SEARCH_MAX  48u
-
-/* Post-response inter-command delay in ms (datasheet minimum ~0.3 ms)        */
-/* Note: send_imu_command_ex uses 5 ms directly; this constant is kept for   */
-/* legacy callers (START_STREAM path).                                        */
-#define IMU_POST_CMD_DELAY_MS   1u
-
-/* Total RX buffer size for one SPI response: largest response (READ_REG     */
-/* base 16 + up to 10 data bytes = 26) + 8 flush bytes = 34.                */
+#define IMU_POST_CMD_DELAY_MS  10u
 #define IMU_RX_TOTAL  34u
-
-/* WRITE_REG ACK response size (per ATMEL IIM4623x ref: SIZE_RESP_ACK = 10)  */
 #define IMU_SIZE_RESP_ACK       10u
 
-/* READ_REG response base overhead (per ATMEL ref: SIZE_RESP_READ_REGS_BASE) */
-/* Full read-reg response = SIZE_RESP_READ_REGS_BASE + data_length bytes     */
 #ifndef SIZE_RESP_READ_REGS_BASE
 #define SIZE_RESP_READ_REGS_BASE  16u
 #endif
 
-/* DRDY pin: PB9 (rising-edge EXTI sets drdy_interrupt; also checked as level) */
 #define IMU_DRDY_PORT   GPIOB
 #define IMU_DRDY_PIN    GPIO_PIN_9
 
+static inline int imu_drdy_is_idle(void)
+{
+    return (HAL_GPIO_ReadPin(IMU_DRDY_PORT, IMU_DRDY_PIN) == GPIO_PIN_SET);
+}
+
 void IMU_Reset(void) {
-    spi2_flush();   /* clear any stuck SPI state before hardware reset */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);   /* CS idle high */
+    spi2_flush();
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
     HAL_Delay(10);
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
     HAL_Delay(300);
 
-    /* Harden post-boot DRDY flush:
-     * The sensor asserts DRDY as a boot-complete signal.  This pulse can
-     * still be HIGH (or re-assert) when we return and immediately start
-     * a command.  Phase 2 of send_imu_command_ex uses a LOW→HIGH two-step
-     * handshake which handles this, but we also flush here as a belt-and-
-     * suspenders: wait for pin LOW (boot pulse fully gone), then wait a
-     * further 50 ms for any secondary transient to settle, then clear the
-     * interrupt flag twice (catches any edge that fired during the wait). */
     {
         uint32_t t0 = HAL_GetTick();
-        while (HAL_GPIO_ReadPin(IMU_DRDY_PORT, IMU_DRDY_PIN) == GPIO_PIN_SET) {
+        while (imu_drdy_is_idle()) {
             if ((HAL_GetTick() - t0) >= 200u) break;
         }
-        HAL_Delay(50);           /* extra settling time after pin goes LOW */
-        drdy_interrupt = 0;      /* clear once … */
+        HAL_Delay(50);
+        drdy_interrupt = 0;
         HAL_Delay(10);
-        drdy_interrupt = 0;      /* … and again to catch any edge fired during the delay */
+        drdy_interrupt = 0;
     }
     Send_UART3_Debug("IMU: reset\r\n");
 }
 
-/* -------------------------------------------------------------------------- */
-/* IMU_SoftReset — send STOP_STREAMING (0x28) to return to command mode      */
-/* without a hardware reset. Config registers survive.                        */
-/*                                                                            */
-/* STOP_STREAMING is a "common command" (cmd_type=0x28).  It follows the     */
-/* same two-phase TX → DRDY-wait → RX flow as all other commands.            */
-/* The sensor sends back a 10-byte ACK (same as SIZE_RESP_ACK).              */
-/* -------------------------------------------------------------------------- */
 void IMU_SoftReset(void) {
     static uint8_t stop_stream_pkt[] = {
-        0x24, 0x24,   /* header */
-        0x08,         /* total_size = 8 */
-        0x28,         /* CMD_TYPE_STOP_STREAMING */
-        0x00, 0x28,   /* checksum big-endian (sum of byte[3] = 0x28) */
-        0x0D, 0x0A    /* footer */
+        0x24, 0x24,
+        0x08,
+        0x28,
+        0x00, 0x28,
+        0x0D, 0x0A
     };
 
-    /* Use send_imu_command_ex:
-     *   - TX 20-byte padded frame, CS HIGH after TX
-     *   - Wait DRDY (level or interrupt) with 500 ms timeout
-     *   - Receive ACK (10 bytes) via header-scan on new CS assertion
-     *   - 1 ms post-command gap
-     */
     send_imu_command_ex(stop_stream_pkt, sizeof(stop_stream_pkt),
                         IMU_SIZE_RESP_ACK, "STOP_STREAMING", NULL);
 
@@ -400,9 +357,6 @@ void IMU_SoftReset(void) {
     Send_UART3_Debug("IMU: soft reset (STOP_STREAMING)\r\n");
 }
 
-/* -------------------------------------------------------------------------- */
-/* build_cmd20 — zero-pad any command to the mandatory 20-byte frame size.   */
-/* -------------------------------------------------------------------------- */
 void build_cmd20(const uint8_t *cmd, uint32_t cmd_len, uint8_t out20[IMU_CMD_PACKET_SIZE])
 {
     memset(out20, 0, IMU_CMD_PACKET_SIZE);
@@ -410,11 +364,6 @@ void build_cmd20(const uint8_t *cmd, uint32_t cmd_len, uint8_t out20[IMU_CMD_PAC
     memcpy(out20, cmd, copy_len);
 }
 
-/* -------------------------------------------------------------------------- */
-/* imu_drdy_ready — returns non-zero when a new DRDY rising edge has fired.  */
-/* ONLY uses the interrupt flag set by the EXTI ISR — never the pin level.   */
-/* Checking pin level causes false-positives when DRDY is still high from    */
-/* the previous command's response (sensor hasn't de-asserted yet).          */
 static int imu_drdy_ready(void) __attribute__((unused));
 static int imu_drdy_ready(void)
 {
@@ -425,10 +374,6 @@ static int imu_drdy_ready(void)
     return 0;
 }
 
-/* -------------------------------------------------------------------------- */
-/* imu_rx_one — clock one 0x00 byte on MOSI, return received byte.           */
-/* SPI must already be in an active CS transaction.                           */
-/* -------------------------------------------------------------------------- */
 static HAL_StatusTypeDef imu_rx_one(uint8_t *out) __attribute__((unused));
 static HAL_StatusTypeDef imu_rx_one(uint8_t *out)
 {
@@ -437,30 +382,11 @@ static HAL_StatusTypeDef imu_rx_one(uint8_t *out)
 }
 
 /* -------------------------------------------------------------------------- */
-/* send_imu_command_ex — IIM-46234 SPI command/response                      */
-/*                                                                            */
-/* ATMEL reference pattern (system.c spi_master_write_read):                 */
-/*   CS LOW → TX 20 bytes → [DRDY fires while CS is still LOW] → RX → HIGH  */
-/*                                                                            */
-/* CS must stay LOW for the ENTIRE TX + DRDY-wait + RX sequence.             */
-/* Raising CS between TX and RX leaves the sensor's SPI shift register in an */
-/* indeterminate state and it will not respond to the next command.           */
-/*                                                                            */
-/*  Phase 1 — FLUSH + CS LOW → TX 20 bytes (CS stays LOW)                   */
-/*  Phase 2 — DRDY poll with CS still LOW (max 500 ms)                       */
-/*  Phase 3 — RX with CS still LOW, then CS HIGH                             */
-/*  Phase 4 — 5 ms inter-command gap (sensor state machine returns to idle)  */
-/*                                                                            */
-/*  Special cases:                                                            */
-/*   START_STREAM 0x27: no response, raise CS after TX immediately.          */
-/*   STOP_STREAM  0x28: uses normal TX+DRDY+RX flow.                         */
-/*                                                                            */
-/*  Fixed response sizes (ATMEL response_handler):                           */
-/*   WRITE_REG  0x12 → IMU_SIZE_RESP_ACK = 10                               */
-/*   READ_REG   0x11 → SIZE_RESP_READ_REGS_BASE(16) + data_len              */
-/*   GET_VERSION 0x20 → 20                                                   */
-/*   SELF_TEST  0x2B → 16                                                    */
-/*   All others       → IMU_SIZE_RESP_ACK = 10                              */
+/* send_imu_command_ex ? IIM-46234 SPI command/response                      */
+/* Command mode is two separate SPI transactions:                            */
+/*   1) Host sends a 20-byte command packet                                  */
+/*   2) After DRDY, host starts a new read transaction for ACK/response      */
+/* This matches the ATMEL reference and the datasheet half-duplex timing.    */
 /* -------------------------------------------------------------------------- */
 int send_imu_command_ex(uint8_t *tx_packet, uint32_t tx_size,
                         uint32_t rx_size, const char *cmd_name,
@@ -471,7 +397,6 @@ int send_imu_command_ex(uint8_t *tx_packet, uint32_t tx_size,
 
     build_cmd20(tx_packet, tx_size, tx20);
 
-    /* Log TX */
     {
         char dbg[120];
         int off = snprintf(dbg, sizeof(dbg), "IMU TX20 [%s]:", cmd_name);
@@ -481,204 +406,186 @@ int send_imu_command_ex(uint8_t *tx_packet, uint32_t tx_size,
         Send_UART3_Debug(dbg);
     }
 
-    uint8_t cmd_type    = tx20[3];
-    int is_start_stream = (cmd_type == 0x27u);
+    uint8_t cmd_type = tx20[3];
+    int no_resp_cmd =
+        (cmd_type == 0x27u) || /* START_STREAMING */
+        (cmd_type == 0x28u) || /* STOP_STREAMING  */
+        (cmd_type == 0x2Du);   /* SET_UTC_TIME    */
 
-    /* Determine fixed RX size per ATMEL response_handler() */
     uint32_t fixed_rx;
     switch (cmd_type) {
-    case 0x11u: /* READ_REG: base + data_len; data_len stored at tx_packet[5] */
+    case 0x11u:
         fixed_rx = (uint32_t)SIZE_RESP_READ_REGS_BASE + (uint32_t)tx_packet[5];
         break;
-    case 0x20u: /* GET_VERSION */
+    case 0x20u:
         fixed_rx = 20u;
         break;
-    case 0x2Bu: /* SELF_TEST */
+    case 0x2Bu:
         fixed_rx = 16u;
         break;
-    default:    /* WRITE_REG 0x12, STOP_STREAM 0x28, etc. */
+    default:
         fixed_rx = (uint32_t)IMU_SIZE_RESP_ACK;
         break;
     }
-    if (rx_size > 0u && rx_size != fixed_rx) fixed_rx = rx_size; /* caller override */
+    if (rx_size > 0u && rx_size != fixed_rx) fixed_rx = rx_size;
     if (fixed_rx > 70u) fixed_rx = 70u;
 
-    /* ================================================================ */
-    /* PHASE 1: CS LOW → TX 20 bytes → CS HIGH                         */
-    /*                                                                   */
-    /* ATMEL spi_master_write() clocks MOSI only — TX, no MISO capture.*/
-    /* Using HAL_SPI_Transmit (not TransmitReceive) matches exactly.    */
-    /* The sensor ONLY begins processing the command and asserting DRDY  */
-    /* AFTER it sees CS go HIGH.                                         */
-    /* ================================================================ */
+    uint32_t edge_base = g_imu_drdy_edges_total;
     drdy_interrupt = 0;
 
     spi2_flush();
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);  /* CS LOW  */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
     delay_us(IMU_NSS_SETUP_US);
 
-    HAL_StatusTypeDef st = HAL_SPI_Transmit(&hspi2, tx20, IMU_CMD_PACKET_SIZE, 100);
-
-    delay_us(IMU_NSS_HOLD_US);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);    /* CS HIGH — sensor latches cmd */
-    delay_us(IMU_NSS_HIGH_US);
-    spi2_flush();
+    HAL_StatusTypeDef st = HAL_OK;
+    for (uint32_t i = 0; i < IMU_CMD_PACKET_SIZE; i++) {
+        uint8_t discard = 0u;
+        st = HAL_SPI_TransmitReceive(&hspi2, &tx20[i], &discard, 1, 10);
+        if (st != HAL_OK) break;
+    }
 
     if (st != HAL_OK) {
+        delay_us(IMU_NSS_HOLD_US);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+        delay_us(IMU_NSS_HIGH_US);
+        spi2_flush();
         Send_UART3_Debug("IMU: TX fail [%s] hal=%d\r\n", cmd_name, (int)st);
         return RET_ERR_SPI;
     }
 
-    /* ================================================================ */
-    /* START_STREAM: no ACK. CS is already HIGH. Done.                  */
-    /* ================================================================ */
-    if (is_start_stream) {
-        Send_UART3_Debug("IMU: START_STREAM sent\r\n");
+    delay_us(IMU_NSS_HOLD_US);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+    delay_us(IMU_NSS_HIGH_US);
+    spi2_flush();
+
+    if (no_resp_cmd) {
+        if (cmd_type == 0x27u) {
+            Send_UART3_Debug("IMU: START_STREAM sent\r\n");
+        }
         HAL_Delay(IMU_POST_CMD_DELAY_MS);
         return RET_OK;
     }
 
-    /* ================================================================ */
-    /* PHASE 2: Wait for DRDY (CS is HIGH — sensor is processing cmd). */
-    /*                                                                   */
-    /* DRDY is a rising-edge pulse. Two ways we can see it:             */
-    /*   (a) interrupt flag: EXTI ISR set drdy_interrupt=1              */
-    /*   (b) pin level HIGH: edge fired but interrupt was already        */
-    /*       processed before we got here (race window = ~500 µs)       */
-    /*                                                                   */
-    /* Step A: wait for any stale HIGH to fall (max 50 ms).             */
-    /*         A stale HIGH means the previous command's DRDY hasn't    */
-    /*         de-asserted yet — discard it.                            */
-    /* Step B: clear interrupt flag, then wait for fresh DRDY.          */
-    /*         Accept EITHER rising-edge interrupt OR pin HIGH.         */
-    /* ================================================================ */
     {
-        /* Step A — drain stale DRDY HIGH left from previous command */
-        uint32_t t0 = HAL_GetTick();
-        while (HAL_GPIO_ReadPin(IMU_DRDY_PORT, IMU_DRDY_PIN) == GPIO_PIN_SET) {
-            if ((HAL_GetTick() - t0) >= 50u) break;
-        }
-        drdy_interrupt = 0;   /* discard any edge accumulated so far */
-
-        /* Step B — wait for the fresh DRDY from THIS command */
-        int drdy_ok = 0;
-        t0 = HAL_GetTick();
-        while ((HAL_GetTick() - t0) < 500u) {
-            if (drdy_interrupt) {
-                drdy_interrupt = 0;
-                drdy_ok = 1;
-                break;
-            }
-            /* Also accept pin level HIGH — catches the race where the
-             * edge fires and the EXTI ISR runs before we enter this loop,
-             * which would have set and then cleared drdy_interrupt already. */
-            if (HAL_GPIO_ReadPin(IMU_DRDY_PORT, IMU_DRDY_PIN) == GPIO_PIN_SET) {
-                drdy_interrupt = 0;
-                drdy_ok = 1;
-                break;
+        uint32_t resp_timeout_ms = (cmd_type == 0x2Bu) ? 6000u : 20u;
+        uint32_t t_wait_start = HAL_GetTick();
+        while ((g_imu_drdy_edges_total == edge_base) && (drdy_interrupt == 0)) {
+            if ((HAL_GetTick() - t_wait_start) >= resp_timeout_ms) {
+                Send_UART3_Debug("IMU: DRDY timeout [%s] edge=%lu pin=%d\r\n",
+                                 cmd_name,
+                                 (unsigned long)(g_imu_drdy_edges_total - edge_base),
+                                 (int)HAL_GPIO_ReadPin(IMU_DRDY_PORT, IMU_DRDY_PIN));
+                return RET_ERR_TIMEOUT;
             }
         }
-        if (!drdy_ok) {
-            Send_UART3_Debug("IMU: DRDY timeout [%s]\r\n", cmd_name);
-            return RET_ERR_TIMEOUT;
-        }
-    }
 
-    /* ================================================================ */
-    /* PHASE 3: CS LOW → RX max(fixed_rx, 22) bytes → CS HIGH          */
-    /* Matches ATMEL spi_master_read(rbuf, rSize) — separate CS pulse.  */
-    /* Clock at least 22 bytes (SIZE_PACKET_CMD+2) to fully drain the   */
-    /* sensor's TX shift register before raising CS again.              */
-    /* ================================================================ */
-    {
-        const uint32_t DRAIN_MIN = (uint32_t)IMU_CMD_PACKET_SIZE + 2u;
-        uint32_t rx_total = (fixed_rx > DRAIN_MIN) ? fixed_rx : DRAIN_MIN;
-        if (rx_total > IMU_RX_TOTAL) rx_total = IMU_RX_TOTAL;
-
-        uint8_t rx_buf[IMU_RX_TOTAL]   = {0};
-        uint8_t tx_zeros[IMU_RX_TOTAL] = {0};
-
-        spi2_flush();
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);  /* CS LOW — RX */
-        delay_us(IMU_NSS_SETUP_US);
-
-        HAL_StatusTypeDef rx_st = HAL_SPI_TransmitReceive(&hspi2, tx_zeros, rx_buf,
-                                                          (uint16_t)rx_total, 100);
-        delay_us(IMU_NSS_HOLD_US);
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);    /* CS HIGH */
-        delay_us(IMU_NSS_HIGH_US);
-        spi2_flush();
-
-        if (rx_st != HAL_OK) {
-            uint32_t sr = hspi2.Instance->SR;
-            Send_UART3_Debug("IMU: RX fail [%s] hal=%d SR=0x%04lX\r\n",
-                             cmd_name, (int)rx_st, (unsigned long)sr);
-            return RET_ERR_SPI;
-        }
-
-        /* Log first 20 raw bytes */
         {
-            char dbg[120];
-            int off = snprintf(dbg, sizeof(dbg), "IMU RX20 [%s]:", cmd_name);
-            for (int i = 0; i < 20 && off < (int)(sizeof(dbg) - 4); i++)
-                off += snprintf(dbg + off, sizeof(dbg) - (size_t)off, " %02X", rx_buf[i]);
-            snprintf(dbg + off, sizeof(dbg) - (size_t)off, "\r\n");
-            Send_UART3_Debug(dbg);
+            uint32_t rx_total = fixed_rx + 2u;
+            if (rx_total > IMU_RX_TOTAL) rx_total = IMU_RX_TOTAL;
+
+            uint8_t rx_buf[IMU_RX_TOTAL] = {0};
+            uint8_t *pkt_start = NULL;
+            uint32_t avail = 0u;
+            HAL_StatusTypeDef rx_st = HAL_OK;
+
+            delay_us(60u); /* Twait(min) = 0.05 ms for non-stream commands */
+            spi2_flush();
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+            delay_us(IMU_NSS_SETUP_US);
+
+            for (uint32_t rx_count = 0u; rx_count < rx_total; rx_count++) {
+                uint8_t tx_zero = 0x00u;
+                rx_st = HAL_SPI_TransmitReceive(&hspi2, &tx_zero, &rx_buf[rx_count], 1, 10);
+                if (rx_st != HAL_OK) {
+                    delay_us(IMU_NSS_HOLD_US);
+                    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+                    delay_us(IMU_NSS_HIGH_US);
+                    spi2_flush();
+                    {
+                        uint32_t sr = hspi2.Instance->SR;
+                        Send_UART3_Debug("IMU: RX fail [%s] hal=%d SR=0x%04lX\r\n",
+                                         cmd_name, (int)rx_st, (unsigned long)sr);
+                    }
+                    return RET_ERR_SPI;
+                }
+            }
+
+            delay_us(IMU_NSS_HOLD_US);
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+            delay_us(IMU_NSS_HIGH_US);
+            spi2_flush();
+
+            {
+                char dbg[120];
+                int off = snprintf(dbg, sizeof(dbg), "IMU RX20 [%s]:", cmd_name);
+                for (int i = 0; i < 20 && off < (int)(sizeof(dbg) - 4); i++)
+                    off += snprintf(dbg + off, sizeof(dbg) - (size_t)off, " %02X", rx_buf[i]);
+                snprintf(dbg + off, sizeof(dbg) - (size_t)off, "\r\n");
+                Send_UART3_Debug(dbg);
+            }
+
+            for (uint32_t i = 0u; i + 1u < rx_total; i++) {
+                if (rx_buf[i] == 0x23u && rx_buf[i + 1u] == 0x23u) {
+                    pkt_start = &rx_buf[i];
+                    avail = (uint32_t)(rx_total - i);
+                    break;
+                }
+            }
+
+            if (pkt_start == NULL) {
+                Send_UART3_Debug("IMU: no 0x2323 hdr [%s] edge=%lu pin=%d\r\n",
+                                 cmd_name,
+                                 (unsigned long)(g_imu_drdy_edges_total - edge_base),
+                                 (int)HAL_GPIO_ReadPin(IMU_DRDY_PORT, IMU_DRDY_PIN));
+                return RET_ERR_RX;
+            }
+
+            if (avail < fixed_rx) {
+                Send_UART3_Debug("IMU: partial pkt avail=%lu need=%lu [%s]\r\n",
+                                 (unsigned long)avail, (unsigned long)fixed_rx, cmd_name);
+                return RET_ERR_RX;
+            }
+
+            uint8_t *pkt = pkt_start;
+
+            if (pkt[fixed_rx-2u] != 0x0Du || pkt[fixed_rx-1u] != 0x0Au) {
+                Send_UART3_Debug("IMU: bad footer [%s] %02X %02X\r\n",
+                                 cmd_name, pkt[fixed_rx-2u], pkt[fixed_rx-1u]);
+            }
+
+            if (fixed_rx >= 7u) {
+                uint16_t stored = ((uint16_t)pkt[fixed_rx-4u] << 8) | pkt[fixed_rx-3u];
+                uint16_t calc = 0u;
+                for (uint32_t ci = 3u; ci < (fixed_rx - 4u); ci++) calc += pkt[ci];
+                if (stored != calc) {
+                    Send_UART3_Debug("IMU: chk FAIL [%s] stored=%04X calc=%04X\r\n",
+                                     cmd_name, (unsigned)stored, (unsigned)calc);
+                }
+            }
+
+            if (cmd_type == 0x12u && pkt[4] != 0x00u) {
+                Send_UART3_Debug("IMU: WRITE_REG err=0x%02X [%s]\r\n", pkt[4], cmd_name);
+                return RET_ERR_RX;
+            }
+
+            if (rx_out) memcpy(rx_out, pkt, fixed_rx);
         }
 
-        /* Find 0x23 0x23 header */
-        uint8_t *pkt_start = NULL;
-        for (uint32_t i = 0u; i + 1u < rx_total; i++) {
-            if (rx_buf[i] == 0x23u && rx_buf[i+1u] == 0x23u) {
-                pkt_start = &rx_buf[i];
-                break;
+        {
+            uint32_t tnext_start = HAL_GetTick();
+            while (!imu_drdy_is_idle()) {
+                if ((HAL_GetTick() - tnext_start) >= 20u) {
+                    Send_UART3_Debug("IMU: DRDY stayed low after RX [%s]\r\n", cmd_name);
+                    break;
+                }
             }
         }
-        if (pkt_start == NULL) {
-            Send_UART3_Debug("IMU: no 0x2323 hdr [%s]\r\n", cmd_name);
-            return RET_ERR_RX;
-        }
 
-        uint32_t avail = (uint32_t)(rx_total - (uint32_t)(pkt_start - rx_buf));
-        uint8_t *pkt   = pkt_start;
-
-        if (avail < fixed_rx) {
-            Send_UART3_Debug("IMU: partial pkt avail=%lu need=%lu [%s]\r\n",
-                             (unsigned long)avail, (unsigned long)fixed_rx, cmd_name);
-        }
-
-        /* Footer check */
-        if (avail >= fixed_rx &&
-            (pkt[fixed_rx-2u] != 0x0Du || pkt[fixed_rx-1u] != 0x0Au))
-            Send_UART3_Debug("IMU: bad footer [%s] %02X %02X\r\n",
-                             cmd_name, pkt[fixed_rx-2u], pkt[fixed_rx-1u]);
-
-        /* Checksum */
-        if (avail >= fixed_rx && fixed_rx >= 7u) {
-            uint16_t stored = ((uint16_t)pkt[fixed_rx-4u] << 8) | pkt[fixed_rx-3u];
-            uint16_t calc = 0u;
-            for (uint32_t ci = 3u; ci < (fixed_rx - 4u); ci++) calc += pkt[ci];
-            if (stored != calc)
-                Send_UART3_Debug("IMU: chk FAIL [%s] stored=%04X calc=%04X\r\n",
-                                 cmd_name, (unsigned)stored, (unsigned)calc);
-        }
-
-        /* WRITE_REG error byte */
-        if (cmd_type == 0x12u && avail >= 5u && pkt[4] != 0x00u) {
-            Send_UART3_Debug("IMU: WRITE_REG err=0x%02X [%s]\r\n", pkt[4], cmd_name);
-            return RET_ERR_RX;
-        }
-
-        if (rx_out && avail >= fixed_rx) memcpy(rx_out, pkt, fixed_rx);
+        drdy_interrupt = 0;
+        delay_us(400u); /* Tnext(min) = 0.3 ms */
+        HAL_Delay(IMU_POST_CMD_DELAY_MS);
+        return RET_OK;
     }
-
-    /* ================================================================ */
-    /* PHASE 4: Inter-command gap — 5 ms minimum.                       */
-    /* Clear any DRDY that fired during the RX read itself.             */
-    /* ================================================================ */
-    drdy_interrupt = 0;
-    HAL_Delay(5u);
-    return RET_OK;
 }
 
 /* Backward-compatible wrapper */
@@ -963,8 +870,8 @@ int IR_FactoryResetNV(void)
 
 //IR Init Helpers
 
-/* ir_flush_rx: explicit drain only — called ONCE before verbose mode command.
- * Must NOT be called from IR_ArmRx — doing so kills the live ReceiveToIdle_IT
+/* ir_flush_rx: explicit drain only ??called ONCE before verbose mode command.
+ * Must NOT be called from IR_ArmRx ??doing so kills the live ReceiveToIdle_IT
  * that the callback re-arms, breaking the handshake.                        */
 static void ir_flush_rx(UART_HandleTypeDef *huart)
 {
@@ -1037,13 +944,13 @@ static int IR_SetNV(uint16_t id, uint16_t val) {
 
     /* NACK (0x06): camera accepted the write but requires a power-cycle  *
      * to activate (e.g. NV17 Genlock Direction, NV18 Genlock Mode).      *
-     * Treat as success — the value IS stored; reboot will apply it.      */
+     * Treat as success ??the value IS stored; reboot will apply it.      */
     if (IR_FindPacket(0x06, 0xFF, NULL) == 0) {
-        Send_UART3_Debug("SetNV#%u NACK(reboot needed) — stored OK\r\n", (unsigned)id);
+        Send_UART3_Debug("SetNV#%u NACK(reboot needed) ??stored OK\r\n", (unsigned)id);
         return 0;
     }
 
-    /* Unknown response — log first 8 bytes for diagnostics */
+    /* Unknown response ??log first 8 bytes for diagnostics */
     {
         char dbg[80];
         int off = snprintf(dbg, sizeof(dbg), "SetNV#%u unknown resp(%u):", (unsigned)id, ir_camera_received_bytes);
@@ -1098,11 +1005,11 @@ int Initialize_IR_Camera(uint8_t camera_num) {
 
     Send_UART3_Debug("Initializing IR Camera %d...\r\n", camera_num);
 
-    // Factory reset NV — restores all NV parameters to defaults before writing ours
+    // Factory reset NV ??restores all NV parameters to defaults before writing ours
     {
         int r = IR_FactoryResetNV();
         if (r != 0) {
-            mcu_ui_log(&g_ctx, "IR cam %d: FactoryResetNV FAILED — continuing anyway\r\n", camera_num);
+            mcu_ui_log(&g_ctx, "IR cam %d: FactoryResetNV FAILED ??continuing anyway\r\n", camera_num);
         }
         HAL_Delay(10);
     }
@@ -1114,7 +1021,7 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     if (ir_camera_data_received_flag) {
         Process_IR_Camera_Received_Data(ir_camera_rx_buffer, ir_camera_received_bytes);
         ir_camera_data_received_flag = false;
-        // Do NOT return — verbose mode response is expected; NV commands must still run
+        // Do NOT return ??verbose mode response is expected; NV commands must still run
         //Return only when NV commands not required
         return RET_OK;
     }
@@ -1256,7 +1163,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_9) { // PB9 DRDY
         drdy_interrupt = 1;       /* used by send_imu_command_ex Phase 2 (command mode) */
-        g_imu_drdy_flag = 1;      /* used by main loop -> mcu_on_imu_drdy (streaming mode) */
+        g_imu_drdy_count++;       /* consumed by main loop -> mcu_on_imu_drdy (streaming mode) */
+        g_imu_drdy_edges_total++;
     } else if (GPIO_Pin == GPIO_PIN_4) { // PC4 VSYNC
         g_vsync_flag = 1;
     }
@@ -1283,7 +1191,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     if (huart->Instance == USART1) {  // IR camera
         ir_camera_data_received_flag = true;
         ir_camera_received_bytes = Size;
-        /* Always re-arm — keeps the UART listening between NV commands and
+        /* Always re-arm ??keeps the UART listening between NV commands and
          * during the handshake / verbose-mode response window.             */
         HAL_UARTEx_ReceiveToIdle_IT(&huart1, ir_camera_rx_buffer, sizeof ir_camera_rx_buffer);
     }
@@ -1382,9 +1290,23 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    // Consume pending IMU DRDY events (counter prevents edge collapse at high ODR)
+    uint32_t pending_drdy = 0;
+    __disable_irq();
+    pending_drdy = g_imu_drdy_count;
+    g_imu_drdy_count = 0;
+    __enable_irq();
 
+    while (pending_drdy--) {
+        mcu_on_imu_drdy(&g_ctx);
+    }
 
-    // Consume UI R if ready
+    if (g_vsync_flag) {
+        g_vsync_flag = 0;
+        mcu_on_vsync(&g_ctx);
+    }
+
+    // Consume UI RX only after latency-sensitive IMU/VSYNC servicing.
     if (ui_rx_chunk_ready) {
         ui_rx_chunk_ready = 0;
         if (ui_rx_chunk_len > 0) {
@@ -1394,19 +1316,7 @@ int main(void)
     }
 
     // Progress FSM (contains blocking delays by design)
-        mcu_fsm_step(&g_ctx);
-
-
-    // Consume IMU DRDY events
-    if (g_imu_drdy_flag) {
-        g_imu_drdy_flag = 0;
-        mcu_on_imu_drdy(&g_ctx);
-    }
-
-    if (g_vsync_flag) {
-        g_vsync_flag = 0;
-        mcu_on_vsync(&g_ctx);
-    }
+    mcu_fsm_step(&g_ctx);
 
     // NOTE: No HAL_Delay() here. The main loop must be free-running so IMU
     // DRDY events at 416 Hz (every 2.4 ms) are processed with minimum latency.
@@ -1514,7 +1424,7 @@ static void MX_I2C3_Init(void)
   /* USER CODE END I2C3_Init 1 */
 
   hi2c3.Instance = I2C3;
-  hi2c3.Init.Timing = 0x00503D58;  // start same as I2C2 (adjust later if needed)
+  hi2c3.Init.Timing = 0x0010061A;  // Fast-mode 400 kHz for FPGA register updates
   hi2c3.Init.OwnAddress1 = 0;
   hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -1563,10 +1473,10 @@ static void MX_SPI2_Init(void)
   hspi2.Init.Mode = SPI_MODE_MASTER;
   hspi2.Init.Direction = SPI_DIRECTION_2LINES;
   hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi2.Init.CLKPolarity = SPI_POLARITY_HIGH;   /* CPOL=1 — clock idles HIGH */
-  hspi2.Init.CLKPhase    = SPI_PHASE_2EDGE;    /* CPHA=1 → SPI Mode 3 (datasheet confirmed; Atmel NCPHA=0 = standard CPHA=1) */
+  hspi2.Init.CLKPolarity = SPI_POLARITY_HIGH;   /* CPOL=1 ??clock idles HIGH */
+  hspi2.Init.CLKPhase    = SPI_PHASE_2EDGE;    /* CPHA=1 ??SPI Mode 3 (datasheet confirmed; Atmel NCPHA=0 = standard CPHA=1) */
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4;  /* ~4 MHz (ATMEL ref uses 6 MHz) */
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;  /* ~8 MHz, inside datasheet 4-12 MHz window */
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -1580,7 +1490,7 @@ static void MX_SPI2_Init(void)
   /* USER CODE BEGIN SPI2_Init 2 */
 
   /* Force RXFIFO threshold to 8-bit (1 byte).
-   * STM32G0 SPI FIFO default threshold is 16-bit — RXNE only fires after
+   * STM32G0 SPI FIFO default threshold is 16-bit ??RXNE only fires after
    * 2 bytes are received.  For 8-bit transfers this causes HAL_SPI_TransmitReceive
    * to stall on the last byte of any odd-length transfer (10-byte ACK,
    * 18-byte READ_REG response, 22-byte drain, etc.).
@@ -1703,7 +1613,7 @@ static void MX_USART3_UART_Init(void)
 
   /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
-  huart3.Init.BaudRate = 460800;   /* 921600: ~0.16 ms/frame vs 1.3 ms at 115200 — needed for 1kHz IMU */
+  huart3.Init.BaudRate = 460800;   /* 921600: ~0.16 ms/frame vs 1.3 ms at 115200 ??needed for 1kHz IMU */
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_NONE;

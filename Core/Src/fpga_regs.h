@@ -23,8 +23,8 @@ extern "C" {
 // roll/pitch sent in centi-degrees (deg * 100), signed int16
 #define FPGA_REG_ORIENT_ROLL_CD8    0x10u // i16 LE at 0x10..0x11
 #define FPGA_REG_ORIENT_PITCH_CD8   0x12u // i16 LE at 0x12..0x13
-#define FPGA_REG_ORIENT_RATE_HZ8    0x14u // u16 LE at 0x14..0x15
-#define FPGA_REG_ORIENT_SEQ8        0x16u // u16 LE at 0x16..0x17
+#define FPGA_REG_ORIENT_RATE_HZ8    0x14u // u16 LE at 0x14..0x15 (currently not updated in fast VSYNC path)
+#define FPGA_REG_ORIENT_SEQ8        0x16u // u16 LE at 0x16..0x17 (currently not updated in fast VSYNC path)
 
 // ---------- PARAM BANKS ----------
 // All float parameters are quantized as Q16.16 int32 before transfer.

@@ -534,3 +534,540 @@ Hardcoded as default values in `s_gyro_bias_x/y/z`. Call `IMU_Handler_SetGyroBia
 | IMU DRDY | PB9 (EXTI rising edge, priority 0) |
 
 SPI2: 4 MHz, Mode 3, software NSS, 8-bit, MSB first.
+
+---
+
+## Batch 15 Update (2026-03-11)
+
+### Why this batch was added
+
+Observed on scope: DRDY is actually ~50 Hz (not just UI-estimation error).  
+Also, this board needs a hardware reset immediately before `START_STREAM` to start streaming reliably.
+
+That creates a conflict:
+- if ODR config is written **before** the final reset, the reset can reload flash-saved values (e.g., 50 Hz),
+- but if reset is removed, streaming may fail to start.
+
+### Changes made in this batch
+
+1. **Keep final pre-stream reset, but move runtime ODR writes after it**
+   - File: `Core/Src/mcu_fsm.c`
+   - `ST_INIT_IMU` now does:
+     - `IMU_Reset` -> `WHO_AM_I` -> `IMU_Reset` -> **final `IMU_Reset`** -> `imu_configure_odr_lpf(1, 0x44)` -> `START_STREAM`
+   - Removed the old reset that was placed right before `START_STREAM` *after* configuration.
+   - Effect: runtime `SAMPLE_RATE_DIV` / `SELECT_OUT_DATA` writes are no longer undone by the final reset.
+
+2. **DRDY command handshake hardened against stale-high state**
+   - File: `Core/Src/main.c`, function `send_imu_command_ex`
+   - Phase 2 now:
+     - fails if DRDY stays HIGH for >50 ms before response window,
+     - then waits for fresh DRDY using LOW->HIGH progression (not stale HIGH carry-over).
+   - Effect: reduces false command-response acceptance from old DRDY state.
+
+3. **Streaming DRDY event handling changed from flag to counter**
+   - Files: `Core/Src/main.c`, `Core/Src/stm32g0xx_it.c`
+   - Replaced `g_imu_drdy_flag` with:
+     - `g_imu_drdy_count` (pending edges)
+     - `g_imu_drdy_edges_total` (total edges seen)
+   - Main loop now consumes all pending DRDY edges (instead of collapsing multiple edges into one).
+   - Effect: prevents under-processing at higher DRDY rates.
+
+### Verification checklist for this batch
+
+1. Boot log should show ODR config succeeds **after final reset**:
+   - `[ODR] SAMPLE_RATE_DIV=0x0001 (ODR=1000 Hz) OK`
+   - `[ODR] SELECT_OUT_DATA=0x07 ... OK`
+   - `[ODR] BW_CONFIG=0x44 OK`
+2. `START_STREAM` should still start reliably.
+3. Scope on PB9 DRDY should rise to near 1 kHz.
+4. If still ~50 Hz, capture logs around:
+   - `IMU: DRDY stuck high before cmd resp`
+   - `IMU: DRDY timeout [...]`
+   - any `[ODR] ... FAILED` line.
+
+---
+
+## Batch 16 Update (2026-03-11)
+
+### Problem seen in latest run
+
+Startup failed at first command:
+
+```
+IMU: reset
+IMU TX20 [WHO_AM_I]: ...
+IMU: DRDY stuck high before cmd resp [WHO_AM_I]
+```
+
+This was caused by a hard-fail condition in `send_imu_command_ex` Phase 2:
+if DRDY remained HIGH for 50 ms before the response wait window, command was aborted immediately.
+
+### Fix applied
+
+File: `Core/Src/main.c`, function `send_imu_command_ex`
+
+1. Removed hard failure on pre-existing DRDY HIGH.
+2. Added fresh-event gating using `g_imu_drdy_edges_total`:
+   - capture `edge_base` before waiting,
+   - accept response-ready only when a new edge is seen (`edges_total != edge_base`) or interrupt flag fires.
+3. Kept LOW->HIGH observation path (`saw_low && pin==HIGH`) as additional race-safe condition.
+4. Added high-held fallback:
+   - if DRDY started HIGH and stayed HIGH through timeout window, attempt RX once and let packet validation decide.
+
+### Expected effect
+
+- `WHO_AM_I` no longer fails immediately just because DRDY is already high after reset.
+- Command path becomes tolerant to reset/boot DRDY level behavior while still preferring fresh DRDY evidence.
+
+---
+
+## Batch 17 Update (2026-03-11)
+
+### Problem seen after batch 16
+
+Latest run reached:
+- `WHO_AM_I` OK
+- `SAMPLE_RATE_DIV` write OK
+- `SELECT_OUT_DATA` write FAILED (`IMU: no 0x2323 hdr`, all-zero RX)
+
+This indicates command sequencing was improved but still not robust for back-to-back writes without reset.
+
+### Root cause
+
+In `send_imu_command_ex` Phase 2, DRDY edge baseline was captured too late and the stale-high drain loop could consume up to 50 ms before response handling.
+If a valid DRDY for the current command arrived in the TX->wait race window, the code could still delay long enough to read zeros/no-header on the next RX transaction.
+
+### Fix applied
+
+File: `Core/Src/main.c`, function `send_imu_command_ex`
+
+1. Capture DRDY edge baseline immediately after TX CS-high (`edge_base_tx`).
+2. Keep DRDY/edge state (do not clear it right before waiting), so fast valid events are preserved.
+3. In stale-high drain loop, break immediately if `drdy_interrupt` is set or edge counter changed.
+4. Use `edge_base_tx` consistently in wait loop for fresh-event detection.
+
+### Expected effect
+
+- Back-to-back write commands (`SAMPLE_RATE_DIV` then `SELECT_OUT_DATA` then `BW_CONFIG`) should no longer lose the second command response.
+- ODR config sequence should complete without requiring an extra hardware reset between each command.
+
+---
+
+## Batch 18 Update (2026-03-11)
+
+### Deeper discrepancy identified
+
+The ATMEL reference always reads the **exact response length** in command mode:
+- `WRITE_REG` ACK: 10 bytes
+- `READ_REG`: `16 + read_length` bytes
+
+The STM32 port had been reading a minimum of 22 bytes for command responses. That does not match either:
+- the ATMEL implementation, or
+- the datasheet command-mode protocol, which defines packet length explicitly and requires only the real response packet to be read.
+
+This mismatch explains the observed pattern:
+- after reset, one command works,
+- then the next command is ignored or returns zeros,
+- `START_STREAM` appears sent, but no DRDY follows.
+
+### Fix applied
+
+1. In `Core/Src/main.c`, command-mode RX length was changed from `max(fixed_rx, 22)` to `fixed_rx + 1`.
+   - `+1` is kept because STM32 logs still show one leading dummy byte (`0x00`) before `0x23 0x23`.
+2. In `Core/Src/mcu_fsm.c`, `START_STREAM` is now considered valid only if a new DRDY edge is observed shortly after sending the command.
+
+### Why this is the strongest current hypothesis
+
+- Datasheet section 5.3.2/5.3.4 defines exact ACK/RESPONSE lengths.
+- ATMEL code reads exactly those lengths.
+- Our failing command was the **second** back-to-back write, which is exactly where an over-read would be expected to strand the protocol state.
+
+---
+
+## Batch 19 Update (2026-03-12)
+
+### Root-cause refinement
+
+After comparing the STM32 implementation against the ATMEL reference and the datasheet timing diagrams again, the most important remaining discrepancy was not SPI mode or base clock.
+
+It was the **command transaction structure**:
+
+- ATMEL path:
+  1. send 20-byte command packet
+  2. deassert CS
+  3. wait for DRDY
+  4. start a **new** SPI transaction to read the ACK/RESPONSE
+
+- STM32 path before this batch:
+  - kept CS asserted from command TX into response RX for command mode
+  - then tried to search for the response header inside that combined transaction
+
+That contradicted:
+- datasheet section 5.3.1.1 (`command mode` is half-duplex), and
+- ATMEL `serif_tx()` + later `serif_rx()` split.
+
+This also matches the observed symptom pattern:
+- first command after reset may succeed,
+- next command is ignored or returns zeros,
+- reset recovers the sensor state.
+
+### Fix applied
+
+File: `Core/Src/main.c`, function `send_imu_command_ex`
+
+1. Reworked command mode to use **two separate CS windows**:
+   - CS low -> 20-byte command TX -> CS high
+   - wait for fresh DRDY
+   - CS low -> response RX -> CS high
+2. Added explicit no-response handling for:
+   - `START_STREAMING (0x27)`
+   - `STOP_STREAMING (0x28)`
+   - `SET_UTC_TIME (0x2D)`
+3. Response wait now uses a fresh DRDY edge baseline:
+   - `g_imu_drdy_edges_total` captured before command TX
+   - timeout if no new response-ready indication arrives
+4. Added explicit post-response wait for DRDY to finish its response window before returning.
+5. Added explicit `Tnext` guard (`>= 0.3 ms`) after response RX.
+6. Kept SPI clock at prescaler `/2` (~8 MHz), which is safely inside the datasheet's `4-12 MHz` window.
+
+### Expected effect
+
+- Back-to-back command reads/writes should no longer require hardware reset between commands.
+- The "echo of the last TX byte" should no longer contaminate response parsing, because command TX and response RX are now separate SPI transactions.
+
+---
+
+## Batch 20 Update (2026-03-12)
+
+### Additional bug found in streaming path
+
+The long-run ODR degradation on the host side (`1000 -> 765 -> 619`) was inconsistent with the first verified stream packets, which already proved the sensor itself was outputting 1 kHz.
+
+The streaming read path in `Core/Src/mcu_fsm.c` used:
+
+- `HAL_SPI_Receive()` in SPI master 2-line mode
+
+On STM32 HAL, that is unsafe here because the master still transmits bytes while receiving. For this IMU stream read, the host must clock out **zeros**, as the ATMEL code does. Sending stale buffer contents on MOSI during stream reads can corrupt long-running streaming behavior.
+
+The stream path also was not explicitly flushing SPI RX/OVR state around each 47-byte read.
+
+### Fix applied
+
+File: `Core/Src/mcu_fsm.c`
+
+1. Added `imu_stream_spi_flush()`:
+   - re-assert 8-bit RX threshold
+   - wait for `BSY=0`
+   - drain RX FIFO
+   - clear OVR if present
+2. Replaced `HAL_SPI_Receive()` with explicit:
+   - `HAL_SPI_TransmitReceive(... zeros ..., rx_buf, 47, ...)`
+3. Added SPI flush before and after each stream transaction.
+
+### Expected effect
+
+- Stream reads now match the ATMEL reference behavior more closely.
+- Host-side packet alignment should be more stable over time.
+- The later false low ODR estimates should be reduced or eliminated if they were caused by SPI RX/FIFO corruption rather than true sensor ODR.
+
+### Verification limitation on this machine
+
+The updated firmware was compiled and flashed successfully after these changes.
+
+However, the full UART log replay loop could not be completed locally in this environment because the currently visible VCP (`COM5`) is not exposing the firmware's UI/log UART traffic, so no post-flash run log was obtainable from this machine for this batch.
+
+---
+
+## Batch 21 Update (2026-03-12)
+
+### New finding from saved log + UI ODR mismatch
+
+The saved `log.txt` only captures the startup window and shows:
+
+- first parsed stream packets at `dts_us ~= 1000`
+- first ODR log at `1000 Hz`
+
+At the same time, the UI later reports about `615 Hz` in the live orientation panel.
+
+Those two observations can both be true because:
+
+1. the firmware logs the human-readable `"[IMU] Sensor ODR ~= ..."` line only once, on the first completed ODR window
+2. later ODR updates are still sent to the UI as `EVT_IMU_ODR`, but are not logged again
+
+### Root issue found in DRDY handling
+
+The PB9 IMU DRDY signal was being handled inconsistently:
+
+- board behavior observed on hardware: **idle HIGH, active LOW pulse**
+- comments in `imu_config.c` already referred to the **next falling-edge DRDY**
+- but firmware GPIO/IRQ handling was still configured for **rising-edge EXTI**
+- `send_imu_command_ex()` also treated `HIGH` after RX as abnormal, which contradicts the observed idle state
+
+That mismatch can cause both:
+
+1. fragile command-response synchronization
+2. unstable long-run stream servicing / ODR estimation
+
+### Fix applied
+
+Files:
+
+- `Core/Src/main.c`
+- `Core/Src/stm32g0xx_it.c`
+
+Changes:
+
+1. PB9 EXTI changed from `GPIO_MODE_IT_RISING` to `GPIO_MODE_IT_FALLING`
+2. EXTI handler changed to consume `FPR1` falling-pending for PB9 instead of `RPR1` rising-pending
+3. Added explicit helpers for DRDY active/idle semantics:
+   - active = pin LOW
+   - idle = pin HIGH
+4. `send_imu_command_ex()` response wait now accepts either:
+   - a fresh DRDY falling edge
+   - or the DRDY pin already LOW
+5. post-RX command wait now waits for DRDY to return to **idle HIGH**, instead of incorrectly treating HIGH as the stuck state
+
+### Expected effect
+
+- command-mode synchronization should now match the actual electrical DRDY behavior
+- false `"DRDY stayed high after RX"` diagnostics are eliminated
+- later ODR collapse caused by wrong-edge synchronization should be reduced or eliminated
+
+### Still open after this batch
+
+This batch fixes a concrete firmware inconsistency.
+
+If the ODR still drops after this change, the next likely bucket is not startup configuration but steady-state servicing throughput:
+
+- SPI stream read + packet parse + Madgwick + Kalman + UART event traffic per sample
+
+At that point the next debug step should be to log:
+
+- DRDY edges seen
+- valid packets parsed
+- parse failures
+- current sample_counter delta histogram
+
+so we can separate true sensor-rate change from host-side servicing loss.
+
+---
+
+## Batch 22 Update (2026-03-12)
+
+### Correction to Batch 21
+
+The falling-edge PB9 change regressed command-mode bring-up immediately:
+
+- fresh log showed `WHO_AM_I` timeout at startup
+- `edge=0 pin=1` means no usable response-ready indication was captured
+
+This proves the previous assumption was too aggressive.
+
+### Refined interpretation
+
+Hardware observation still stands:
+
+- DRDY line is normally HIGH
+- it pulses LOW when active
+
+But for **command-mode response synchronization**, the host-side usable event is the **return-to-HIGH** edge, not the falling edge itself.
+
+That matches the earlier successful runs:
+
+- command responses were captured when PB9 was handled on rising edge
+- switching PB9 command/stream bookkeeping to falling edge broke `WHO_AM_I`
+
+### Fix applied
+
+Files:
+
+- `Core/Src/main.c`
+- `Core/Src/stm32g0xx_it.c`
+
+Changes:
+
+1. Reverted PB9 EXTI from `GPIO_MODE_IT_FALLING` back to `GPIO_MODE_IT_RISING`
+2. Reverted EXTI handler to use `RPR1` / `RPIF9` for PB9
+3. Reverted command wait loop so response readiness is again based on:
+   - fresh PB9 edge count change, or
+   - DRDY interrupt flag
+
+### Conclusion after this correction
+
+The PB9 line may be low-active electrically, but the firmware should not use falling-edge EXTI as the response-ready trigger for command mode on this board. Rising-edge response-ready handling is the behavior that matches the working handshake.
+
+---
+
+## Batch 23 Update (2026-03-12)
+
+### What the latest log + UI behavior mean
+
+The saved boot log still shows:
+
+- valid `WHO_AM_I`
+- default profile confirmed at 1 kHz
+- first parsed stream packets at `dts_us = 1000`
+- first ODR window at `1000 Hz`
+
+But the UI later falls toward about `615 Hz`.
+
+That pattern is now most consistent with a **steady-state servicing throughput limit**, not a startup configuration error.
+
+### Why this is the likely root cause
+
+In the previous stream path, every parsed sample did all of the following on a Cortex-M0+ with software floating point:
+
+1. Madgwick quaternion update
+2. quaternion-to-Euler conversion inside `imu_handler.c`
+   - `atan2f`
+   - `asinf`
+   - `atan2f`
+3. second post-filter accel-angle + Kalman stage inside `mcu_fsm.c`
+   - `atan2f`
+   - `sqrtf`
+   - `atan2f`
+   - two `Kalman1D_Update()` calls
+
+That is redundant work.
+
+Madgwick is already the fusion filter. The second software Kalman stage was adding more floating-point cost to an already expensive path.
+
+### Fix applied
+
+Files:
+
+- `Core/Src/imu_handler.c`
+- `Core/Src/mcu_fsm.c`
+
+Changes:
+
+1. Removed per-sample `Madgwick_GetEuler()` call from `imu_handler.c`
+2. Removed the second post-Madgwick accel-angle + Kalman fusion stage from `mcu_fsm.c`
+3. Kept Madgwick quaternion integration running on **every** valid sample
+4. Added a reduced-rate quaternion-to-roll/pitch conversion path in `mcu_fsm.c`
+   - roll/pitch are now derived from quaternion every `4` samples (`250 Hz` at a `1 kHz` stream)
+   - shadow roll/pitch values are still available continuously for VSYNC use
+5. UI orientation event remains throttled to `100 Hz`
+
+### Intended effect
+
+- preserve high-rate quaternion fusion
+- drastically reduce per-sample software trig cost
+- remove redundant filtering
+- recover sustained stream servicing closer to the sensor's 1 kHz capability
+
+### Tradeoff
+
+Roll/pitch shadow updates are now decimated relative to the raw sensor stream.
+
+That is intentional: the FPGA consumer is frame-synchronous via VSYNC, so updating roll/pitch at `250 Hz` is still comfortably above frame rate while avoiding the previous M0+ overload.
+
+---
+
+## Batch 24 Update (2026-03-16)
+
+### Problem clarified by scope
+
+Hardware scope measurement on PB9 shows DRDY at about `48.5 Hz`, while the UI was showing about `615 Hz`.
+
+Those are not the same metric.
+
+The old UI field labeled `ODR` was populated from the firmware's packet-derived estimate based on:
+
+- stream packet timestamp delta
+- stream packet sample-counter delta
+
+It was **not** the physical PB9 DRDY edge rate.
+
+### Fix applied
+
+Firmware now publishes a separate IMU stats event with three different rates:
+
+1. `DRDY_HZ`
+   - measured from PB9 edge count over wall-clock time
+   - this is the physical interrupt cadence reaching the MCU
+2. `PKT_TS_HZ`
+   - measured from packet `timestamp` and `sample_counter`
+   - this is the logical/sample-domain rate implied by packet contents
+3. `PARSE_OK_HZ`
+   - measured from number of valid parsed packets per wall-clock second
+   - this is the effective packet-processing rate inside the MCU
+
+### Files changed
+
+- `Core/Src/mcu_fsm.c`
+- `PC_MCU_COM/Program.cs`
+
+### UI change
+
+The IMU status text now shows:
+
+- `DRDY <x> Hz`
+- `TS <y> Hz`
+- `Parse <z> Hz`
+
+instead of a single ambiguous `ODR` field.
+
+### Why this matters
+
+This split makes it immediately visible whether a mismatch comes from:
+
+- real sensor/DRDY output behavior
+- packet metadata behavior
+- MCU parsing/service throughput
+
+So if scope says `48.5 Hz`, the UI should now also show something close to:
+
+- `DRDY ~48 Hz`
+- `Parse ~48 Hz`
+
+while `TS` may still differ if the sensor packet metadata implies a different internal sample cadence.
+
+---
+
+## Batch 25 Update (2026-03-16)
+
+### New interpretation of `DRDY 48 Hz / TS 581 Hz / Parse 48 Hz`
+
+That triple no longer points to a bad `SAMPLE_RATE_DIV` write by itself.
+
+It matches the IMU's documented streaming FIFO behavior:
+
+- the sensor samples internally at the configured ODR and pushes packets into a 40-entry queue
+- the host was servicing exactly one packet per observed DRDY event
+- once the host falls behind, the queue can stay non-empty and delivered DRDY transitions no longer reflect every internal sample
+- packet `sample_counter` then jumps by more than 1, so packet timestamps still imply a much higher internal rate than the physical/event-delivered packet rate
+
+In short: the STM32 stream reader was still behaving like an edge-for-edge reader, while the sensor behaves like a queued producer.
+
+### Fix applied
+
+Files:
+
+- `Core/Src/mcu_fsm.c`
+- `Core/Src/main.c`
+
+Changes:
+
+1. **Burst-drain the IMU FIFO when backlog is detected**
+   - `mcu_on_imu_drdy()` now processes more than one stream packet per service pass.
+   - When a parsed packet shows `sample_counter` delta `> 1`, the firmware immediately reads additional packets in the same pass, up to a bounded burst (`IMU_STREAM_BURST_MAX = 16`).
+   - This is intended to catch the host back up to the IMU queue instead of waiting for more DRDY edges that may not come at the internal sample rate once backlog exists.
+
+2. **Move IMU servicing ahead of UI/FSM work in the main loop**
+   - Pending IMU DRDY packets are now consumed before UI RX parsing and FSM stepping.
+   - This reduces latency between the EXTI event and the SPI read in steady-state streaming mode.
+
+3. **Remove trig from the hot path unless it is actually needed**
+   - Quaternion fusion still runs on every valid sample.
+   - Quaternion-to-roll/pitch conversion now runs only when:
+     - a UI orientation send is due, or
+     - FPGA VSYNC data is pending.
+   - This removes unnecessary `atan2f/asinf` cost from most stream packets.
+
+### Expected effect
+
+- physical DRDY and parse rate should move much closer to the true internal sample rate
+- `sample_counter` jumps should shrink back toward `1`
+- `TS` should move toward `DRDY`/`Parse`
+- if the remaining bottleneck is purely compute budget, this batch should still improve the sustainable rate materially because the trig work is now demand-driven instead of packet-driven

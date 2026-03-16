@@ -138,7 +138,6 @@ static int decode_stream_pkt(const uint8_t *pkt, uint32_t pkt_len,
                     (out->gyro_z - s_gyro_bias_z) * DEG2RAD,
                     out->accel_x, out->accel_y, out->accel_z);
 
-    Madgwick_GetEuler(&s_filter, &out->euler);
     Madgwick_GetQuaternion(&s_filter, &out->quaternion);
 
     return IMU_ERR_OK;

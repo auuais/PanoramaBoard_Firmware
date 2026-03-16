@@ -9,7 +9,6 @@
 #include "fpga_regs.h"
 #include "imu_handler.h"
 #include "imu_config.h"
-#include "orientation_kalman.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -20,6 +19,7 @@
 
 //
 static void fpga_service_orient(void);
+static int imu_stream_read_raw(uint8_t *dst);
 
 
 // ---- externs from existing codebase ----
@@ -41,6 +41,8 @@ extern UART_HandleTypeDef huart3;
 extern volatile bool g_debug_enabled;
 extern fpga_i2c_t g_fpga;
 extern void IMU_Handler_SetSampleFreq(float sample_freq);
+extern volatile uint32_t g_imu_drdy_count;
+extern volatile uint32_t g_imu_drdy_edges_total;
 
 // ---- config ----
 #define UI_TX_MAX   512
@@ -55,6 +57,7 @@ extern void IMU_Handler_SetSampleFreq(float sample_freq);
 // ---- Event subtypes ----
 #define EVT_IMU_ORIENT  0x20   // roll_cd (int16 LE) + pitch_cd (int16 LE)
 #define EVT_IMU_ODR     0x21   // rate_hz (uint16 LE)
+#define EVT_IMU_STATS   0x22   // drdy_hz + pkt_ts_hz + parse_ok_hz (uint16 LE each)
 #define EVT_CFG_BANK    0x30   // [sub][bank][mode][8*i32 LE quantized params]
 #define EVT_CFG_APPLY   0x31   // [sub][bank][ok][detail]
 
@@ -86,7 +89,9 @@ extern void IMU_Handler_SetSampleFreq(float sample_freq);
 #define CFG_FLOAT_COUNT  8
 
 // ---- Orientation safety clamp (hard limits, not artificial) ----
-#define ORIENT_CLAMP_DEG   (90.0f)
+#define ORIENT_CLAMP_DEG      (90.0f)
+#define IMU_STREAM_BURST_MAX  16u
+#define UI_ORIENT_DECIM       10u
 
 // ---- IMU command packets (matching ATMEL IIM4623x reference exactly) ----
 // WHO_AM_I = ReadRegister(addr=0x00, len=1, page=0)
@@ -123,17 +128,25 @@ static volatile int16_t s_pitch_cd;
 static volatile int16_t s_rate_hz;
 static volatile bool s_vsync_pending = false;
 static uint16_t s_orient_tx_seq = 0;
-static uint32_t s_last_drdy_tick = 0;
-static uint32_t s_drdy_accum_ms = 0;
-static uint16_t s_drdy_samples = 0;
-static Kalman1D_t s_kf_roll;
-static Kalman1D_t s_kf_pitch;
+static uint32_t s_odr_accum_us = 0;
+static uint16_t s_odr_samples = 0;
+static uint8_t s_stream_valid_log_sent = 0u;
+static uint8_t s_stream_odr_log_sent = 0u;
+static uint8_t s_stream_diag_count = 0;
+static uint8_t s_prev_sample_counter = 0;
+static uint64_t s_prev_timestamp_us = 0;
+static uint16_t s_ui_throttle = 0u;
+static uint32_t s_stats_window_start_ms = 0u;
+static uint32_t s_stats_edges_base = 0u;
+static uint32_t s_stats_parse_ok = 0u;
+static uint32_t s_stats_ts_delta_us = 0u;
+static uint32_t s_stats_ts_delta_count = 0u;
 
 /* -------------------------------------------------------------------------- */
-/* 0.25° quantization — zero lag, eliminates sub-quarter-degree jitter        */
+/* 0.25° quantization ??zero lag, eliminates sub-quarter-degree jitter        */
 /*                                                                             */
 /* Madgwick IS the filter. Its quaternion integrator already smooths the      */
-/* gyro + accel fusion — we do not need a second software filter on top.      */
+/* gyro + accel fusion ??we do not need a second software filter on top.      */
 /* Adding EMA on the Euler output just creates lag that makes 30 Hz frame     */
 /* correction feel sluggish.                                                  */
 /*                                                                             */
@@ -141,7 +154,7 @@ static Kalman1D_t s_kf_pitch;
 /*   - Rounds centidegrees to the nearest 25 cd (= 0.25°)                    */
 /*   - Any jitter smaller than ±12 cd (±0.12°) is silently absorbed          */
 /*   - True motion larger than 0.25° passes through at full speed             */
-/*   - Zero samples of lag — output reflects this exact sample                */
+/*   - Zero samples of lag ??output reflects this exact sample                */
 /* -------------------------------------------------------------------------- */
 #define QUANT_STEP_CD   25   /* 0.25 degree = 25 centidegrees */
 
@@ -149,7 +162,7 @@ static Kalman1D_t s_kf_pitch;
  * @brief Round val_cd to the nearest QUANT_STEP_CD increment.
  *
  * Works correctly for positive and negative values.
- * Example: 137 cd → 125 cd,  138 cd → 150 cd,  -137 cd → -125 cd
+ * Example: 137 cd ??125 cd,  138 cd ??150 cd,  -137 cd ??-125 cd
  */
 static inline int16_t quantize_cd(int16_t val_cd)
 {
@@ -507,7 +520,7 @@ static void ui_send_log(McuContext *ctx, const char *s)
     ui_send_frame(MSG_LOG, 0, (const uint8_t*)s, n);
 }
 
-/* Public version — callable from main.c and any other translation unit.
+/* Public version ??callable from main.c and any other translation unit.
  * Accepts a printf-style format so callers don't need a local snprintf.
  * Usage:  mcu_ui_log(&g_ctx, "Verify Genlock: NV17=%u NV18=%u\r\n", nv17, nv18); */
 void mcu_ui_log(McuContext *ctx, const char *fmt, ...)
@@ -548,6 +561,19 @@ static void ui_send_imu_odr(uint16_t rate_hz)
     p[0] = EVT_IMU_ODR;
     p[1] = (uint8_t)(rate_hz & 0xFF);
     p[2] = (uint8_t)((rate_hz >> 8) & 0xFF);
+    ui_send_frame(MSG_EVT, 0, p, sizeof(p));
+}
+
+static void ui_send_imu_stats(uint16_t drdy_hz, uint16_t pkt_ts_hz, uint16_t parse_ok_hz)
+{
+    uint8_t p[7];
+    p[0] = EVT_IMU_STATS;
+    p[1] = (uint8_t)(drdy_hz & 0xFF);
+    p[2] = (uint8_t)((drdy_hz >> 8) & 0xFF);
+    p[3] = (uint8_t)(pkt_ts_hz & 0xFF);
+    p[4] = (uint8_t)((pkt_ts_hz >> 8) & 0xFF);
+    p[5] = (uint8_t)(parse_ok_hz & 0xFF);
+    p[6] = (uint8_t)((parse_ok_hz >> 8) & 0xFF);
     ui_send_frame(MSG_EVT, 0, p, sizeof(p));
 }
 
@@ -635,12 +661,12 @@ void mcu_fsm_start_init(McuContext *ctx)
     if (ctx == NULL) return;
 
     // ctx->init_seq is already set by the caller (CMD_INIT_SYSTEM handler)
-    // to the UI's sequence number — do NOT reset it here.
+    // to the UI's sequence number ??do NOT reset it here.
 
     // Only allow init start from idle/wait state
     if (ctx->state == ST_WAIT_UI_INIT) {
         ctx->state = ST_BOOT;
-        // No extra ACK here — the caller (CMD_INIT_SYSTEM handler) already sent it
+        // No extra ACK here ??the caller (CMD_INIT_SYSTEM handler) already sent it
     }
 }
 
@@ -655,7 +681,7 @@ void mcu_fsm_step(McuContext *ctx)
     case ST_WAIT_UI_INIT: {
         // Do nothing until UI requests init
 
-//    	ctx->state = ST_BOOT;
+    	ctx->state = ST_BOOT;
         break;
     }
 
@@ -675,7 +701,7 @@ void mcu_fsm_step(McuContext *ctx)
     case ST_INIT_IMU: {
         // ----------------------------------------------------------------
         // INIT SEQUENCE (batch 14):
-        //   Reset → WHO_AM_I → Reset → imu_configure_odr_lpf → START_STREAM
+        //   Reset ??WHO_AM_I ??Reset ??imu_configure_odr_lpf ??START_STREAM
         //
         // SPI fixes applied (batch 14):
         //   - spi2_flush() now re-asserts FRXTH=1 on every call
@@ -685,14 +711,14 @@ void mcu_fsm_step(McuContext *ctx)
         //     to catch the race where the edge fires before the poll loop
         //
         // With these fixes multiple consecutive commands work, so ODR
-        // and SELECT_OUT_DATA are written explicitly every boot — we no
+        // and SELECT_OUT_DATA are written explicitly every boot ??we no
         // longer rely on whatever was saved to flash.
         // ----------------------------------------------------------------
 
         /* ---- First reset: clean boot ---- */
         IMU_Reset();
-
-        /* ---- WHO_AM_I — confirm sensor is alive ---- */
+        HAL_Delay(10);
+        /* ---- WHO_AM_I ??confirm sensor is alive ---- */
         uint8_t wai_rx[SIZE_RESP_READ_REGS_BASE + 2u] = {0};
         int r = send_imu_command_ex(who_am_i_packet, sizeof(who_am_i_packet),
                                     (uint32_t)(SIZE_RESP_READ_REGS_BASE + 1u), "WHO_AM_I",
@@ -723,40 +749,68 @@ void mcu_fsm_step(McuContext *ctx)
             break;
         }
 
-        /* ---- Second reset: clears WHO_AM_I side-effects ---- */
-        HAL_Delay(10);
-        IMU_Reset();
-
-        /* ---- Configure ODR=1000 Hz and SELECT_OUT_DATA=0x07 ----
-         * Write every boot — do not rely on flash state.
-         * imu_configure_odr_lpf writes: SAMPLE_RATE_DIV, SELECT_OUT_DATA,
-         * BW_CONFIG.  SAVE_ALL_CONFIG is intentionally removed (see
-         * imu_config.c) to reduce the number of SPI transactions.      */
         float imu_odr_hz = 1000.0f;
         {
-            int rc = imu_configure_odr_lpf(IMU_ODR_DIV_1000HZ, IMU_BW_DEFAULT);
+            int rc = imu_ensure_default_profile();
             if (rc == 0) {
-                ui_send_log(ctx, "[IMU] ODR=1000 Hz, SELECT_OUT_DATA=0x07 OK\r\n");
+                ui_send_log(ctx, "[IMU] Flash-backed default profile verified\r\n");
             } else {
-                imu_odr_hz = 50.0f;   /* fall back to ~sensor default */
-                ui_send_log(ctx, "[IMU] WARN: ODR config failed, using flash defaults\r\n");
+                ui_send_log(ctx, "[IMU] WARN: Default profile verify/restore failed\r\n");
             }
         }
 
-        IMU_Handler_Init(imu_odr_hz, 0.9f);
-        Kalman1D_Init(&s_kf_roll,  0.001f, 0.003f, 0.5f, 0.0f);
-        Kalman1D_Init(&s_kf_pitch, 0.001f, 0.003f, 0.5f, 0.0f);
+        {
+            float t = 0.0f, h = 0.0f;
+            for (int i = 0; i < 3; i++) {
+                Read_HDC3022_Sensor(&t, &h);
+                HAL_Delay(10);
+            }
 
-        /* ---- START_STREAM — no DRDY/ACK, returns immediately ---- */
-        HAL_Delay(10);
+            uint8_t ok_temp = (t > -900.0f && h > -900.0f) ? 1 : 0;
+            ui_send_init_ack(ctx->init_seq, NODE_TEMP, 0, ok_temp,
+                             ok_temp ? ERR_OK : ERR_FAIL);
+
+            {
+                int16_t  t_cd = (int16_t)lroundf(t * 100.0f);
+                uint16_t h_cp = (uint16_t)lroundf(h * 100.0f);
+                char msg[80];
+                snprintf(msg, sizeof(msg),
+                         "Temperature %.2f C, Humidity %.2f %%\r\n",
+                         t_cd / 100.0f,
+                         h_cp / 100.0f);
+                Send_UART3_Debug(msg);
+            }
+        }
+
+        /* This board still behaves reliably only when START_STREAM is the
+         * first command after reset. Keep the final reset immediately before
+         * sending START_STREAM. */
         IMU_Reset();
+        HAL_Delay(10);
+
+        IMU_Handler_Init(imu_odr_hz, 0.9f);
+        s_stream_valid_log_sent = 0u;
+        s_stream_odr_log_sent = 0u;
+        s_stream_diag_count = 0u;
+        s_prev_sample_counter = 0u;
+        s_prev_timestamp_us = 0u;
+        s_odr_accum_us = 0u;
+        s_odr_samples = 0u;
+        s_ui_throttle = 0u;
+        s_stats_window_start_ms = HAL_GetTick();
+        s_stats_edges_base = g_imu_drdy_edges_total;
+        s_stats_parse_ok = 0u;
+        s_stats_ts_delta_us = 0u;
+        s_stats_ts_delta_count = 0u;
+        HAL_Delay(50u);
+
         int rs = send_imu_command(start_streaming_packet,
                                   sizeof(start_streaming_packet),
                                   0, "START_STREAM");
 
         if (rs == 0) {
             ctx->imu_streaming = true;
-            ui_send_log(ctx, "[IMU] Streaming started\r\n");
+            ui_send_log(ctx, "[IMU] START_STREAM sent; waiting for first DRDY packet\r\n");
         } else {
             ctx->imu_streaming = false;
             uint8_t err_payload[2] = { NODE_IMU, ERR_FAIL };
@@ -764,71 +818,71 @@ void mcu_fsm_step(McuContext *ctx)
             ui_send_log(ctx, "[IMU] START_STREAM failed\r\n");
         }
 
-        ctx->day_idx = 0;
-        ctx->state = ST_INIT_DAY;
+        ctx->state = ST_OPERATION;
+        ui_send_log(ctx, "Entered OPERATION\r\n");
         break;
     }
 
 
-    case ST_INIT_DAY: {
-        if (ctx->day_idx < 6) {
-            HAL_Delay(20);
-            int r = test_day_camera_controls(ctx->day_idx);   // change it to return status if it doesn’t
-            uint8_t ok = (r == 0) ? 1 : 0;
-            ui_send_init_ack(ctx->init_seq,NODE_DAY, ctx->day_idx, ok, ok ? ERR_OK : ERR_FAIL);
-            ctx->day_idx++;
-        } else {
-            ctx->ir_idx = 0;
-            ctx->state = ST_INIT_IR;
-        }
-        break;
-    }
-
-
-    case ST_INIT_IR: {
-    	HAL_Delay(1000);
-    	if (ctx->ir_idx < 6) {
-        	int r = Initialize_IR_Camera(ctx->ir_idx);   // change to return status if it doesn’t
-            uint8_t ok = (r == 0) ? 1 : 0;
-            ui_send_init_ack(ctx->init_seq,NODE_IR, ctx->ir_idx, ok, ok ? ERR_OK : ERR_FAIL);
-
-            ctx->ir_idx++;
-
-        } else {
-            ctx->state = ST_INIT_FPGA_CAL;
-        }
-        break;
-    }
-
-
-    case ST_INIT_FPGA_CAL: {
-        int st = fpga_rw_smoke_test();
-
-        if (st == 0) {
-            ui_send_log(ctx, "FPGA I2C ping OK (0xA5)\r\n");
-            Send_UART3_Debug("FPGA I2C ping OK (0xA5)\r\n\n\n");
-            uint8_t detail = fpga_push_all_runtime_config();
-            if (detail == CFG_APPLY_OK) {
-                ui_send_log(ctx, "FPGA runtime config push OK\r\n");
-                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 1, ERR_OK);
-            } else {
-                char msg[96];
-                snprintf(msg, sizeof(msg), "FPGA runtime config push FAIL detail=%u\r\n", (unsigned)detail);
-                ui_send_log(ctx, msg);
-                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
-            }
-
-        } else {
-            ui_send_log(ctx, "FPGA I2C ping FAIL\r\n");
-            Send_UART3_Debug("FPGA I2C ping FAIL\r\n");
-
-             ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
-        }
-
-        // Do NOT say Entered OPERATION here; we are not in OPERATION yet.
-        ctx->state = ST_INIT_TEMP;
-        break;
-    }
+//    case ST_INIT_DAY: {
+//        if (ctx->day_idx < 6) {
+//            HAL_Delay(20);
+//            int r = test_day_camera_controls(ctx->day_idx);   // change it to return status if it doesn?�t
+//            uint8_t ok = (r == 0) ? 1 : 0;
+//            ui_send_init_ack(ctx->init_seq,NODE_DAY, ctx->day_idx, ok, ok ? ERR_OK : ERR_FAIL);
+//            ctx->day_idx++;
+//        } else {
+//            ctx->ir_idx = 0;
+//            ctx->state = ST_INIT_IR;
+//        }
+//        break;
+//    }
+//
+//
+//    case ST_INIT_IR: {
+//    	HAL_Delay(1000);
+//    	if (ctx->ir_idx < 6) {
+//        	int r = Initialize_IR_Camera(ctx->ir_idx);   // change to return status if it doesn?�t
+//            uint8_t ok = (r == 0) ? 1 : 0;
+//            ui_send_init_ack(ctx->init_seq,NODE_IR, ctx->ir_idx, ok, ok ? ERR_OK : ERR_FAIL);
+//
+//            ctx->ir_idx++;
+//
+//        } else {
+//            ctx->state = ST_INIT_FPGA_CAL;
+//        }
+//        break;
+//    }
+//
+//
+//    case ST_INIT_FPGA_CAL: {
+//        int st = fpga_rw_smoke_test();
+//
+//        if (st == 0) {
+//            ui_send_log(ctx, "FPGA I2C ping OK (0xA5)\r\n");
+//            Send_UART3_Debug("FPGA I2C ping OK (0xA5)\r\n\n\n");
+//            uint8_t detail = fpga_push_all_runtime_config();
+//            if (detail == CFG_APPLY_OK) {
+//                ui_send_log(ctx, "FPGA runtime config push OK\r\n");
+//                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 1, ERR_OK);
+//            } else {
+//                char msg[96];
+//                snprintf(msg, sizeof(msg), "FPGA runtime config push FAIL detail=%u\r\n", (unsigned)detail);
+//                ui_send_log(ctx, msg);
+//                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
+//            }
+//
+//        } else {
+//            ui_send_log(ctx, "FPGA I2C ping FAIL\r\n");
+//            Send_UART3_Debug("FPGA I2C ping FAIL\r\n");
+//
+//             ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
+//        }
+//
+//        // Do NOT say Entered OPERATION here; we are not in OPERATION yet.
+//        ctx->state = ST_INIT_TEMP;
+//        break;
+//    }
 
     case ST_INIT_TEMP: {
         float t = 0.0f, h = 0.0f;
@@ -875,7 +929,7 @@ void mcu_fsm_step(McuContext *ctx)
 }
 
 // ===================== IMU DRDY handler =====================
-// Called from main loop when g_imu_drdy_flag is set (EXTI PB9).
+// Called from main loop for each pending DRDY edge counted from EXTI PB9.
 
 /* Local microsecond delay for NSS timing in streaming read path */
 static void fsm_delay_us(uint32_t us) {
@@ -883,10 +937,64 @@ static void fsm_delay_us(uint32_t us) {
     while (count--) { __NOP(); }
 }
 
+static void imu_stream_spi_flush(void)
+{
+    hspi2.Instance->CR2 |= SPI_CR2_FRXTH;
+
+    uint32_t t0 = HAL_GetTick();
+    while (hspi2.Instance->SR & SPI_SR_BSY) {
+        if ((HAL_GetTick() - t0) >= 10u) break;
+    }
+
+    while (hspi2.Instance->SR & SPI_SR_RXNE) {
+        volatile uint8_t dummy = *(__IO uint8_t *)&hspi2.Instance->DR;
+        (void)dummy;
+    }
+
+    if (hspi2.Instance->SR & SPI_SR_OVR) {
+        __HAL_SPI_CLEAR_OVRFLAG(&hspi2);
+    }
+}
+
+static void quat_to_roll_pitch_deg(const Quaternion_t *q, float *roll_deg, float *pitch_deg)
+{
+    const float RAD2DEG = 180.0f / 3.14159265358979f;
+    const float q0 = q->q0;
+    const float q1 = q->q1;
+    const float q2 = q->q2;
+    const float q3 = q->q3;
+
+    float sinr_cosp = 2.0f * (q0 * q1 + q2 * q3);
+    float cosr_cosp = 1.0f - 2.0f * (q1 * q1 + q2 * q2);
+    float sinp = 2.0f * (q0 * q2 - q3 * q1);
+
+    if (sinp > 1.0f) sinp = 1.0f;
+    if (sinp < -1.0f) sinp = -1.0f;
+
+    *roll_deg = atan2f(sinr_cosp, cosr_cosp) * RAD2DEG;
+    *pitch_deg = asinf(sinp) * RAD2DEG;
+}
+
+static void update_shadow_roll_pitch(const Quaternion_t *q)
+{
+    float roll_deg = 0.0f;
+    float pitch_deg = 0.0f;
+
+    quat_to_roll_pitch_deg(q, &roll_deg, &pitch_deg);
+
+    if (roll_deg  >  ORIENT_CLAMP_DEG) roll_deg  =  ORIENT_CLAMP_DEG;
+    if (roll_deg  < -ORIENT_CLAMP_DEG) roll_deg  = -ORIENT_CLAMP_DEG;
+    if (pitch_deg >  ORIENT_CLAMP_DEG) pitch_deg =  ORIENT_CLAMP_DEG;
+    if (pitch_deg < -ORIENT_CLAMP_DEG) pitch_deg = -ORIENT_CLAMP_DEG;
+
+    s_roll_cd = quantize_cd((int16_t)lroundf(roll_deg * 100.0f));
+    s_pitch_cd = quantize_cd((int16_t)lroundf(pitch_deg * 100.0f));
+}
+
 /* Confirmed from log (2026-02-26, batch 11):
  * The sensor outputs 1 dummy byte (0x00) before the 46-byte stream packet.
  * Total SPI read = 47 bytes.  Packet starts at byte[1] (0x23 0x23 header).
- *   byte[0]       = 0x00  (dummy / SPI pipeline flush byte — ignore)
+ *   byte[0]       = 0x00  (dummy / SPI pipeline flush byte ??ignore)
  *   byte[1..2]    = 0x23 0x23  (stream packet header)
  *   byte[3]       = packet size byte (0x2E = 46)
  *   byte[4..46]   = remainder of 46-byte stream packet
@@ -899,120 +1007,199 @@ static void fsm_delay_us(uint32_t us) {
 #define IMU_STREAM_READ_TOTAL   (IMU_STREAM_DUMMY_BYTES + IMU_STREAM_PKT_BYTES)  /* 47 */
 
 static uint8_t s_imu_rx_buf[IMU_STREAM_READ_TOTAL];
+static const uint8_t s_imu_tx_zeros[IMU_STREAM_READ_TOTAL] = {0};
 
-void mcu_on_imu_drdy(McuContext *ctx)
+static int imu_stream_read_raw(uint8_t *dst)
 {
-    if (ctx->state != ST_OPERATION) return;
-
-    /* ------------------------------------------------------------------ */
-    /* Bulk streaming read:                                                 */
-    /*   CS LOW → HAL_SPI_Receive 47 bytes → CS HIGH                      */
-    /* byte[0] = dummy, byte[1..46] = 46-byte stream packet (0x23 header) */
-    /* ------------------------------------------------------------------ */
-
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);  /* CS LOW  */
+    imu_stream_spi_flush();
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
     fsm_delay_us(5u);
 
-    HAL_StatusTypeDef spi_st = HAL_SPI_Receive(
-        &hspi2,
-        s_imu_rx_buf,
-        IMU_STREAM_READ_TOTAL,
-        10u);   /* 47 bytes @ 4 MHz ≈ 94 µs; 10 ms timeout is plenty */
+    HAL_StatusTypeDef spi_st = HAL_SPI_TransmitReceive(&hspi2,
+                                                       (uint8_t *)s_imu_tx_zeros,
+                                                       dst,
+                                                       IMU_STREAM_READ_TOTAL,
+                                                       10u);
 
     fsm_delay_us(5u);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);    /* CS HIGH */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+    imu_stream_spi_flush();
 
-    if (spi_st != HAL_OK) return;
+    return (spi_st == HAL_OK) ? 0 : -1;
+}
 
-    /* Packet always starts at byte[1] — validate header */
+static int mcu_process_imu_stream_packet(McuContext *ctx, uint8_t *delta_counter_out)
+{
+    if (delta_counter_out) *delta_counter_out = 0u;
+
+    if (imu_stream_read_raw(s_imu_rx_buf) != 0) return -1;
+
+    /* Packet always starts at byte[1] ??validate header */
     uint8_t *pkt      = &s_imu_rx_buf[IMU_STREAM_DUMMY_BYTES];
     uint32_t pkt_avail = IMU_STREAM_PKT_BYTES;
 
     if (pkt[0] != 0x23u || pkt[1] != 0x23u) {
-        /* Unexpected — header not where expected, discard */
-        return;
+        /* Unexpected ??header not where expected, discard */
+        return 0;
     }
 
     // ---- Parse packet + run Madgwick ----
     IMU_Sample_t sample;
     int parse_result = IMU_Handler_ProcessStreamPacket(pkt, pkt_avail, &sample);
     if (parse_result != IMU_ERR_OK) {
-        /* Discard silently — no Send_UART3_Debug here, blocking UART kills 1kHz */
-        return;
+        /* Discard silently ??no Send_UART3_Debug here, blocking UART kills 1kHz */
+        return 0;
     }
 
-    // ---- DRDY interval measurement (ms) -> ODR ----
-    uint32_t now = HAL_GetTick();
-    float dt_s = 0.0f;
-    if (s_last_drdy_tick != 0) {
-        uint32_t delta_ms = now - s_last_drdy_tick;
-        if (delta_ms > 0 && delta_ms < 1000) { // ignore outliers
-            dt_s = delta_ms * 0.001f;
-            s_drdy_accum_ms += delta_ms;
-            s_drdy_samples++;
-            if (s_drdy_samples >= 16) {
-                uint32_t avg_ms = s_drdy_accum_ms / s_drdy_samples;
-                if (avg_ms > 0) {
-                    uint16_t rate_hz = (uint16_t)((1000u + (avg_ms / 2u)) / avg_ms); // rounded
-                    s_rate_hz = (int16_t)rate_hz;
-                    IMU_Handler_SetSampleFreq((float)rate_hz);
-                    ui_send_imu_odr(rate_hz);
-                    /* NOTE: Send_UART3_Debug removed from here — it calls
-                     * HAL_UART_Transmit (blocking) every 16 samples which
-                     * adds ~1.3 ms stall at 115200 and prevents 1kHz processing. */
+    s_stats_parse_ok++;
+
+    if (!s_stream_valid_log_sent) {
+        s_stream_valid_log_sent = 1u;
+        ui_send_log(ctx, "[IMU] First stream packet parsed\r\n");
+    }
+
+    uint64_t timestamp_us =
+        ((uint64_t)sample.timestamp_high << 32) | (uint64_t)sample.timestamp_low;
+    uint8_t delta_counter = 0u;
+    uint32_t delta_us = 0u;
+
+    if (s_prev_timestamp_us != 0u) {
+        delta_counter = (uint8_t)(sample.sample_counter - s_prev_sample_counter);
+        delta_us = (uint32_t)(timestamp_us - s_prev_timestamp_us);
+        if (delta_counter > 0u && delta_us > 0u && delta_us < 1000000u) {
+            s_stats_ts_delta_us += delta_us;
+            s_stats_ts_delta_count += delta_counter;
+            uint32_t per_sample_us = delta_us / (uint32_t)delta_counter;
+            if (per_sample_us > 0u) {
+                s_odr_accum_us += per_sample_us;
+                s_odr_samples++;
+                if (s_odr_samples >= 32u) {
+                    uint32_t avg_us = s_odr_accum_us / s_odr_samples;
+                    if (avg_us > 0u) {
+                        uint16_t rate_hz = (uint16_t)((1000000u + (avg_us / 2u)) / avg_us);
+                        s_rate_hz = (int16_t)rate_hz;
+                        IMU_Handler_SetSampleFreq((float)rate_hz);
+                        ui_send_imu_odr(rate_hz);
+                        if (!s_stream_odr_log_sent) {
+                            char odr_msg[64];
+                            s_stream_odr_log_sent = 1u;
+                            snprintf(odr_msg, sizeof(odr_msg), "[IMU] Sensor ODR ~= %u Hz\r\n",
+                                     (unsigned)rate_hz);
+                            ui_send_log(ctx, odr_msg);
+                        }
+                    }
+                    s_odr_accum_us = 0u;
+                    s_odr_samples = 0u;
                 }
-                s_drdy_accum_ms = 0;
-                s_drdy_samples = 0;
             }
         }
     }
-    s_last_drdy_tick = now;
-    if (dt_s <= 0.0f) dt_s = 0.001f; // fallback 1 kHz
+    if (delta_counter_out) *delta_counter_out = delta_counter;
 
-    // ---- Extract roll and pitch (yaw discarded — no magnetometer) ----
-    float roll_deg  = sample.euler.roll;
-    float pitch_deg = sample.euler.pitch;
+    if (s_stream_diag_count < 8u) {
+        char diag_msg[128];
 
-    // ---- Kalman fuse gyro+accel (gyro deg/s, accel-derived angles) ----
-    float acc_roll_deg  = atan2f(sample.accel_y, sample.accel_z) * (180.0f / 3.14159265358979f);
-    float acc_pitch_deg = atan2f(-sample.accel_x, sqrtf(sample.accel_y*sample.accel_y + sample.accel_z*sample.accel_z)) * (180.0f / 3.14159265358979f);
-    float kf_roll_deg  = Kalman1D_Update(&s_kf_roll, sample.gyro_x, acc_roll_deg, dt_s);
-    float kf_pitch_deg = Kalman1D_Update(&s_kf_pitch, sample.gyro_y, acc_pitch_deg, dt_s);
+        if (s_stream_diag_count == 0u) {
+            snprintf(diag_msg, sizeof(diag_msg),
+                     "[IMU] pkt0 sc=%u ts=%lu\r\n",
+                     (unsigned)sample.sample_counter,
+                     (unsigned long)timestamp_us);
+        } else {
+            uint8_t delta_counter = (uint8_t)(sample.sample_counter - s_prev_sample_counter);
+            uint32_t delta_us = (uint32_t)(timestamp_us - s_prev_timestamp_us);
+            snprintf(diag_msg, sizeof(diag_msg),
+                     "[IMU] pkt%u sc=%u dsc=%u dts_us=%lu\r\n",
+                     (unsigned)s_stream_diag_count,
+                     (unsigned)sample.sample_counter,
+                     (unsigned)delta_counter,
+                     (unsigned long)delta_us);
+        }
+        ui_send_log(ctx, diag_msg);
+        s_stream_diag_count++;
+    }
+    s_prev_sample_counter = sample.sample_counter;
+    s_prev_timestamp_us = timestamp_us;
 
-    // ---- Safety clamp ±90° ----
-    if (roll_deg  >  90.0f) roll_deg  =  90.0f;
-    if (roll_deg  < -90.0f) roll_deg  = -90.0f;
-    if (pitch_deg >  90.0f) pitch_deg =  90.0f;
-    if (pitch_deg < -90.0f) pitch_deg = -90.0f;
+    {
+        uint32_t now_ms = HAL_GetTick();
+        uint32_t elapsed_ms = now_ms - s_stats_window_start_ms;
+        if (elapsed_ms >= 1000u) {
+            uint32_t edge_now = 0u;
+            uint32_t drdy_edges = 0u;
+            uint16_t drdy_hz = 0u;
+            uint16_t parse_ok_hz = 0u;
+            uint16_t pkt_ts_hz = 0u;
 
-    if (kf_roll_deg  >  90.0f) kf_roll_deg  =  90.0f;
-    if (kf_roll_deg  < -90.0f) kf_roll_deg  = -90.0f;
-    if (kf_pitch_deg >  90.0f) kf_pitch_deg =  90.0f;
-    if (kf_pitch_deg < -90.0f) kf_pitch_deg = -90.0f;
+            __disable_irq();
+            edge_now = g_imu_drdy_edges_total;
+            __enable_irq();
 
-    // ---- Convert to centidegrees (int16) ----
-    int16_t roll_cd  = (int16_t)lroundf(kf_roll_deg  * 100.0f);
-    int16_t pitch_cd = (int16_t)lroundf(kf_pitch_deg * 100.0f);
+            drdy_edges = edge_now - s_stats_edges_base;
+            drdy_hz = (uint16_t)((drdy_edges * 1000u + (elapsed_ms / 2u)) / elapsed_ms);
+            parse_ok_hz = (uint16_t)((s_stats_parse_ok * 1000u + (elapsed_ms / 2u)) / elapsed_ms);
 
-    // ---- Quantize to 0.25° steps ----
-    roll_cd  = quantize_cd(roll_cd);
-    pitch_cd = quantize_cd(pitch_cd);
+            if (s_stats_ts_delta_us > 0u && s_stats_ts_delta_count > 0u) {
+                uint64_t num = (uint64_t)s_stats_ts_delta_count * 1000000ull;
+                pkt_ts_hz = (uint16_t)((num + (uint64_t)(s_stats_ts_delta_us / 2u)) /
+                                       (uint64_t)s_stats_ts_delta_us);
+            } else if (s_rate_hz > 0) {
+                pkt_ts_hz = (uint16_t)s_rate_hz;
+            }
 
-    // ---- Update shadow registers ----
-    s_roll_cd      = roll_cd;
-    s_pitch_cd     = pitch_cd;
+            ui_send_imu_stats(drdy_hz, pkt_ts_hz, parse_ok_hz);
 
-    // ---- Throttle UI sends to 100 Hz max ----------------------------------------
-    // HAL_UART_Transmit is BLOCKING. At 921600 baud a ~15 byte frame costs ~0.16 ms.
-    // At 1000 Hz that is 160 ms/s of blocking — acceptable but only if we throttle.
-    // Sending every 10th sample = 100 Hz to the UI, zero DRDY samples are dropped
-    // (Kalman still runs at full 1 kHz), and UART time is capped at 16 ms/s.
-    // -------------------------------------------------------------------------------
-    static uint16_t s_ui_throttle = 0u;
+            s_stats_window_start_ms = now_ms;
+            s_stats_edges_base = edge_now;
+            s_stats_parse_ok = 0u;
+            s_stats_ts_delta_us = 0u;
+            s_stats_ts_delta_count = 0u;
+        }
+    }
+
     s_ui_throttle++;
-    if (s_ui_throttle >= 10u) {
-        s_ui_throttle = 0u;
-        ui_send_imu_orient(roll_cd, pitch_cd);
+    {
+        const bool ui_due = (s_ui_throttle >= UI_ORIENT_DECIM);
+        if (s_vsync_pending || ui_due) {
+            update_shadow_roll_pitch(&sample.quaternion);
+        }
+
+        if (ui_due) {
+            s_ui_throttle = 0u;
+            ui_send_imu_orient((int16_t)s_roll_cd, (int16_t)s_pitch_cd);
+        }
+    }
+
+    return 1;
+}
+
+void mcu_on_imu_drdy(McuContext *ctx)
+{
+    if (ctx->state != ST_OPERATION) return;
+
+    /* The IMU streams into a 40-entry FIFO in streaming mode. If we process only
+     * one packet per DRDY event and fall behind, the queue can stay non-empty and
+     * the delivered DRDY edge rate collapses well below the internal sample rate.
+     * When sample_counter jumps by N, immediately drain up to N-1 more packets to
+     * catch the host back up to the FIFO. */
+    uint32_t processed = 0u;
+    uint32_t burst_budget = 1u;
+
+    while (processed < IMU_STREAM_BURST_MAX && burst_budget > 0u) {
+        uint8_t delta_counter = 0u;
+        int packet_status = 0;
+
+        burst_budget--;
+        packet_status = mcu_process_imu_stream_packet(ctx, &delta_counter);
+        if (packet_status <= 0) break;
+
+        processed++;
+
+        if (delta_counter > 1u && processed < IMU_STREAM_BURST_MAX) {
+            uint32_t backlog = (uint32_t)(delta_counter - 1u);
+            uint32_t room = IMU_STREAM_BURST_MAX - processed;
+            if (backlog > room) backlog = room;
+            burst_budget += backlog;
+        }
     }
 }
 
@@ -1030,28 +1217,24 @@ static void fpga_service_orient(void)
     if (!s_vsync_pending) return;
     s_vsync_pending = false;
 
-    uint8_t payload[8];
-
     const int16_t roll  = s_roll_cd;
     const int16_t pitch = s_pitch_cd;
-    const uint16_t rate = (uint16_t)s_rate_hz;
-    const uint16_t seq  = ++s_orient_tx_seq;
+    uint8_t payload[4];
 
     payload[0] = (uint8_t)(roll & 0xFF);
     payload[1] = (uint8_t)((roll >> 8) & 0xFF);
     payload[2] = (uint8_t)(pitch & 0xFF);
     payload[3] = (uint8_t)((pitch >> 8) & 0xFF);
-    payload[4] = (uint8_t)(rate & 0xFF);
-    payload[5] = (uint8_t)((rate >> 8) & 0xFF);
-    payload[6] = (uint8_t)(seq & 0xFF);
-    payload[7] = (uint8_t)((seq >> 8) & 0xFF);
 
-    uint8_t detail = CFG_APPLY_OK;
-    for (uint8_t i = 0; i < (uint8_t)sizeof(payload); ++i) {
-        if (!fpga_write_verify_reg8((uint8_t)(FPGA_REG_ORIENT_ROLL_CD8 + i), payload[i], &detail)) {
-            break;
-        }
-    }
+    (void)s_rate_hz;
+    s_orient_tx_seq++;
+
+    /* VSYNC path is latency-sensitive: push only roll/pitch in one burst. */
+    (void)fpga_write_regs(&g_fpga,
+                          FPGA_REG_ORIENT_ROLL_CD8,
+                          payload,
+                          (uint16_t)sizeof(payload),
+                          20);
 }
 
 
@@ -1122,7 +1305,7 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
         // If already running (or in init), do not block. Just re-sync the UI.
         ui_send_log(ctx, "INIT: resync (already running)\r\n");
 
-        // Option 1 (fastest): report “ready” for nodes (snapshot)
+        // Option 1 (fastest): report ?�ready??for nodes (snapshot)
         // (You can make these more truthful if you store per-node init results.)
         ui_send_init_ack(seq, NODE_IMU,  0, 1, ERR_OK);
         ui_send_init_ack(seq, NODE_DAY,  0, 1, ERR_OK);
@@ -1323,3 +1506,6 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
         break;
     }
 }
+
+
+

@@ -4,7 +4,7 @@
  *
  * Each WRITE_REG command needs the sensor in a clean command-mode state.
  * IMU_SoftReset() sends STOP_STREAMING (0x28) between commands to return
- * the sensor to command mode WITHOUT a hardware reset — config survives.
+ * the sensor to command mode WITHOUT a hardware reset ??config survives.
  */
 
 #include "imu_config.h"
@@ -15,6 +15,7 @@ extern int send_imu_command_ex(uint8_t *tx_packet, uint32_t tx_size,
                                uint32_t rx_size, const char *cmd_name,
                                uint8_t *rx_out);
 extern void Send_UART3_Debug(const char *format, ...);
+extern void IMU_Reset(void);
 
 static uint16_t calc_checksum(const uint8_t *buf, uint32_t len)
 {
@@ -24,7 +25,7 @@ static uint16_t calc_checksum(const uint8_t *buf, uint32_t len)
 }
 
 /* -------------------------------------------------------------------------- */
-/* imu_read_reg — issue a READ_REG command and return the data bytes.        */
+/* imu_read_reg ??issue a READ_REG command and return the data bytes.        */
 /* response = SIZE_RESP_READ_REGS_BASE(16) + data_len bytes.                 */
 /* data is at pkt[12 .. 12+data_len-1] (after hdr2+len1+type1+res1+len1+    */
 /* addr1+page1+status1+sample1+res2+data_len_echo1 = offset 12).            */
@@ -99,19 +100,19 @@ static int imu_write_reg(uint8_t reg_addr, uint8_t page_id,
      *   - scan for 0x23 0x23 header, read length, read remaining bytes
      *   - validate footer + checksum
      *   - toggle CS correctly with proper NSS timing
-     *   - enforce ≥1 ms post-response inter-command gap
+     *   - enforce ?? ms post-response inter-command gap
      */
     uint8_t ack_buf[IMU_SIZE_RESP_ACK] = {0};
     return send_imu_command_ex(pkt, total_size, IMU_SIZE_RESP_ACK, name, ack_buf);
 }
 
 /* -------------------------------------------------------------------------- */
-/* imu_read_config — read back the key configuration registers and log them. */
+/* imu_read_config ??read back the key configuration registers and log them. */
 /*                                                                            */
 /* Registers read:                                                            */
-/*   SAMPLE_RATE_DIV  page=0, addr=0x1A, len=2  → ODR = 1000 / divisor     */
-/*   BW_CONFIG        page=0, addr=0x30, len=1  → LPF bandwidth             */
-/*   OUT_DATA_FORM    page=0, addr=0x19, len=1  → float(0) or fixed(1)      */
+/*   SAMPLE_RATE_DIV  page=0, addr=0x1A, len=2  ??ODR = 1000 / divisor     */
+/*   BW_CONFIG        page=0, addr=0x30, len=1  ??LPF bandwidth             */
+/*   OUT_DATA_FORM    page=0, addr=0x19, len=1  ??float(0) or fixed(1)      */
 /*                                                                            */
 /* Call BEFORE and AFTER imu_configure_odr_lpf() to confirm writes.         */
 /* -------------------------------------------------------------------------- */
@@ -197,19 +198,162 @@ int imu_read_config(const char *tag)
     return any_fail;
 }
 
+static int imu_read_reg_after_reset(uint8_t reg_addr, uint8_t page_id,
+                                    uint8_t data_len, uint8_t *data_out,
+                                    const char *name)
+{
+    IMU_Reset();
+    HAL_Delay(10u);
+    return imu_read_reg(reg_addr, page_id, data_len, data_out, name);
+}
+
+static int imu_write_reg_after_reset(uint8_t reg_addr, uint8_t page_id,
+                                     const uint8_t *data, uint8_t data_len,
+                                     const char *name)
+{
+    IMU_Reset();
+    HAL_Delay(10u);
+    return imu_write_reg(reg_addr, page_id, data, data_len, name);
+}
+
+int imu_ensure_default_profile(void)
+{
+    uint8_t sample_div_rb[2] = {0};
+    uint8_t select_out_rb = 0u;
+    uint8_t bw_config_rb = 0u;
+    int r;
+
+    IMU_Reset();
+    HAL_Delay(10u);
+
+    r = imu_read_reg(IMU_REG_SAMPLE_RATE_DIV_ADDR, IMU_PAGE0,
+                     IMU_REG_SAMPLE_RATE_DIV_LEN, sample_div_rb,
+                     "RD_DEFAULT_SAMPLE_RATE_DIV");
+    if (r == 0) {
+        r = imu_read_reg(IMU_REG_SELECT_OUT_DATA_ADDR, IMU_PAGE0,
+                         1u, &select_out_rb,
+                         "RD_DEFAULT_SELECT_OUT_DATA");
+    }
+    if (r == 0) {
+        r = imu_read_reg(IMU_REG_BW_CONFIG_ADDR, IMU_PAGE0,
+                         IMU_REG_BW_CONFIG_LEN, &bw_config_rb,
+                         "RD_DEFAULT_BW_CONFIG");
+    }
+
+    if (r == 0) {
+        Send_UART3_Debug("[ODR] Back-to-back command probe OK without reset\r\n");
+    } else {
+        Send_UART3_Debug("[ODR] Back-to-back command probe FAILED r=%d, retrying with reset-per-command\r\n", r);
+
+        r = imu_read_reg_after_reset(IMU_REG_SAMPLE_RATE_DIV_ADDR, IMU_PAGE0,
+                                     IMU_REG_SAMPLE_RATE_DIV_LEN, sample_div_rb,
+                                     "RD_DEFAULT_SAMPLE_RATE_DIV");
+        if (r != 0) {
+            Send_UART3_Debug("[ODR] SAMPLE_RATE_DIV probe FAILED r=%d\r\n", r);
+            return r;
+        }
+
+        r = imu_read_reg_after_reset(IMU_REG_SELECT_OUT_DATA_ADDR, IMU_PAGE0,
+                                     1u, &select_out_rb,
+                                     "RD_DEFAULT_SELECT_OUT_DATA");
+        if (r != 0) {
+            Send_UART3_Debug("[ODR] SELECT_OUT_DATA probe FAILED r=%d\r\n", r);
+            return r;
+        }
+
+        r = imu_read_reg_after_reset(IMU_REG_BW_CONFIG_ADDR, IMU_PAGE0,
+                                     IMU_REG_BW_CONFIG_LEN, &bw_config_rb,
+                                     "RD_DEFAULT_BW_CONFIG");
+        if (r != 0) {
+            Send_UART3_Debug("[ODR] BW_CONFIG probe FAILED r=%d\r\n", r);
+            return r;
+        }
+    }
+
+    {
+        const uint16_t sample_div =
+            (uint16_t)(((uint16_t)sample_div_rb[0] << 8) | sample_div_rb[1]);
+        const int need_restore =
+            (sample_div != IMU_ODR_DIV_1000HZ) ||
+            (select_out_rb != IMU_SELECT_OUT_ACC_GYRO_TEMP) ||
+            (bw_config_rb != IMU_BW_DEFAULT);
+
+        Send_UART3_Debug("[ODR] Flash profile: SAMPLE_RATE_DIV=0x%04X SELECT_OUT_DATA=0x%02X BW_CONFIG=0x%02X\r\n",
+                         (unsigned)sample_div,
+                         (unsigned)select_out_rb,
+                         (unsigned)bw_config_rb);
+
+        if (!need_restore) {
+            Send_UART3_Debug("[ODR] Flash profile already at factory 1 kHz defaults\r\n");
+            return 0;
+        }
+    }
+
+    {
+        uint8_t reset_cmd = IMU_RESET_ALL_CONFIG_CMD;
+        r = imu_write_reg_after_reset(IMU_REG_RESET_ALL_CONFIG_ADDR, IMU_PAGE0,
+                                      &reset_cmd, 1u, "RESET_ALL_CONFIG");
+        if (r != 0) {
+            Send_UART3_Debug("[ODR] RESET_ALL_CONFIG FAILED r=%d\r\n", r);
+            return r;
+        }
+        Send_UART3_Debug("[ODR] RESET_ALL_CONFIG=0x%02X ACK, waiting for flash save\r\n",
+                         (unsigned)reset_cmd);
+        HAL_Delay(250u);
+    }
+
+    r = imu_read_reg_after_reset(IMU_REG_SAMPLE_RATE_DIV_ADDR, IMU_PAGE0,
+                                 IMU_REG_SAMPLE_RATE_DIV_LEN, sample_div_rb,
+                                 "RD_RESTORED_SAMPLE_RATE_DIV");
+    if (r != 0) {
+        Send_UART3_Debug("[ODR] SAMPLE_RATE_DIV verify FAILED r=%d\r\n", r);
+        return r;
+    }
+
+    r = imu_read_reg_after_reset(IMU_REG_SELECT_OUT_DATA_ADDR, IMU_PAGE0,
+                                 1u, &select_out_rb,
+                                 "RD_RESTORED_SELECT_OUT_DATA");
+    if (r != 0) {
+        Send_UART3_Debug("[ODR] SELECT_OUT_DATA verify FAILED r=%d\r\n", r);
+        return r;
+    }
+
+    r = imu_read_reg_after_reset(IMU_REG_BW_CONFIG_ADDR, IMU_PAGE0,
+                                 IMU_REG_BW_CONFIG_LEN, &bw_config_rb,
+                                 "RD_RESTORED_BW_CONFIG");
+    if (r != 0) {
+        Send_UART3_Debug("[ODR] BW_CONFIG verify FAILED r=%d\r\n", r);
+        return r;
+    }
+
+    {
+        const uint16_t sample_div =
+            (uint16_t)(((uint16_t)sample_div_rb[0] << 8) | sample_div_rb[1]);
+        if ((sample_div != IMU_ODR_DIV_1000HZ) ||
+            (select_out_rb != IMU_SELECT_OUT_ACC_GYRO_TEMP) ||
+            (bw_config_rb != IMU_BW_DEFAULT)) {
+            Send_UART3_Debug("[ODR] Flash restore verify mismatch: SAMPLE_RATE_DIV=0x%04X SELECT_OUT_DATA=0x%02X BW_CONFIG=0x%02X\r\n",
+                             (unsigned)sample_div,
+                             (unsigned)select_out_rb,
+                             (unsigned)bw_config_rb);
+            return -1;
+        }
+    }
+
+    Send_UART3_Debug("[ODR] Flash profile restored to factory 1 kHz defaults\r\n");
+    return 0;
+}
+
 int imu_configure_odr_lpf(uint16_t odr_divisor, uint8_t bw_config)
 {
     int r;
 
-    /* Helper macro: after each successful write, clear any residual DRDY
-     * pulse and wait 10 ms so the sensor's SPI state machine is fully idle
-     * before the next command's CS falls.  Without this, the stale DRDY
-     * from the previous ACK triggers Phase 2 immediately and the RX reads
-     * before the sensor has a real response — resulting in all-zero bytes. */
+    /* Keep a short idle gap between commands so the next falling-edge DRDY
+     * belongs to the command we just sent. */
     extern volatile int drdy_interrupt;
 #define IMU_INTER_CMD_CLEAR() do { drdy_interrupt = 0; HAL_Delay(10u); } while(0)
 
-    /* 1) SAMPLE_RATE_DIV: 2 bytes, big-endian.                         */
+    /* 1) SAMPLE_RATE_DIV: 2 bytes, big-endian. */
     uint8_t div_bytes[2];
     div_bytes[0] = (uint8_t)(odr_divisor >> 8);
     div_bytes[1] = (uint8_t)(odr_divisor & 0xFFu);
@@ -224,30 +368,10 @@ int imu_configure_odr_lpf(uint16_t odr_divisor, uint8_t bw_config)
                      (unsigned)odr_divisor,
                      (unsigned)((odr_divisor > 0u) ? (1000u / odr_divisor) : 0u));
     IMU_INTER_CMD_CLEAR();
-
-    /* 2) SELECT_OUT_DATA = 0x07 (accel | gyro | temp only, 46-byte pkt) */
-    {
-        uint8_t sel = IMU_SELECT_OUT_ACC_GYRO_TEMP;   /* 0x07 */
-        r = imu_write_reg(IMU_REG_SELECT_OUT_DATA_ADDR, IMU_PAGE0,
-                          &sel, 1u, "SELECT_OUT_DATA");
-        if (r != 0) {
-            Send_UART3_Debug("[ODR] SELECT_OUT_DATA write FAILED r=%d\r\n", r);
-            return r;
-        }
-        Send_UART3_Debug("[ODR] SELECT_OUT_DATA=0x07 (acc+gyro+temp, pkt=46 B) OK\r\n");
-        IMU_INTER_CMD_CLEAR();
-    }
-
-    /* 3) BW_CONFIG: 1 byte — accel and gyro LPF bandwidth.            */
-    r = imu_write_reg(IMU_REG_BW_CONFIG_ADDR, IMU_PAGE0,
-                      &bw_config, IMU_REG_BW_CONFIG_LEN,
-                      "BW_CONFIG");
-    if (r != 0) {
-        Send_UART3_Debug("[ODR] BW_CONFIG write FAILED r=%d\r\n", r);
-        return r;
-    }
-    Send_UART3_Debug("[ODR] BW_CONFIG=0x%02X OK\r\n", (unsigned)bw_config);
+    HAL_Delay(100u);
+    Send_UART3_Debug("[ODR] Leaving SELECT_OUT_DATA/BW_CONFIG unchanged in single-write path\r\n");
 
 #undef IMU_INTER_CMD_CLEAR
     return 0;
 }
+
