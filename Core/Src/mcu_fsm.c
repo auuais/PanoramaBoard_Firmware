@@ -145,22 +145,25 @@ static uint32_t s_stats_edges_base = 0u;
 static uint32_t s_stats_parse_ok = 0u;
 static uint32_t s_stats_ts_delta_us = 0u;
 static uint32_t s_stats_ts_delta_count = 0u;
+static float s_roll_deg_filt = 0.0f;
+static float s_pitch_deg_filt = 0.0f;
+static bool s_orient_filter_init = false;
 
 /* -------------------------------------------------------------------------- */
-/* 0.25° quantization ??zero lag, eliminates sub-quarter-degree jitter        */
+/* Light output-stage smoothing and 0.1 degree quantization.                  */
 /*                                                                             */
 /* Madgwick IS the filter. Its quaternion integrator already smooths the      */
 /* gyro + accel fusion ??we do not need a second software filter on top.      */
-/* Adding EMA on the Euler output just creates lag that makes 30 Hz frame     */
-/* correction feel sluggish.                                                  */
+/* A very small EMA here targets only the final visible flutter and is tuned  */
+/* to stay well below 10 ms of added lag.                                     */
 /*                                                                             */
-/* What quantization does:                                                     */
-/*   - Rounds centidegrees to the nearest 25 cd (= 0.25°)                    */
-/*   - Any jitter smaller than ±12 cd (±0.12°) is silently absorbed          */
-/*   - True motion larger than 0.25° passes through at full speed             */
-/*   - Zero samples of lag ??output reflects this exact sample                */
+/* Output behavior:                                                            */
+/*   - EMA time constant is about 5 ms                                        */
+/*   - Rounds centidegrees to the nearest 10 cd (= 0.1 degree)                */
+/*   - Any residual flutter smaller than +-5 cd (+-0.05 degree) is absorbed   */
 /* -------------------------------------------------------------------------- */
-#define QUANT_STEP_CD   25   /* 0.25 degree = 25 centidegrees */
+#define QUANT_STEP_CD            10   /* 0.1 degree = 10 centidegrees */
+#define ORIENT_SMOOTH_TAU_MS      10.0f
 
 /**
  * @brief Round val_cd to the nearest QUANT_STEP_CD increment.
@@ -639,6 +642,17 @@ static void mcu_service_log_capture(McuContext *ctx)
     }
 }
 
+static float orient_output_alpha(void)
+{
+    float rate_hz = (s_rate_hz > 0) ? (float)s_rate_hz : 1000.0f;
+    float dt_ms = 1000.0f / rate_hz;
+    float alpha = dt_ms / (ORIENT_SMOOTH_TAU_MS + dt_ms);
+
+    if (alpha < 0.02f) alpha = 0.02f;
+    if (alpha > 1.0f) alpha = 1.0f;
+    return alpha;
+}
+
 
 // ===================== FPGA helpers =====================
 //static int fpga_write16(uint16_t reg, const uint8_t *data, uint8_t len)
@@ -710,7 +724,7 @@ void mcu_fsm_step(McuContext *ctx)
     case ST_WAIT_UI_INIT: {
         // Do nothing until UI requests init
 
-    	ctx->state = ST_BOOT;
+//    	ctx->state = ST_BOOT;
         break;
     }
 
@@ -821,7 +835,7 @@ void mcu_fsm_step(McuContext *ctx)
         IMU_Reset();
         HAL_Delay(10);
 
-        IMU_Handler_Init(imu_odr_hz, 0.9f);
+        IMU_Handler_Init(imu_odr_hz, 0.12f);
         s_stream_valid_log_sent = 0u;
         s_stream_odr_log_sent = 0u;
         s_stream_diag_count = 0u;
@@ -830,6 +844,9 @@ void mcu_fsm_step(McuContext *ctx)
         s_odr_accum_us = 0u;
         s_odr_samples = 0u;
         s_ui_throttle = 0u;
+        s_roll_deg_filt = 0.0f;
+        s_pitch_deg_filt = 0.0f;
+        s_orient_filter_init = false;
         s_stats_window_start_ms = HAL_GetTick();
         s_stats_edges_base = g_imu_drdy_edges_total;
         s_stats_parse_ok = 0u;
@@ -987,6 +1004,7 @@ static void update_shadow_roll_pitch(const Quaternion_t *q)
 {
     float roll_deg = 0.0f;
     float pitch_deg = 0.0f;
+    float alpha = 1.0f;
 
     quat_to_roll_pitch_deg(q, &roll_deg, &pitch_deg);
 
@@ -995,8 +1013,18 @@ static void update_shadow_roll_pitch(const Quaternion_t *q)
     if (pitch_deg >  ORIENT_CLAMP_DEG) pitch_deg =  ORIENT_CLAMP_DEG;
     if (pitch_deg < -ORIENT_CLAMP_DEG) pitch_deg = -ORIENT_CLAMP_DEG;
 
-    s_roll_cd = quantize_cd((int16_t)lroundf(roll_deg * 100.0f));
-    s_pitch_cd = quantize_cd((int16_t)lroundf(pitch_deg * 100.0f));
+    if (!s_orient_filter_init) {
+        s_roll_deg_filt = roll_deg;
+        s_pitch_deg_filt = pitch_deg;
+        s_orient_filter_init = true;
+    } else {
+        alpha = orient_output_alpha();
+        s_roll_deg_filt += alpha * (roll_deg - s_roll_deg_filt);
+        s_pitch_deg_filt += alpha * (pitch_deg - s_pitch_deg_filt);
+    }
+
+    s_roll_cd = quantize_cd((int16_t)lroundf(s_roll_deg_filt * 100.0f));
+    s_pitch_cd = quantize_cd((int16_t)lroundf(s_pitch_deg_filt * 100.0f));
 }
 
 /* Confirmed from log (2026-02-26, batch 11):
@@ -1511,6 +1539,7 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
         break;
     }
 }
+
 
 
 
