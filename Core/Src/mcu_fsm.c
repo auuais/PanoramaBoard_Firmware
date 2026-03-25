@@ -724,7 +724,7 @@ void mcu_fsm_step(McuContext *ctx)
     case ST_WAIT_UI_INIT: {
         // Do nothing until UI requests init
 
-//    	ctx->state = ST_BOOT;
+    	ctx->state = ST_BOOT;
         break;
     }
 
@@ -1148,38 +1148,10 @@ static int mcu_process_imu_stream_packet(McuContext *ctx, uint8_t *delta_counter
         uint32_t elapsed_ms = now_ms - s_stats_window_start_ms;
         if (elapsed_ms >= 1000u) {
             uint32_t edge_now = 0u;
-            uint32_t drdy_edges = 0u;
-            uint16_t drdy_hz = 0u;
-            uint16_t parse_ok_hz = 0u;
-            uint16_t pkt_ts_hz = 0u;
 
             __disable_irq();
             edge_now = g_imu_drdy_edges_total;
             __enable_irq();
-
-            drdy_edges = edge_now - s_stats_edges_base;
-            drdy_hz = (uint16_t)((drdy_edges * 1000u + (elapsed_ms / 2u)) / elapsed_ms);
-            parse_ok_hz = (uint16_t)((s_stats_parse_ok * 1000u + (elapsed_ms / 2u)) / elapsed_ms);
-
-            if (s_stats_ts_delta_us > 0u && s_stats_ts_delta_count > 0u) {
-                uint64_t num = (uint64_t)s_stats_ts_delta_count * 1000000ull;
-                pkt_ts_hz = (uint16_t)((num + (uint64_t)(s_stats_ts_delta_us / 2u)) /
-                                       (uint64_t)s_stats_ts_delta_us);
-            } else if (s_rate_hz > 0) {
-                pkt_ts_hz = (uint16_t)s_rate_hz;
-            }
-
-            ui_send_imu_stats(drdy_hz, pkt_ts_hz, parse_ok_hz);
-            {
-                char stats_msg[96];
-                snprintf(stats_msg, sizeof(stats_msg),
-                         "[IMU] stats DRDY=%uHz TS=%uHz Parse=%uHz\r\n",
-                         (unsigned)drdy_hz,
-                         (unsigned)pkt_ts_hz,
-                         (unsigned)parse_ok_hz);
-                ui_send_log(ctx, stats_msg);
-            }
-            ui_send_log_ctrl(LOG_CTRL_SAVE);
 
             s_stats_window_start_ms = now_ms;
             s_stats_edges_base = edge_now;
