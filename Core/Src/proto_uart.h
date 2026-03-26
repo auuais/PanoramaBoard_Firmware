@@ -14,12 +14,18 @@ size_t cobs_encode(const uint8_t *in, size_t len, uint8_t *out, size_t out_max);
 size_t cobs_decode(const uint8_t *in, size_t len, uint8_t *out, size_t out_max);
 
 // ---- Framing helpers ----
-// Frame = COBS(payload||crc16_le) + 0x00
+// Internal caller format remains:
+//   [msg_type][seq][len_lo][len_hi][payload...]
+//
+// On-wire decoded packet is:
+//   [SOM][LEN_lo][LEN_hi][MessageID][SEQ][payload...][CRC_lo][CRC_hi][EOM]
+//
+// The full decoded packet is COBS-encoded and terminated with 0x00 on UART.
 // returns total bytes written (including delimiter), or 0 on error.
 size_t uart_frame_build(const uint8_t *payload, size_t payload_len,
                         uint8_t *out, size_t out_max);
 
-// returns payload length on success, 0 on failure (crc/format).
+// Returns internal caller format length on success, 0 on failure.
 size_t uart_frame_parse(const uint8_t *cobs_data, size_t cobs_len,
                         uint8_t *payload_out, size_t payload_out_max);
 

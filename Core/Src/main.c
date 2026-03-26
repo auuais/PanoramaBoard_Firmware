@@ -221,7 +221,8 @@ static void ui_logf(const char *fmt, ...) {
     vsnprintf(text, sizeof(text), fmt, args);
     va_end(args);
 
-    // payload format: [type][seq][lenL][lenH][...data...]
+    // Internal message format: [type][seq][lenL][lenH][...data...]
+    // uart_frame_build() converts it to the SOM/LEN/MessageID/... wire packet.
     uint8_t payload[4 + 200];
     uint16_t n = (uint16_t)strlen(text);
     if (n > 200) n = 200;
