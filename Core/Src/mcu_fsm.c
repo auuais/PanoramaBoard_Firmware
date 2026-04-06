@@ -32,6 +32,8 @@ extern void Read_HDC3022_Sensor(float* temp, float* hum);
 extern void Send_UART3_Debug(const char *format, ...);
 extern int test_day_camera_controls(uint8_t camera_num);
 extern int Initialize_IR_Camera(uint8_t camera_num);
+extern int Apply_IR_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
+extern int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
 extern SPI_HandleTypeDef hspi2;
 
 // UART3 (PC UI)
@@ -69,6 +71,7 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define CMD_INIT_SYSTEM  0x13
 #define CMD_GET_CONFIG   0x30
 #define CMD_APPLY_CONFIG 0x31
+#define CMD_CAMERA_CONTROL 0x32
 
 // ---- Node types (for CHECK) ----
 #define NODE_SYSTEM 0x00
@@ -519,6 +522,26 @@ static void ui_send_resp_simple(uint8_t seq, uint8_t err)
     ui_send_frame(MSG_RESP, seq, p, sizeof(p));
 }
 
+static void ui_send_camera_apply_result(uint8_t seq,
+                                        uint8_t node_type,
+                                        uint8_t camera_id,
+                                        uint16_t param_id,
+                                        uint16_t value,
+                                        uint8_t ok,
+                                        uint8_t err)
+{
+    uint8_t resp[8];
+    resp[0] = err;
+    resp[1] = node_type;
+    resp[2] = camera_id;
+    resp[3] = ok;
+    resp[4] = (uint8_t)(param_id & 0xFF);
+    resp[5] = (uint8_t)((param_id >> 8) & 0xFF);
+    resp[6] = (uint8_t)(value & 0xFF);
+    resp[7] = (uint8_t)((value >> 8) & 0xFF);
+    ui_send_frame(MSG_RESP, seq, resp, sizeof(resp));
+}
+
 static void ui_send_log(McuContext *ctx, const char *s)
 {
     if (!ctx->debug_enabled) return;
@@ -664,12 +687,30 @@ static int fpga_rw_smoke_test(void)
 {
   uint8_t rd = 0;
   const uint8_t wr = 0xA5;
+  HAL_StatusTypeDef st;
 
-  HAL_StatusTypeDef st = fpga_write_read_reg8(&g_fpga, FPGA_REG_MODE_CURRENT, wr, &rd, 200);
+  st = fpga_is_ready(&g_fpga, 2u, 50u);
   if (st != HAL_OK) {
     uint32_t e = HAL_I2C_GetError(g_fpga.hi2c);
-    Send_UART3_Debug("FPGA smoke fail HAL=%d I2Cerr=0x%08lX\r\n", (int)st, (unsigned long)e);
-    return -1;
+    Send_UART3_Debug("FPGA ready fail HAL=%d I2Cerr=0x%08lX addr7=0x%02X\r\n",
+                     (int)st, (unsigned long)e, (unsigned)g_fpga.addr7);
+    return -10;
+  }
+
+  st = fpga_write_reg8(&g_fpga, FPGA_REG_MODE_CURRENT, wr, 200);
+  if (st != HAL_OK) {
+    uint32_t e = HAL_I2C_GetError(g_fpga.hi2c);
+    Send_UART3_Debug("FPGA write fail HAL=%d I2Cerr=0x%08lX reg=0x%02X wr=0x%02X\r\n",
+                     (int)st, (unsigned long)e, FPGA_REG_MODE_CURRENT, wr);
+    return -11;
+  }
+
+  st = fpga_read_reg8(&g_fpga, FPGA_REG_MODE_CURRENT, &rd, 200);
+  if (st != HAL_OK) {
+    uint32_t e = HAL_I2C_GetError(g_fpga.hi2c);
+    Send_UART3_Debug("FPGA read fail HAL=%d I2Cerr=0x%08lX reg=0x%02X\r\n",
+                     (int)st, (unsigned long)e, FPGA_REG_MODE_CURRENT);
+    return -12;
   }
 
   Send_UART3_Debug("FPGA smoke OK wr=0x%02X rd=0x%02X\r\n", wr, rd);
@@ -724,7 +765,7 @@ void mcu_fsm_step(McuContext *ctx)
     case ST_WAIT_UI_INIT: {
         // Do nothing until UI requests init
 
-    	ctx->state = ST_BOOT;
+//    	ctx->state = ST_BOOT;
         break;
     }
 
@@ -868,71 +909,71 @@ void mcu_fsm_step(McuContext *ctx)
             ui_send_log(ctx, "[IMU] START_STREAM failed\r\n");
         }
 
-        ctx->state = ST_OPERATION;
+        ctx->state = ST_INIT_DAY;
         ui_send_log(ctx, "Entered OPERATION\r\n");
         break;
     }
 
 
-//    case ST_INIT_DAY: {
-//        if (ctx->day_idx < 6) {
-//            HAL_Delay(20);
-//            int r = test_day_camera_controls(ctx->day_idx);   // change it to return status if it doesn?�t
-//            uint8_t ok = (r == 0) ? 1 : 0;
-//            ui_send_init_ack(ctx->init_seq,NODE_DAY, ctx->day_idx, ok, ok ? ERR_OK : ERR_FAIL);
-//            ctx->day_idx++;
-//        } else {
-//            ctx->ir_idx = 0;
-//            ctx->state = ST_INIT_IR;
-//        }
-//        break;
-//    }
-//
-//
-//    case ST_INIT_IR: {
-//    	HAL_Delay(1000);
-//    	if (ctx->ir_idx < 6) {
-//        	int r = Initialize_IR_Camera(ctx->ir_idx);   // change to return status if it doesn?�t
-//            uint8_t ok = (r == 0) ? 1 : 0;
-//            ui_send_init_ack(ctx->init_seq,NODE_IR, ctx->ir_idx, ok, ok ? ERR_OK : ERR_FAIL);
-//
-//            ctx->ir_idx++;
-//
-//        } else {
-//            ctx->state = ST_INIT_FPGA_CAL;
-//        }
-//        break;
-//    }
-//
-//
-//    case ST_INIT_FPGA_CAL: {
-//        int st = fpga_rw_smoke_test();
-//
-//        if (st == 0) {
-//            ui_send_log(ctx, "FPGA I2C ping OK (0xA5)\r\n");
-//            Send_UART3_Debug("FPGA I2C ping OK (0xA5)\r\n\n\n");
-//            uint8_t detail = fpga_push_all_runtime_config();
-//            if (detail == CFG_APPLY_OK) {
-//                ui_send_log(ctx, "FPGA runtime config push OK\r\n");
-//                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 1, ERR_OK);
-//            } else {
-//                char msg[96];
-//                snprintf(msg, sizeof(msg), "FPGA runtime config push FAIL detail=%u\r\n", (unsigned)detail);
-//                ui_send_log(ctx, msg);
-//                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
-//            }
-//
-//        } else {
-//            ui_send_log(ctx, "FPGA I2C ping FAIL\r\n");
-//            Send_UART3_Debug("FPGA I2C ping FAIL\r\n");
-//
-//             ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
-//        }
-//
-//        // Do NOT say Entered OPERATION here; we are not in OPERATION yet.
-//        ctx->state = ST_INIT_TEMP;
-//        break;
-//    }
+    case ST_INIT_DAY: {
+        if (ctx->day_idx < 6) {
+            HAL_Delay(20);
+            int r = test_day_camera_controls(ctx->day_idx);   // change it to return status if it doesn?�t
+            uint8_t ok = (r == 0) ? 1 : 0;
+            ui_send_init_ack(ctx->init_seq,NODE_DAY, ctx->day_idx, ok, ok ? ERR_OK : ERR_FAIL);
+            ctx->day_idx++;
+        } else {
+            ctx->ir_idx = 0;
+            ctx->state = ST_INIT_IR;
+        }
+        break;
+    }
+
+
+    case ST_INIT_IR: {
+    	HAL_Delay(1000);
+    	if (ctx->ir_idx < 6) {
+        	int r = Initialize_IR_Camera(ctx->ir_idx);   // change to return status if it doesn?�t
+            uint8_t ok = (r == 0) ? 1 : 0;
+            ui_send_init_ack(ctx->init_seq,NODE_IR, ctx->ir_idx, ok, ok ? ERR_OK : ERR_FAIL);
+
+            ctx->ir_idx++;
+
+        } else {
+            ctx->state = ST_INIT_FPGA_CAL;
+        }
+        break;
+    }
+
+
+    case ST_INIT_FPGA_CAL: {
+        int st = fpga_rw_smoke_test();
+
+        if (st == 0) {
+            ui_send_log(ctx, "FPGA I2C ping OK (0xA5)\r\n");
+            Send_UART3_Debug("FPGA I2C ping OK (0xA5)\r\n\n\n");
+            uint8_t detail = fpga_push_all_runtime_config();
+            if (detail == CFG_APPLY_OK) {
+                ui_send_log(ctx, "FPGA runtime config push OK\r\n");
+                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 1, ERR_OK);
+            } else {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "FPGA runtime config push FAIL detail=%u\r\n", (unsigned)detail);
+                ui_send_log(ctx, msg);
+                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
+            }
+
+        } else {
+            ui_send_log(ctx, "FPGA I2C ping FAIL\r\n");
+            Send_UART3_Debug("FPGA I2C ping FAIL\r\n");
+
+             ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
+        }
+
+        // Do NOT say Entered OPERATION here; we are not in OPERATION yet.
+        ctx->state = ST_INIT_TEMP;
+        break;
+    }
 
     case ST_INIT_TEMP: {
         float t = 0.0f, h = 0.0f;
@@ -1418,6 +1459,53 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
         ui_send_cfg_apply_result(bank, 1u, CFG_APPLY_OK);
         ui_send_cfg_bank(bank);
         ui_send_resp_simple(seq, ERR_OK);
+        break;
+    }
+
+    case CMD_CAMERA_CONTROL: {
+        if (plen < 4u) {
+            ui_send_resp_simple(seq, ERR_BADARG);
+            break;
+        }
+
+        const uint8_t node_type = d[1];
+        const uint8_t camera_sel = d[2];
+        const uint8_t count = d[3];
+        const uint16_t expected = (uint16_t)(4u + ((uint16_t)count * 4u));
+        uint8_t overall_err = ERR_OK;
+
+        if (count == 0u || plen != expected) {
+            ui_send_resp_simple(seq, ERR_BADARG);
+            break;
+        }
+
+        if (node_type != NODE_DAY && node_type != NODE_IR) {
+            ui_send_resp_simple(seq, ERR_BADARG);
+            break;
+        }
+
+        for (uint8_t i = 0u; i < count; ++i) {
+            const uint16_t off = (uint16_t)(4u + ((uint16_t)i * 4u));
+            const uint16_t param_id = (uint16_t)d[off] | ((uint16_t)d[off + 1u] << 8);
+            const uint16_t value = (uint16_t)d[off + 2u] | ((uint16_t)d[off + 3u] << 8);
+            int rc = -3;
+
+            if (node_type == NODE_DAY) {
+                rc = Apply_EO_Camera_Param(camera_sel, param_id, value);
+            } else {
+                rc = Apply_IR_Camera_Param(camera_sel, param_id, value);
+            }
+
+            {
+                const uint8_t ok = (rc == 0) ? 1u : 0u;
+                const uint8_t err = ok ? ERR_OK : ((rc == -2) ? ERR_BUSY : ERR_FAIL);
+                const uint8_t resp_id = (camera_sel == 0u) ? 0xFFu : (uint8_t)(camera_sel - 1u);
+                ui_send_camera_apply_result(seq, node_type, resp_id, param_id, value, ok, err);
+                if (!ok) overall_err = err;
+            }
+        }
+
+        ui_send_resp_simple(seq, overall_err);
         break;
     }
 

@@ -152,9 +152,11 @@ int test_day_camera_controls(uint8_t camera_num);
 void select_ir_camera(uint8_t camera_num);
 int Send_IR_Camera_Command(uint8_t message_id, uint8_t *params, uint32_t param_size);
 void Process_IR_Camera_Received_Data(uint8_t* data, uint16_t length);
-void Translate_And_Send_IR_Camera_Command(uint16_t param_id, uint16_t value);
+int Apply_IR_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
+int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
 int Initialize_IR_Camera(uint8_t camera_num);
 bool Validate_IR_Parameter(uint16_t param_id, uint16_t value);
+bool Validate_EO_Parameter(uint16_t param_id, uint16_t value);
 uint8_t ComputeChecksum(uint8_t* message_buffer, uint32_t length);
 
 
@@ -961,45 +963,42 @@ int Send_IR_Camera_Command(uint8_t message_id, uint8_t *params, uint32_t param_s
 
 bool Validate_IR_Parameter(uint16_t param_id, uint16_t value) {
     switch(param_id) {
-        case PARAM_ID_NUC_COMMAND:   return value <= 2;
-        case PARAM_ID_ROTATION:      return value <= 3;
-        case PARAM_ID_FRAMERATE:     return value <= 8;
-        case PARAM_ID_PALETTE:       return value >= 1 && value <= 6;
-        case PARAM_ID_POLARITY:      return value <= 1;
-        case PARAM_ID_D_ZOOM:        return value <= 12;
-        case PARAM_ID_TNR_ENABLE:    return value <= 1;
-        case PARAM_ID_POWER_RESET:   return value <= 1;
+        case PARAM_ID_IR_NUC_COMMAND:    return value <= 1u;
+        case PARAM_ID_IR_IMAGE_FLIP:     return value <= 3u;
+        case PARAM_ID_IR_FRAME_RATE:     return value <= 8u;
+        case PARAM_ID_IR_ICE_GAIN_BIAS:  return value <= 4095u;
+        case PARAM_ID_IR_ICE_LEVEL_BIAS: return value <= 4095u;
+        case PARAM_ID_IR_ICE_STRENGTH:   return value <= 7u;
+        case PARAM_ID_IR_PALETTE:        return value <= 6u;
+        case PARAM_ID_IR_POLARITY:       return value <= 1u;
+        case PARAM_ID_IR_D_ZOOM:         return value <= 12u;
+        case PARAM_ID_IR_TNR_ENABLE:     return value <= 1u;
+        case PARAM_ID_IR_TNR_THRESHOLD:  return value <= 32u;
         default: return false;
     }
 }
 
-void Translate_And_Send_IR_Camera_Command(uint16_t param_id, uint16_t value) {
-    uint8_t payload[4];
+bool Validate_EO_Parameter(uint16_t param_id, uint16_t value) {
     switch(param_id) {
-    case PARAM_ID_POLARITY:
-        if (value == 1) {
-            Send_IR_Camera_Command(0x29, NULL, 0);
-            Send_UART3_Debug("IR Camera %d: Set Polarity WHITE HOT\r\n", current_ir_camera);
-        } else {
-            Send_IR_Camera_Command(0x28, NULL, 0);
-            Send_UART3_Debug("IR Camera %d: Set Polarity BLACK HOT\r\n", current_ir_camera);
-        }
-        break;
-    case PARAM_ID_D_ZOOM:
-        payload[0] = 0x00;
-        payload[1] = (uint8_t)value;
-        Send_IR_Camera_Command(0xA4, payload, 2);
-        Send_UART3_Debug("IR Camera %d: Set Digital Zoom: %d\r\n", current_ir_camera, value);
-        break;
-    case PARAM_ID_PALETTE:
-        payload[0] = 0x00;
-        payload[1] = value;
-        Send_IR_Camera_Command(0x58, payload, 2);
-        Send_UART3_Debug("IR Camera %d: Set Palette: %d\r\n", current_ir_camera, value);
-        break;
-    default:
-        Send_UART3_Debug("IR Camera %d: Unknown Param ID 0x%04X\r\n", current_ir_camera, param_id);
-        break;
+        case PARAM_ID_EO_POWER_RESET:    return value <= 1u;
+        case PARAM_ID_EO_D_ZOOM:         return (value <= 5u) || (value >= 100u && value <= 105u);
+        case PARAM_ID_EO_WHITE_BALANCE:  return value <= 5u;
+        case PARAM_ID_EO_RED_GAIN:       return value <= 20u;
+        case PARAM_ID_EO_BLUE_GAIN:      return value <= 20u;
+        case PARAM_ID_EO_CHROMA_GAIN:    return value <= 20u;
+        case PARAM_ID_EO_AGC:            return value <= 10u;
+        case PARAM_ID_EO_AE_SHUTTER:     return value <= 21u;
+        case PARAM_ID_EO_BRIGHTNESS:     return value <= 20u;
+        case PARAM_ID_EO_BLC:            return value <= 1u;
+        case PARAM_ID_EO_HLC:            return (value <= 1u) || (value >= 100u && value <= 120u) || value == 210u;
+        case PARAM_ID_EO_ACE:            return (value <= 1u) || (value >= 100u && value <= 111u);
+        case PARAM_ID_EO_DEFOG:          return (value <= 1u) || (value >= 100u && value <= 111u);
+        case PARAM_ID_EO_DNR:            return value <= 4u;
+        case PARAM_ID_EO_GAMMA:          return value <= 6u;
+        case PARAM_ID_EO_SHARPNESS:      return value <= 20u;
+        case PARAM_ID_EO_MIRROR:         return value <= 1u;
+        case PARAM_ID_EO_IMAGE_FLIP:     return value <= 1u;
+        default: return false;
     }
 }
 
@@ -1192,6 +1191,275 @@ static int IR_SetMux(uint16_t sel) {
     return 0;
 }
 
+static int IR_SendCommandAndWaitAck(uint8_t cmd_id, const uint8_t *params, uint8_t param_len)
+{
+    uint16_t ack_code = 0u;
+
+    IR_ArmRx();
+    if (Send_IR_Camera_Command(cmd_id, (uint8_t *)params, param_len) != RET_OK) {
+        return RET_ERR_TX;
+    }
+
+    if (IR_WaitPacket(500u) != 0) {
+        return RET_ERR_TIMEOUT;
+    }
+
+    if (IR_FindPacket(0x02, 0x02, &ack_code) == 0 && ack_code == (uint16_t)cmd_id) {
+        return RET_OK;
+    }
+
+    return RET_ERR_RX;
+}
+
+static int IR_SetOrientation(uint16_t orientation)
+{
+    uint8_t p[2] = { (uint8_t)(orientation >> 8), (uint8_t)(orientation & 0xFF) };
+    return IR_SendCommandAndWaitAck(0xCFu, p, 2u);
+}
+
+static int IR_SetIceStrength(uint16_t strength)
+{
+    uint8_t p[2] = { (uint8_t)(strength >> 8), (uint8_t)(strength & 0xFF) };
+    return IR_SendCommandAndWaitAck(0x1Eu, p, 2u);
+}
+
+static int IR_SetIceGainBias(uint16_t value)
+{
+    uint8_t p[2] = { (uint8_t)(value >> 8), (uint8_t)(value & 0xFF) };
+    return IR_SendCommandAndWaitAck(0x82u, p, 2u);
+}
+
+static int IR_SetIceLevelBias(uint16_t value)
+{
+    uint8_t p[2] = { (uint8_t)(value >> 8), (uint8_t)(value & 0xFF) };
+    return IR_SendCommandAndWaitAck(0x83u, p, 2u);
+}
+
+static int IR_SetPalette(uint16_t palette)
+{
+    uint8_t p[2] = { (uint8_t)(palette >> 8), (uint8_t)(palette & 0xFF) };
+    return IR_SendCommandAndWaitAck(0x58u, p, 2u);
+}
+
+static int IR_SetPolarity(uint16_t white_hot)
+{
+    return IR_SendCommandAndWaitAck((white_hot != 0u) ? 0x29u : 0x28u, NULL, 0u);
+}
+
+static int IR_SetZoom(uint16_t zoom_id)
+{
+    uint8_t p[2] = { (uint8_t)(zoom_id >> 8), (uint8_t)(zoom_id & 0xFF) };
+    return IR_SendCommandAndWaitAck(0xA4u, p, 2u);
+}
+
+static int IR_RunNuc(uint16_t mode)
+{
+    if (mode == 0u) {
+        uint8_t p[2] = { 0x00u, 0x03u };
+        return IR_SendCommandAndWaitAck(0x27u, p, 2u);
+    }
+    if (mode == 1u) {
+        uint8_t p[2] = { 0x00u, 0x04u };
+        return IR_SendCommandAndWaitAck(0x27u, p, 2u);
+    }
+    return RET_ERR_TX;
+}
+
+static int apply_ir_param_single(uint8_t camera_num, uint16_t param_id, uint16_t value)
+{
+    if (camera_num >= 6u) return RET_ERR_RX;
+    if (!Validate_IR_Parameter(param_id, value)) return RET_ERR_RX;
+
+    select_ir_camera(camera_num);
+
+    switch (param_id) {
+        case PARAM_ID_IR_NUC_COMMAND:
+            return IR_RunNuc(value);
+        case PARAM_ID_IR_IMAGE_FLIP:
+            return IR_SetOrientation(value);
+        case PARAM_ID_IR_FRAME_RATE:
+            return IR_SetNV(16u, value);
+        case PARAM_ID_IR_ICE_GAIN_BIAS:
+            if (IR_SetNV(39u, value) != RET_OK) return RET_ERR_RX;
+            return IR_SetIceGainBias(value);
+        case PARAM_ID_IR_ICE_LEVEL_BIAS:
+            if (IR_SetNV(40u, value) != RET_OK) return RET_ERR_RX;
+            return IR_SetIceLevelBias(value);
+        case PARAM_ID_IR_ICE_STRENGTH:
+            return IR_SetIceStrength(value);
+        case PARAM_ID_IR_PALETTE:
+            return IR_SetPalette(value);
+        case PARAM_ID_IR_POLARITY:
+            return IR_SetPolarity(value);
+        case PARAM_ID_IR_D_ZOOM:
+            return IR_SetZoom(value);
+        case PARAM_ID_IR_TNR_ENABLE:
+            return IR_SetNV(89u, value);
+        case PARAM_ID_IR_TNR_THRESHOLD:
+            return IR_SetNV(90u, value);
+        default:
+            return RET_ERR_RX;
+    }
+}
+
+static int day_send_visca_bytes(uint8_t camera_num, const uint8_t *cmd, uint8_t cmd_len)
+{
+    if (camera_num >= 6u || cmd == NULL || cmd_len == 0u) return RET_ERR_TX;
+    select_day_camera(camera_num);
+    HAL_Delay(10);
+    return send_visca_command((uint8_t *)cmd, cmd_len, 0);
+}
+
+static int day_send_visca_simple(uint8_t camera_num, uint8_t b2, uint8_t b3, uint8_t b4)
+{
+    uint8_t cmd[] = { 0x81u, 0x01u, b2, b3, b4, 0xFFu };
+    return day_send_visca_bytes(camera_num, cmd, (uint8_t)sizeof(cmd));
+}
+
+static int day_send_visca_u8(uint8_t camera_num, uint8_t b2, uint8_t b3, uint8_t value)
+{
+    uint8_t cmd[] = { 0x81u, 0x01u, b2, b3, (uint8_t)(value & 0x0Fu), 0xFFu };
+    return day_send_visca_bytes(camera_num, cmd, (uint8_t)sizeof(cmd));
+}
+
+static int day_send_visca_sub_u8(uint8_t camera_num, uint8_t b2, uint8_t b3, uint8_t sub, uint8_t value)
+{
+    uint8_t cmd[] = { 0x81u, 0x01u, b2, b3, sub, (uint8_t)(value & 0x0Fu), 0xFFu };
+    return day_send_visca_bytes(camera_num, cmd, (uint8_t)sizeof(cmd));
+}
+
+static int day_send_visca_u16_direct(uint8_t camera_num, uint8_t b2, uint8_t b3, uint16_t value)
+{
+    uint8_t cmd[] = { 0x81u, 0x01u, b2, b3, 0x00u, 0x00u, (uint8_t)((value >> 4) & 0x0Fu), (uint8_t)(value & 0x0Fu), 0xFFu };
+    return day_send_visca_bytes(camera_num, cmd, (uint8_t)sizeof(cmd));
+}
+
+static int day_send_visca_sub_u16(uint8_t camera_num, uint8_t b2, uint8_t b3, uint8_t sub, uint16_t value)
+{
+    uint8_t cmd[] = { 0x81u, 0x01u, b2, b3, sub, 0x00u, (uint8_t)((value >> 4) & 0x0Fu), (uint8_t)(value & 0x0Fu), 0xFFu };
+    return day_send_visca_bytes(camera_num, cmd, (uint8_t)sizeof(cmd));
+}
+
+static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t value)
+{
+    static const uint8_t dzoom_positions[] = { 0x00u, 0x1Eu, 0x28u, 0x2Du, 0x30u, 0x32u };
+    if (camera_num >= 6u) return RET_ERR_TX;
+    if (!Validate_EO_Parameter(param_id, value)) return RET_ERR_TX;
+
+    switch (param_id) {
+        case PARAM_ID_EO_POWER_RESET:
+            return day_send_visca_simple(camera_num, 0x04u, 0x00u, 0x03u);
+        case PARAM_ID_EO_D_ZOOM:
+            if (value <= 5u) {
+                return day_send_visca_u16_direct(camera_num, 0x04u, 0x46u, dzoom_positions[value]);
+            }
+            switch (value) {
+                case 100u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x02u);
+                case 101u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x03u);
+                case 102u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x00u);
+                case 103u: return day_send_visca_u8(camera_num, 0x04u, 0x06u, 0x27u);
+                case 104u: return day_send_visca_u8(camera_num, 0x04u, 0x06u, 0x37u);
+                case 105u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x10u);
+                default: return RET_ERR_TX;
+            }
+        case PARAM_ID_EO_WHITE_BALANCE:
+            switch (value) {
+                case 0u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x00u);
+                case 1u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x03u);
+                case 2u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x01u);
+                case 3u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x02u);
+                case 4u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x05u);
+                case 5u: return day_send_visca_simple(camera_num, 0x04u, 0x10u, 0x05u);
+                default: return RET_ERR_TX;
+            }
+        case PARAM_ID_EO_RED_GAIN:
+            return day_send_visca_u16_direct(camera_num, 0x04u, 0x43u, value);
+        case PARAM_ID_EO_BLUE_GAIN:
+            return day_send_visca_u16_direct(camera_num, 0x04u, 0x44u, value);
+        case PARAM_ID_EO_CHROMA_GAIN:
+            return day_send_visca_u16_direct(camera_num, 0x04u, 0x13u, value);
+        case PARAM_ID_EO_AGC:
+            return day_send_visca_u8(camera_num, 0x04u, 0x2Cu, (uint8_t)value);
+        case PARAM_ID_EO_AE_SHUTTER:
+            return day_send_visca_u16_direct(camera_num, 0x04u, 0x4Au, value);
+        case PARAM_ID_EO_BRIGHTNESS:
+            return day_send_visca_u16_direct(camera_num, 0x04u, 0x4Eu, value);
+        case PARAM_ID_EO_BLC:
+            return day_send_visca_simple(camera_num, 0x04u, 0x33u, (value != 0u) ? 0x02u : 0x03u);
+        case PARAM_ID_EO_HLC:
+            if (value == 0u || value == 1u) {
+                return day_send_visca_u8(camera_num, 0x04u, 0x32u, (uint8_t)value);
+            }
+            if (value >= 100u && value <= 120u) {
+                return day_send_visca_sub_u16(camera_num, 0x04u, 0x32u, 0x10u, (uint16_t)(value - 100u));
+            }
+            if (value == 210u) {
+                return day_send_visca_u8(camera_num, 0x04u, 0x32u, 0x3Au);
+            }
+            return RET_ERR_TX;
+        case PARAM_ID_EO_ACE:
+            if (value == 0u || value == 1u) {
+                return day_send_visca_simple(camera_num, 0x04u, 0x1Au, (value != 0u) ? 0x02u : 0x03u);
+            }
+            if (value >= 100u && value <= 111u) {
+                return day_send_visca_sub_u8(camera_num, 0x04u, 0x1Au, 0x10u, (uint8_t)(value - 100u));
+            }
+            return RET_ERR_TX;
+        case PARAM_ID_EO_DEFOG:
+            if (value == 0u || value == 1u) {
+                return day_send_visca_simple(camera_num, 0x04u, 0x65u, (value != 0u) ? 0x02u : 0x03u);
+            }
+            if (value >= 100u && value <= 111u) {
+                return day_send_visca_sub_u8(camera_num, 0x04u, 0x65u, 0x10u, (uint8_t)(value - 100u));
+            }
+            return RET_ERR_TX;
+        case PARAM_ID_EO_DNR:
+            return day_send_visca_u8(camera_num, 0x04u, 0x53u, (uint8_t)value);
+        case PARAM_ID_EO_GAMMA:
+            return day_send_visca_u8(camera_num, 0x04u, 0x5Bu, (uint8_t)value);
+        case PARAM_ID_EO_SHARPNESS:
+            return day_send_visca_u16_direct(camera_num, 0x04u, 0x42u, value);
+        case PARAM_ID_EO_MIRROR:
+            return day_send_visca_simple(camera_num, 0x04u, 0x61u, (value != 0u) ? 0x02u : 0x03u);
+        case PARAM_ID_EO_IMAGE_FLIP:
+            return day_send_visca_simple(camera_num, 0x04u, 0x66u, (value != 0u) ? 0x02u : 0x03u);
+        default:
+            return RET_ERR_TX;
+    }
+}
+
+int Apply_IR_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value)
+{
+    int rc = RET_OK;
+
+    if (camera_sel == 0u) {
+        for (uint8_t cam = 0u; cam < 6u; ++cam) {
+            rc = apply_ir_param_single(cam, param_id, value);
+            if (rc != RET_OK) return rc;
+        }
+        return RET_OK;
+    }
+
+    if (camera_sel > 6u) return RET_ERR_RX;
+    return apply_ir_param_single((uint8_t)(camera_sel - 1u), param_id, value);
+}
+
+int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value)
+{
+    int rc = RET_OK;
+
+    if (camera_sel == 0u) {
+        for (uint8_t cam = 0u; cam < 6u; ++cam) {
+            rc = apply_eo_param_single(cam, param_id, value);
+            if (rc != RET_OK) return rc;
+        }
+        return RET_OK;
+    }
+
+    if (camera_sel > 6u) return RET_ERR_TX;
+    return apply_eo_param_single((uint8_t)(camera_sel - 1u), param_id, value);
+}
+
 
 
 
@@ -1220,7 +1488,7 @@ int Initialize_IR_Camera(uint8_t camera_num) {
         ir_camera_data_received_flag = false;
         // Do NOT return ??verbose mode response is expected; NV commands must still run
         //Return only when NV commands not required
-        return RET_OK;
+//        return RET_OK;
     }
 
     Send_UART3_Debug("\r\n--- STEP 2: Here Performing Handshake ---\r\n");
@@ -1304,8 +1572,8 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     mcu_ui_log(&g_ctx, "Verify FrameRate: NV16=%d\r\n", nv16);
 
     // --- Genlock slave / input ---
-    IR_SetNV(17, 1);       // NV#17 Genlock Direction = input (slave mode)
-    IR_SetNV(18, 0);       // NV#18 Genlock Mode = slave
+    IR_SetNV(17, 0);       // NV#17 Genlock Direction = input (slave mode)
+    IR_SetNV(18, 1);       // NV#18 Genlock Mode = 0 (slave)
 
     int nv17=-1,nv18=-1;
     IR_GetNV(17,&nv17); IR_GetNV(18,&nv18);
@@ -1621,7 +1889,7 @@ static void MX_I2C3_Init(void)
   /* USER CODE END I2C3_Init 1 */
 
   hi2c3.Instance = I2C3;
-  hi2c3.Init.Timing = 0x0010061A;  // Fast-mode 400 kHz for FPGA register updates
+  hi2c3.Init.Timing = 0x00503D58;  // Standard-mode 100 kHz; matches the original working FPGA soft-slave setup
   hi2c3.Init.OwnAddress1 = 0;
   hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
