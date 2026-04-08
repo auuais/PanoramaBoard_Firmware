@@ -799,6 +799,9 @@ int send_imu_command(uint8_t *tx_packet, uint32_t tx_size,
 // ===================== DAY CAMERA (VISCA) FUNCTIONS =====================
 void select_day_camera(uint8_t camera_num) {
     if (camera_num > 5) camera_num = 5;
+    if (current_day_camera == camera_num) {
+        return;
+    }
     current_day_camera = camera_num;
 
     // Set day camera multiplexer control pins (A=PC3, B=PB1, C=PB2)
@@ -998,6 +1001,13 @@ bool Validate_EO_Parameter(uint16_t param_id, uint16_t value) {
         case PARAM_ID_EO_SHARPNESS:      return value <= 20u;
         case PARAM_ID_EO_MIRROR:         return value <= 1u;
         case PARAM_ID_EO_IMAGE_FLIP:     return value <= 1u;
+        case PARAM_ID_EO_TRIGGER_MODE:   return value <= 1u;
+        case PARAM_ID_EO_TRIG_IN_POLARITY: return value <= 1u;
+        case PARAM_ID_EO_STROBE_POLARITY:  return value <= 1u;
+        case PARAM_ID_EO_STROBE_MODE:      return value <= 1u;
+        case PARAM_ID_EO_EXT_TRIG_DELAY:   return value <= 255u;
+        case PARAM_ID_EO_STROBE_DELAY:     return value <= 255u;
+        case PARAM_ID_EO_STROBE_WIDTH:     return value >= 1u && value <= 255u;
         default: return false;
     }
 }
@@ -1340,6 +1350,187 @@ static int day_send_visca_sub_u16(uint8_t camera_num, uint8_t b2, uint8_t b3, ui
     return day_send_visca_bytes(camera_num, cmd, (uint8_t)sizeof(cmd));
 }
 
+enum {
+    EO_MENUKEY_UP = 0x01u,
+    EO_MENUKEY_DOWN = 0x02u,
+    EO_MENUKEY_LEFT = 0x04u,
+    EO_MENUKEY_RIGHT = 0x08u,
+    EO_MENUKEY_MENU = 0x10u,
+    EO_MENUKEY_ESC = 0x20u,
+};
+
+static int day_send_menu_key(uint8_t camera_num, uint8_t key)
+{
+    return day_send_visca_u8(camera_num, 0x04u, 0x16u, key);
+}
+
+static int day_menu_wait(void)
+{
+    HAL_Delay(50);
+    return RET_OK;
+}
+
+static int day_menu_key_and_wait(uint8_t camera_num, uint8_t key)
+{
+    int rc = day_send_menu_key(camera_num, key);
+    if (rc != RET_OK) return rc;
+    return day_menu_wait();
+}
+
+static int day_menu_repeat(uint8_t camera_num, uint8_t key, uint16_t count)
+{
+    for (uint16_t i = 0u; i < count; ++i) {
+        int rc = day_menu_key_and_wait(camera_num, key);
+        if (rc != RET_OK) return rc;
+    }
+    return RET_OK;
+}
+
+static int day_menu_normalize_to_top(uint8_t camera_num, uint16_t max_rows)
+{
+    return day_menu_repeat(camera_num, EO_MENUKEY_UP, (uint16_t)(max_rows + 2u));
+}
+
+static int day_open_trigger_menu(uint8_t camera_num)
+{
+    int rc = RET_OK;
+    rc = day_menu_repeat(camera_num, EO_MENUKEY_ESC, 3u);
+    if (rc != RET_OK) return rc;
+    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
+    if (rc != RET_OK) return rc;
+    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_DOWN);
+    if (rc != RET_OK) return rc;
+    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
+    return rc;
+}
+
+static int day_close_menu(uint8_t camera_num)
+{
+    return day_menu_repeat(camera_num, EO_MENUKEY_ESC, 2u);
+}
+
+static int day_open_exposure_menu(uint8_t camera_num)
+{
+    int rc = RET_OK;
+    rc = day_menu_repeat(camera_num, EO_MENUKEY_ESC, 3u);
+    if (rc != RET_OK) return rc;
+    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
+    if (rc != RET_OK) return rc;
+    rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN, 2u);
+    if (rc != RET_OK) return rc;
+    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
+    return rc;
+}
+
+static int day_save_current_submenu(uint8_t camera_num, uint8_t row, uint8_t item_count)
+{
+    int rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN, (uint16_t)(item_count - row));
+    if (rc != RET_OK) return rc;
+    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_RIGHT);
+    if (rc != RET_OK) {
+        (void)day_close_menu(camera_num);
+        return rc;
+    }
+    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
+    if (rc != RET_OK) {
+        (void)day_close_menu(camera_num);
+        return rc;
+    }
+    HAL_Delay(100);
+    (void)day_close_menu(camera_num);
+    return rc;
+}
+
+static int day_set_trigger_row_absolute(uint8_t camera_num, uint8_t row, uint16_t value, uint16_t min_value, uint16_t max_value)
+{
+    int rc = day_open_trigger_menu(camera_num);
+    if (rc != RET_OK) return rc;
+    rc = day_menu_normalize_to_top(camera_num, 6u);
+    if (rc != RET_OK) {
+        (void)day_close_menu(camera_num);
+        return rc;
+    }
+    rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN, row);
+    if (rc != RET_OK) {
+        (void)day_close_menu(camera_num);
+        return rc;
+    }
+
+    rc = day_menu_repeat(camera_num, EO_MENUKEY_LEFT, (uint16_t)(max_value + 2u));
+    if (rc != RET_OK) {
+        (void)day_close_menu(camera_num);
+        return rc;
+    }
+
+    if (value > min_value) {
+        rc = day_menu_repeat(camera_num, EO_MENUKEY_RIGHT, (uint16_t)(value - min_value));
+        if (rc != RET_OK) {
+            (void)day_close_menu(camera_num);
+            return rc;
+        }
+    }
+
+    return day_save_current_submenu(camera_num, row, 6u);
+}
+
+static int day_ensure_exposure_manual(uint8_t camera_num)
+{
+    int rc = day_open_exposure_menu(camera_num);
+    if (rc != RET_OK) return rc;
+
+    rc = day_menu_normalize_to_top(camera_num, 7u);
+    if (rc != RET_OK) {
+        (void)day_close_menu(camera_num);
+        return rc;
+    }
+
+    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_DOWN); /* MODE row */
+    if (rc != RET_OK) {
+        (void)day_close_menu(camera_num);
+        return rc;
+    }
+
+    rc = day_menu_repeat(camera_num, EO_MENUKEY_LEFT, 3u);
+    if (rc != RET_OK) {
+        (void)day_close_menu(camera_num);
+        return rc;
+    }
+
+    rc = day_menu_repeat(camera_num, EO_MENUKEY_RIGHT, 2u); /* AUTO -> SHUT.P -> MANUAL */
+    if (rc != RET_OK) {
+        (void)day_close_menu(camera_num);
+        return rc;
+    }
+
+    return day_save_current_submenu(camera_num, 1u, 7u);
+}
+
+static int day_apply_eo_trigger_param(uint8_t camera_num, uint16_t param_id, uint16_t value)
+{
+    int rc = day_ensure_exposure_manual(camera_num);
+    if (rc != RET_OK) return rc;
+
+    switch (param_id) {
+        case PARAM_ID_EO_TRIGGER_MODE:
+            return day_set_trigger_row_absolute(camera_num, 0u, value, 0u, 1u);
+        case PARAM_ID_EO_TRIG_IN_POLARITY:
+            return day_set_trigger_row_absolute(camera_num, 1u, value, 0u, 1u);
+        case PARAM_ID_EO_STROBE_POLARITY:
+            return day_set_trigger_row_absolute(camera_num, 2u, value, 0u, 1u);
+        case PARAM_ID_EO_STROBE_MODE:
+            /* Manual lists this feature, but the trigger OSD page does not expose a distinct row for it. */
+            return RET_ERR_TX;
+        case PARAM_ID_EO_EXT_TRIG_DELAY:
+            return day_set_trigger_row_absolute(camera_num, 3u, value, 0u, 255u);
+        case PARAM_ID_EO_STROBE_DELAY:
+            return day_set_trigger_row_absolute(camera_num, 4u, value, 0u, 255u);
+        case PARAM_ID_EO_STROBE_WIDTH:
+            return day_set_trigger_row_absolute(camera_num, 5u, value, 1u, 255u);
+        default:
+            return RET_ERR_TX;
+    }
+}
+
 static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t value)
 {
     static const uint8_t dzoom_positions[] = { 0x00u, 0x1Eu, 0x28u, 0x2Du, 0x30u, 0x32u };
@@ -1423,6 +1614,14 @@ static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
             return day_send_visca_simple(camera_num, 0x04u, 0x61u, (value != 0u) ? 0x02u : 0x03u);
         case PARAM_ID_EO_IMAGE_FLIP:
             return day_send_visca_simple(camera_num, 0x04u, 0x66u, (value != 0u) ? 0x02u : 0x03u);
+        case PARAM_ID_EO_TRIGGER_MODE:
+        case PARAM_ID_EO_TRIG_IN_POLARITY:
+        case PARAM_ID_EO_STROBE_POLARITY:
+        case PARAM_ID_EO_STROBE_MODE:
+        case PARAM_ID_EO_EXT_TRIG_DELAY:
+        case PARAM_ID_EO_STROBE_DELAY:
+        case PARAM_ID_EO_STROBE_WIDTH:
+            return day_apply_eo_trigger_param(camera_num, param_id, value);
         default:
             return RET_ERR_TX;
     }

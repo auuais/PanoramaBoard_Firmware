@@ -126,6 +126,13 @@ void IMU_SPI_ResetSession(void);
 #define PARAM_ID_EO_SHARPNESS          0x3030
 #define PARAM_ID_EO_MIRROR             0x3131
 #define PARAM_ID_EO_IMAGE_FLIP         0x3232
+#define PARAM_ID_EO_TRIGGER_MODE       0x3333
+#define PARAM_ID_EO_TRIG_IN_POLARITY   0x3434
+#define PARAM_ID_EO_STROBE_POLARITY    0x3535
+#define PARAM_ID_EO_STROBE_MODE        0x3636
+#define PARAM_ID_EO_EXT_TRIG_DELAY     0x3737
+#define PARAM_ID_EO_STROBE_DELAY       0x3838
+#define PARAM_ID_EO_STROBE_WIDTH       0x3939
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus
