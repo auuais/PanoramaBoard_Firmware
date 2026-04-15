@@ -20,6 +20,7 @@
 //
 static void fpga_service_orient(void);
 static int imu_stream_read_raw(uint8_t *dst);
+static void ui_send_log(McuContext *ctx, const char *s);
 
 
 // ---- externs from existing codebase ----
@@ -98,7 +99,8 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define UI_ORIENT_DECIM       10u
 #define LOG_CTRL_CLEAR        0x01u
 #define LOG_CTRL_SAVE         0x02u
-#define LOG_CAPTURE_SAVE_DELAY_MS 15000u
+#define LOG_CAPTURE_SAVE_DELAY_MS 45000u
+#define FPGA_DEBUG_TOP_MODE_ONLY 0u
 
 // ---- IMU command packets (matching ATMEL IIM4623x reference exactly) ----
 // WHO_AM_I = ReadRegister(addr=0x00, len=1, page=0)
@@ -422,6 +424,11 @@ static int32_t cfg_pitch_to_translation_effective_q16(uint8_t bank_id, const Par
     return div_round_i64_local(((int64_t)bank->pitch_to_translation_raw_q16) << 16, resize_q16);
 }
 
+static void cfg_bank_copy_aligned(ParamBankQ16* dst, const ParamBankQ16* src)
+{
+    memcpy(dst, src, sizeof(*dst));
+}
+
 static bool fpga_write_verify_reg8(uint8_t reg, uint8_t value, uint8_t* detail_out)
 {
     uint8_t rd = 0;
@@ -459,19 +466,116 @@ static bool fpga_write_verify_i32(uint8_t reg, int32_t value, uint8_t* detail_ou
     return true;
 }
 
+static bool fpga_write_reg8_logged(McuContext *ctx,
+                                   const char *tag,
+                                   const char *field,
+                                   uint8_t reg,
+                                   uint8_t value,
+                                   uint8_t* detail_out)
+{
+    char msg[96];
+    snprintf(msg, sizeof(msg), "FPGA %s %s reg0x%02X=0x%02X\r\n",
+             tag, field, (unsigned)reg, (unsigned)value);
+    ui_send_log(ctx, msg);
+
+    HAL_StatusTypeDef st = fpga_write_reg8(&g_fpga, reg, value, 50);
+    if (st != HAL_OK) {
+        if (detail_out) *detail_out = CFG_APPLY_ERR_I2C_WRITE;
+        return false;
+    }
+
+    snprintf(msg, sizeof(msg), "FPGA %s %s reg0x%02X OK\r\n",
+             tag, field, (unsigned)reg);
+    ui_send_log(ctx, msg);
+    HAL_Delay(1);
+
+    if (detail_out) *detail_out = CFG_APPLY_OK;
+    return true;
+}
+
+static bool fpga_write_i32_le_logged(McuContext *ctx,
+                                     const char *tag,
+                                     const char *field,
+                                     uint8_t reg,
+                                     int32_t value,
+                                     uint8_t* detail_out)
+{
+    uint8_t b[4];
+    b[0] = (uint8_t)(value & 0xFF);
+    b[1] = (uint8_t)((value >> 8) & 0xFF);
+    b[2] = (uint8_t)((value >> 16) & 0xFF);
+    b[3] = (uint8_t)((value >> 24) & 0xFF);
+
+    for (uint8_t i = 0; i < 4u; ++i) {
+        if (!fpga_write_reg8_logged(ctx, tag, field, (uint8_t)(reg + i), b[i], detail_out)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static uint8_t fpga_push_bank_chunked(McuContext *ctx, uint8_t bank, const ParamBankQ16* cfg)
+{
+    const uint8_t base = fpga_cfg_bank_base(bank);
+    uint8_t detail = CFG_APPLY_OK;
+    const char *tag = (bank == CFG_BANK_IR) ? "IR" : "EO";
+    char msg[64];
+    ParamBankQ16 local_cfg;
+
+    cfg_bank_copy_aligned(&local_cfg, cfg);
+
+    snprintf(msg, sizeof(msg), "FPGA %s bank field: cyl_h\r\n", tag);
+    ui_send_log(ctx, msg);
+    if (!fpga_write_i32_le_logged(ctx, tag, "cyl_h", (uint8_t)(base + 0u), local_cfg.cyl_h_fov_q16, &detail)) return detail;
+
+    snprintf(msg, sizeof(msg), "FPGA %s bank field: cyl_v\r\n", tag);
+    ui_send_log(ctx, msg);
+    if (!fpga_write_i32_le_logged(ctx, tag, "cyl_v", (uint8_t)(base + 4u), local_cfg.cyl_v_fov_q16, &detail)) return detail;
+
+    snprintf(msg, sizeof(msg), "FPGA %s bank field: crop_h\r\n", tag);
+    ui_send_log(ctx, msg);
+    if (!fpga_write_i32_le_logged(ctx, tag, "crop_h", (uint8_t)(base + 8u), local_cfg.pano_crop_h_q16, &detail)) return detail;
+
+    snprintf(msg, sizeof(msg), "FPGA %s bank field: crop_w\r\n", tag);
+    ui_send_log(ctx, msg);
+    if (!fpga_write_i32_le_logged(ctx, tag, "crop_w", (uint8_t)(base + 12u), local_cfg.pano_crop_w_q16, &detail)) return detail;
+
+    snprintf(msg, sizeof(msg), "FPGA %s bank field: pitch_tr\r\n", tag);
+    ui_send_log(ctx, msg);
+    if (!fpga_write_i32_le_logged(ctx, tag, "pitch_tr", (uint8_t)(base + 16u), cfg_pitch_to_translation_effective_q16(bank, &local_cfg), &detail)) return detail;
+
+    snprintf(msg, sizeof(msg), "FPGA %s bank field: yaw_tr\r\n", tag);
+    ui_send_log(ctx, msg);
+    if (!fpga_write_i32_le_logged(ctx, tag, "yaw_tr", (uint8_t)(base + 20u), local_cfg.yaw_to_translation_q16, &detail)) return detail;
+
+    snprintf(msg, sizeof(msg), "FPGA %s bank field: overlap\r\n", tag);
+    ui_send_log(ctx, msg);
+    if (!fpga_write_i32_le_logged(ctx, tag, "overlap", (uint8_t)(base + 24u), local_cfg.overlap_px_i32, &detail)) return detail;
+
+    snprintf(msg, sizeof(msg), "FPGA %s bank field: feather\r\n", tag);
+    ui_send_log(ctx, msg);
+    if (!fpga_write_i32_le_logged(ctx, tag, "feather", (uint8_t)(base + 28u), local_cfg.feather_strength_q16, &detail)) return detail;
+
+    return CFG_APPLY_OK;
+}
+
 static uint8_t fpga_push_bank(uint8_t bank, const ParamBankQ16* cfg)
 {
     const uint8_t base = fpga_cfg_bank_base(bank);
     uint8_t detail = CFG_APPLY_OK;
+    ParamBankQ16 local_cfg;
 
-    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_CYL_H_FOV_Q16), cfg->cyl_h_fov_q16, &detail)) return detail;
-    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_CYL_V_FOV_Q16), cfg->cyl_v_fov_q16, &detail)) return detail;
-    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_CROP_H_Q16), cfg->pano_crop_h_q16, &detail)) return detail;
-    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_CROP_W_Q16), cfg->pano_crop_w_q16, &detail)) return detail;
-    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_PITCH_TR_Q16), cfg_pitch_to_translation_effective_q16(bank, cfg), &detail)) return detail;
-    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_YAW_TR_Q16), cfg->yaw_to_translation_q16, &detail)) return detail;
-    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_OVERLAP_I32), cfg->overlap_px_i32, &detail)) return detail;
-    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_FEATHER_Q16), cfg->feather_strength_q16, &detail)) return detail;
+    cfg_bank_copy_aligned(&local_cfg, cfg);
+
+    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_CYL_H_FOV_Q16), local_cfg.cyl_h_fov_q16, &detail)) return detail;
+    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_CYL_V_FOV_Q16), local_cfg.cyl_v_fov_q16, &detail)) return detail;
+    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_CROP_H_Q16), local_cfg.pano_crop_h_q16, &detail)) return detail;
+    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_CROP_W_Q16), local_cfg.pano_crop_w_q16, &detail)) return detail;
+    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_PITCH_TR_Q16), cfg_pitch_to_translation_effective_q16(bank, &local_cfg), &detail)) return detail;
+    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_YAW_TR_Q16), local_cfg.yaw_to_translation_q16, &detail)) return detail;
+    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_OVERLAP_I32), local_cfg.overlap_px_i32, &detail)) return detail;
+    if (!fpga_write_verify_i32((uint8_t)(base + FPGA_REG_CFG_FEATHER_Q16), local_cfg.feather_strength_q16, &detail)) return detail;
 
     return CFG_APPLY_OK;
 }
@@ -617,20 +721,21 @@ static void put_le_i32(uint8_t* dst, int32_t v)
 
 static void ui_send_cfg_bank(uint8_t bank)
 {
-    const ParamBankQ16* cfg = cfg_bank_const(bank);
+    ParamBankQ16 cfg_local;
+    cfg_bank_copy_aligned(&cfg_local, cfg_bank_const(bank));
     uint8_t p[3 + (CFG_FLOAT_COUNT * 4)];
     p[0] = EVT_CFG_BANK;
     p[1] = bank;
     p[2] = s_cfg_store.mode;
 
-    put_le_i32(&p[3 + (0 * 4)], cfg->cyl_h_fov_q16);
-    put_le_i32(&p[3 + (1 * 4)], cfg->cyl_v_fov_q16);
-    put_le_i32(&p[3 + (2 * 4)], cfg->pano_crop_h_q16);
-    put_le_i32(&p[3 + (3 * 4)], cfg->pano_crop_w_q16);
-    put_le_i32(&p[3 + (4 * 4)], cfg->pitch_to_translation_raw_q16);
-    put_le_i32(&p[3 + (5 * 4)], cfg->yaw_to_translation_q16);
-    put_le_i32(&p[3 + (6 * 4)], cfg->overlap_px_i32);
-    put_le_i32(&p[3 + (7 * 4)], cfg->feather_strength_q16);
+    put_le_i32(&p[3 + (0 * 4)], cfg_local.cyl_h_fov_q16);
+    put_le_i32(&p[3 + (1 * 4)], cfg_local.cyl_v_fov_q16);
+    put_le_i32(&p[3 + (2 * 4)], cfg_local.pano_crop_h_q16);
+    put_le_i32(&p[3 + (3 * 4)], cfg_local.pano_crop_w_q16);
+    put_le_i32(&p[3 + (4 * 4)], cfg_local.pitch_to_translation_raw_q16);
+    put_le_i32(&p[3 + (5 * 4)], cfg_local.yaw_to_translation_q16);
+    put_le_i32(&p[3 + (6 * 4)], cfg_local.overlap_px_i32);
+    put_le_i32(&p[3 + (7 * 4)], cfg_local.feather_strength_q16);
 
     ui_send_frame(MSG_EVT, 0, p, sizeof(p));
 }
@@ -947,18 +1052,65 @@ void mcu_fsm_step(McuContext *ctx)
 
 
     case ST_INIT_FPGA_CAL: {
+        ui_send_log(ctx, "FPGA init build: full-regmap diag v9\r\n");
         int st = fpga_rw_smoke_test();
 
         if (st == 0) {
             ui_send_log(ctx, "FPGA I2C ping OK (0xA5)\r\n");
             Send_UART3_Debug("FPGA I2C ping OK (0xA5)\r\n\n\n");
-            uint8_t detail = fpga_push_all_runtime_config();
+            uint8_t detail = CFG_APPLY_OK;
+            uint32_t t0 = HAL_GetTick();
+            uint8_t probe_detail = CFG_APPLY_OK;
+
+            {
+                static const uint8_t probe_regs[4]  = { 0x20u, 0x21u, 0x22u, 0x23u };
+                static const uint8_t probe_vals[4]  = { 0x5Au, 0xA5u, 0x3Cu, 0xC3u };
+                char msg[96];
+                for (uint8_t i = 0; i < 4u; ++i) {
+                    snprintf(msg, sizeof(msg), "FPGA probe reg 0x%02X\r\n", (unsigned)probe_regs[i]);
+                    ui_send_log(ctx, msg);
+                    if (!fpga_write_verify_reg8(probe_regs[i], probe_vals[i], &probe_detail)) {
+                        snprintf(msg, sizeof(msg), "FPGA probe reg 0x%02X FAIL detail=%u\r\n",
+                                 (unsigned)probe_regs[i], (unsigned)probe_detail);
+                        ui_send_log(ctx, msg);
+                        detail = probe_detail;
+                        break;
+                    }
+                }
+            }
+
             if (detail == CFG_APPLY_OK) {
-                ui_send_log(ctx, "FPGA runtime config push OK\r\n");
+                #if FPGA_DEBUG_TOP_MODE_ONLY
+                ui_send_log(ctx, "FPGA bank push skipped (debug top)\r\n");
+                ui_send_log(ctx, "FPGA push stage: mode\r\n");
+                detail = fpga_push_mode(s_cfg_store.mode);
+                #else
+                ui_send_log(ctx, "FPGA push stage: EO bank\r\n");
+                detail = fpga_push_bank_chunked(ctx, CFG_BANK_EO, &s_cfg_store.eo);
+
+                if (detail == CFG_APPLY_OK) {
+                    ui_send_log(ctx, "FPGA push stage: IR bank\r\n");
+                    detail = fpga_push_bank_chunked(ctx, CFG_BANK_IR, &s_cfg_store.ir);
+                }
+
+                if (detail == CFG_APPLY_OK) {
+                    ui_send_log(ctx, "FPGA push stage: mode\r\n");
+                    detail = fpga_push_mode(s_cfg_store.mode);
+                }
+                #endif
+            }
+
+            if (detail == CFG_APPLY_OK) {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "FPGA runtime config push OK (%lums)\r\n",
+                         (unsigned long)(HAL_GetTick() - t0));
+                ui_send_log(ctx, msg);
                 ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 1, ERR_OK);
             } else {
                 char msg[96];
-                snprintf(msg, sizeof(msg), "FPGA runtime config push FAIL detail=%u\r\n", (unsigned)detail);
+                snprintf(msg, sizeof(msg), "FPGA runtime config push FAIL detail=%u (%lums)\r\n",
+                         (unsigned)detail,
+                         (unsigned long)(HAL_GetTick() - t0));
                 ui_send_log(ctx, msg);
                 ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
             }
@@ -1409,9 +1561,9 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
           break;
       }
 
+      ui_send_resp_simple(seq, ERR_OK);
       ui_send_cfg_bank(CFG_BANK_EO);
       ui_send_cfg_bank(CFG_BANK_IR);
-      ui_send_resp_simple(seq, ERR_OK);
       break;
     }
 
