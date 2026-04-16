@@ -128,6 +128,8 @@ static void MX_I2C2_Init(void);
 static void MX_I2C3_Init(void);
 static void MX_SPI2_Init(void);
 void Enable_All_Camera_Power(void);
+void Disable_All_Camera_Power(void);
+int Power_Cycle_All_Cameras(void);
 void IMU_Reset(void);
 void IMU_SoftReset(void);
 
@@ -203,6 +205,33 @@ void Enable_All_Camera_Power(void)
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_3, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_4, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_5, GPIO_PIN_SET);
+}
+
+void Disable_All_Camera_Power(void)
+{
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_11, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_12, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_RESET);
+
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_0, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_1, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_3, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_5, GPIO_PIN_RESET);
+}
+
+int Power_Cycle_All_Cameras(void)
+{
+    Disable_All_Camera_Power();
+    HAL_Delay(500u);
+    Enable_All_Camera_Power();
+    HAL_Delay(1000u);
+    return RET_OK;
 }
 
 
@@ -1771,8 +1800,8 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     mcu_ui_log(&g_ctx, "Verify FrameRate: NV16=%d\r\n", nv16);
 
     // --- Genlock slave / input ---
-    IR_SetNV(17, 0);       // NV#17 Genlock Direction = input (slave mode)
-    IR_SetNV(18, 1);       // NV#18 Genlock Mode = 0 (slave)
+    IR_SetNV(17, 1);       // NV#17 Genlock Direction = input (slave mode)
+    IR_SetNV(18, 0);       // NV#18 Genlock Mode = 0 (slave)
 
     int nv17=-1,nv18=-1;
     IR_GetNV(17,&nv17); IR_GetNV(18,&nv18);

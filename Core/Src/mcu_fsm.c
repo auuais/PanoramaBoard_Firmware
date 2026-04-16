@@ -25,6 +25,7 @@ static void ui_send_log(McuContext *ctx, const char *s);
 
 // ---- externs from existing codebase ----
 extern void Enable_All_Camera_Power(void);
+extern int Power_Cycle_All_Cameras(void);
 extern void IMU_Reset(void);
 extern void IMU_SoftReset(void);
 extern int send_imu_command(uint8_t *tx_packet, uint32_t tx_size, uint32_t rx_size, const char *cmd_name);
@@ -70,6 +71,8 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define CMD_SET_MODE     0x11
 #define CMD_SET_DEBUG    0x12
 #define CMD_INIT_SYSTEM  0x13
+#define CMD_CAMERA_RESET 0x14
+#define CMD_PING         0x15
 #define CMD_GET_CONFIG   0x30
 #define CMD_APPLY_CONFIG 0x31
 #define CMD_CAMERA_CONTROL 0x32
@@ -849,12 +852,14 @@ void mcu_fsm_start_init(McuContext *ctx)
 
     // ctx->init_seq is already set by the caller (CMD_INIT_SYSTEM handler)
     // to the UI's sequence number ??do NOT reset it here.
-
-    // Only allow init start from idle/wait state
-    if (ctx->state == ST_WAIT_UI_INIT) {
-        ctx->state = ST_BOOT;
-        // No extra ACK here ??the caller (CMD_INIT_SYSTEM handler) already sent it
-    }
+    ctx->day_idx = 0u;
+    ctx->ir_idx = 0u;
+    ctx->imu_streaming = false;
+    ctx->log_capture_active = false;
+    ctx->log_capture_save_sent = false;
+    ctx->log_capture_start_ms = 0u;
+    ctx->state = ST_BOOT;
+    // No extra ACK here ??the caller (CMD_INIT_SYSTEM handler) already sent it
 }
 
 
@@ -1458,7 +1463,7 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
     if (ctx->state != ST_OPERATION) {
         if (msg_type == MSG_CMD && plen >= 1) {
             uint8_t maybe_cmd = d[0];
-            if (maybe_cmd != CMD_INIT_SYSTEM && maybe_cmd != CMD_GET_CONFIG) {
+            if (maybe_cmd != CMD_INIT_SYSTEM && maybe_cmd != CMD_GET_CONFIG && maybe_cmd != CMD_PING) {
                 ui_send_resp_simple(seq, ERR_BUSY);
                 return;
             }
@@ -1493,33 +1498,9 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
 
         // Always ACK the command itself
         ui_send_init_ack(seq, NODE_SYSTEM, 0, 1, ERR_OK);
-
-        if (ctx->state == ST_WAIT_UI_INIT) {
-            Send_UART3_Debug("INIT: started\r\n");
-            mcu_fsm_start_init(ctx);
-            break;
-        }
-
-        // If already running (or in init), do not block. Just re-sync the UI.
-        ui_send_log(ctx, "INIT: resync (already running)\r\n");
-
-        // Option 1 (fastest): report ?�ready??for nodes (snapshot)
-        // (You can make these more truthful if you store per-node init results.)
-        ui_send_init_ack(seq, NODE_IMU,  0, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_DAY,  0, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_DAY,  1, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_DAY,  2, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_DAY,  3, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_DAY,  4, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_DAY,  5, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_IR,   0, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_IR,   1, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_IR,   2, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_IR,   3, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_IR,   4, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_IR,   5, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_FPGA, 0, 1, ERR_OK);
-        ui_send_init_ack(seq, NODE_TEMP, 0, 1, ERR_OK);
+        ui_send_log(ctx, (ctx->state == ST_WAIT_UI_INIT) ? "INIT: started\r\n" : "INIT: restart\r\n");
+        Send_UART3_Debug("INIT: requested (state=%d)\r\n", (int)ctx->state);
+        mcu_fsm_start_init(ctx);
 
         break;
     }
@@ -1565,6 +1546,23 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
       ui_send_cfg_bank(CFG_BANK_EO);
       ui_send_cfg_bank(CFG_BANK_IR);
       break;
+    }
+
+    case CMD_CAMERA_RESET: {
+        mcu_ui_log(ctx, "Camera power cycle requested\r\n");
+        if (Power_Cycle_All_Cameras() != 0) {
+            mcu_ui_log(ctx, "Camera power cycle failed\r\n");
+            ui_send_resp_simple(seq, ERR_FAIL);
+            break;
+        }
+        mcu_ui_log(ctx, "Camera power cycle complete\r\n");
+        ui_send_resp_simple(seq, ERR_OK);
+        break;
+    }
+
+    case CMD_PING: {
+        ui_send_resp_simple(seq, ERR_OK);
+        break;
     }
 
     case CMD_APPLY_CONFIG: {
