@@ -27,22 +27,24 @@ extern "C" {
 #define FPGA_REG_ORIENT_SEQ8        0x16u // u16 LE at 0x16..0x17 (currently not updated in fast VSYNC path)
 
 // ---------- PARAM BANKS ----------
-// All float parameters are quantized as Q16.16 int32 before transfer.
-// overlap_px is sent as signed int32.
+// Per-bank runtime configuration used by the panorama algorithm.
+// Layout per bank:
+//   yaw_cd[6]    : uint16 LE, centi-degrees
+//   pitch_cd[6]  : int16 LE, centi-degrees
+//   roll_cd[6]   : int16 LE, centi-degrees
+//   overlap_px   : uint16 LE, pixels
+//   feather_q16  : int32 LE, Q16.16
 #define FPGA_CFG_BANK_EO            0x00u
 #define FPGA_CFG_BANK_IR            0x01u
 
 #define FPGA_REG_BASE_CFG_EO        0x20u
 #define FPGA_REG_BASE_CFG_IR        0x50u
 
-#define FPGA_REG_CFG_CYL_H_FOV_Q16  0x00u // i32
-#define FPGA_REG_CFG_CYL_V_FOV_Q16  0x04u // i32
-#define FPGA_REG_CFG_CROP_H_Q16     0x08u // i32
-#define FPGA_REG_CFG_CROP_W_Q16     0x0Cu // i32
-#define FPGA_REG_CFG_PITCH_TR_Q16   0x10u // i32 (effective pitch factor)
-#define FPGA_REG_CFG_YAW_TR_Q16     0x14u // i32
-#define FPGA_REG_CFG_OVERLAP_I32    0x18u // i32
-#define FPGA_REG_CFG_FEATHER_Q16    0x1Cu // i32
+#define FPGA_REG_CFG_YAW_CD(idx)    ((uint8_t)(0x00u + ((idx) * 2u))) // u16
+#define FPGA_REG_CFG_PITCH_CD(idx)  ((uint8_t)(0x0Cu + ((idx) * 2u))) // i16
+#define FPGA_REG_CFG_ROLL_CD(idx)   ((uint8_t)(0x18u + ((idx) * 2u))) // i16
+#define FPGA_REG_CFG_OVERLAP_U16    0x24u // u16
+#define FPGA_REG_CFG_FEATHER_Q16    0x28u // i32
 
 #define FPGA_REG_CFG_BANK_STRIDE    0x30u
 
