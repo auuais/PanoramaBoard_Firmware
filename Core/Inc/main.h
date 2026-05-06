@@ -97,6 +97,8 @@ void IMU_SPI_ResetSession(void);
 
 
 #define PARAM_ID_IR_NUC_COMMAND        0x0101
+#define PARAM_ID_IR_NUC_INTERVAL       0x0102
+#define PARAM_ID_IR_NUC_TRIGGER        0x0103
 #define PARAM_ID_IR_IMAGE_FLIP         0x0202
 #define PARAM_ID_IR_FRAME_RATE         0x0303
 #define PARAM_ID_IR_ICE_GAIN_BIAS      0x0405

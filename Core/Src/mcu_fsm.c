@@ -36,6 +36,8 @@ extern int test_day_camera_controls(uint8_t camera_num);
 extern int Initialize_IR_Camera(uint8_t camera_num);
 extern int Apply_IR_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
 extern int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
+extern void IR_Nuc_OnOperationEnter(void);
+extern void IR_Nuc_Service(McuContext *ctx);
 extern SPI_HandleTypeDef hspi2;
 
 // UART3 (PC UI)
@@ -1020,88 +1022,88 @@ void mcu_fsm_step(McuContext *ctx)
             ctx->ir_idx++;
 
         } else {
-//            ctx->state = ST_INIT_FPGA_CAL;
-        	ctx->state = ST_INIT_TEMP;
+            ctx->state = ST_INIT_FPGA_CAL;
+//        	ctx->state = ST_INIT_TEMP;
         }
         break;
     }
 
 
-//    case ST_INIT_FPGA_CAL: {
-//        ui_send_log(ctx, "FPGA init build: full-regmap diag v9\r\n");
-//        int st = fpga_rw_smoke_test();
-//
-//        if (st == 0) {
-//            ui_send_log(ctx, "FPGA I2C ping OK (0xA5)\r\n");
-//            Send_UART3_Debug("FPGA I2C ping OK (0xA5)\r\n\n\n");
-//            uint8_t detail = CFG_APPLY_OK;
-//            uint32_t t0 = HAL_GetTick();
-//            uint8_t probe_detail = CFG_APPLY_OK;
-//
-//            {
-//                static const uint8_t probe_regs[4]  = { 0x20u, 0x21u, 0x22u, 0x23u };
-//                static const uint8_t probe_vals[4]  = { 0x5Au, 0xA5u, 0x3Cu, 0xC3u };
-//                char msg[96];
-//                for (uint8_t i = 0; i < 4u; ++i) {
-//                    snprintf(msg, sizeof(msg), "FPGA probe reg 0x%02X\r\n", (unsigned)probe_regs[i]);
-//                    ui_send_log(ctx, msg);
-//                    if (!fpga_write_verify_reg8(probe_regs[i], probe_vals[i], &probe_detail)) {
-//                        snprintf(msg, sizeof(msg), "FPGA probe reg 0x%02X FAIL detail=%u\r\n",
-//                                 (unsigned)probe_regs[i], (unsigned)probe_detail);
-//                        ui_send_log(ctx, msg);
-//                        detail = probe_detail;
-//                        break;
-//                    }
-//                }
-//            }
-//
-//            if (detail == CFG_APPLY_OK) {
-//                #if FPGA_DEBUG_TOP_MODE_ONLY
-//                ui_send_log(ctx, "FPGA bank push skipped (debug top)\r\n");
-//                ui_send_log(ctx, "FPGA push stage: mode\r\n");
-//                detail = fpga_push_mode(s_cfg_store.mode);
-//                #else
-//                ui_send_log(ctx, "FPGA push stage: EO bank\r\n");
-//                detail = fpga_push_bank_chunked(ctx, CFG_BANK_EO, &s_cfg_store.eo);
-//
-//                if (detail == CFG_APPLY_OK) {
-//                    ui_send_log(ctx, "FPGA push stage: IR bank\r\n");
-//                    detail = fpga_push_bank_chunked(ctx, CFG_BANK_IR, &s_cfg_store.ir);
-//                }
-//
-//                if (detail == CFG_APPLY_OK) {
-//                    ui_send_log(ctx, "FPGA push stage: mode\r\n");
-//                    detail = fpga_push_mode(s_cfg_store.mode);
-//                }
-//                #endif
-//            }
-//
-//            if (detail == CFG_APPLY_OK) {
-//                char msg[96];
-//                snprintf(msg, sizeof(msg), "FPGA runtime config push OK (%lums)\r\n",
-//                         (unsigned long)(HAL_GetTick() - t0));
-//                ui_send_log(ctx, msg);
-//                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 1, ERR_OK);
-//            } else {
-//                char msg[96];
-//                snprintf(msg, sizeof(msg), "FPGA runtime config push FAIL detail=%u (%lums)\r\n",
-//                         (unsigned)detail,
-//                         (unsigned long)(HAL_GetTick() - t0));
-//                ui_send_log(ctx, msg);
-//                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
-//            }
-//
-//        } else {
-//            ui_send_log(ctx, "FPGA I2C ping FAIL\r\n");
-//            Send_UART3_Debug("FPGA I2C ping FAIL\r\n");
-//
-//             ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
-//        }
-//
-//        // Do NOT say Entered OPERATION here; we are not in OPERATION yet.
-//        ctx->state = ST_INIT_TEMP;
-//        break;
-//    }
+    case ST_INIT_FPGA_CAL: {
+        ui_send_log(ctx, "FPGA init build: full-regmap diag v9\r\n");
+        int st = fpga_rw_smoke_test();
+
+        if (st == 0) {
+            ui_send_log(ctx, "FPGA I2C ping OK (0xA5)\r\n");
+            Send_UART3_Debug("FPGA I2C ping OK (0xA5)\r\n\n\n");
+            uint8_t detail = CFG_APPLY_OK;
+            uint32_t t0 = HAL_GetTick();
+            uint8_t probe_detail = CFG_APPLY_OK;
+
+            {
+                static const uint8_t probe_regs[4]  = { 0x20u, 0x21u, 0x22u, 0x23u };
+                static const uint8_t probe_vals[4]  = { 0x5Au, 0xA5u, 0x3Cu, 0xC3u };
+                char msg[96];
+                for (uint8_t i = 0; i < 4u; ++i) {
+                    snprintf(msg, sizeof(msg), "FPGA probe reg 0x%02X\r\n", (unsigned)probe_regs[i]);
+                    ui_send_log(ctx, msg);
+                    if (!fpga_write_verify_reg8(probe_regs[i], probe_vals[i], &probe_detail)) {
+                        snprintf(msg, sizeof(msg), "FPGA probe reg 0x%02X FAIL detail=%u\r\n",
+                                 (unsigned)probe_regs[i], (unsigned)probe_detail);
+                        ui_send_log(ctx, msg);
+                        detail = probe_detail;
+                        break;
+                    }
+                }
+            }
+
+            if (detail == CFG_APPLY_OK) {
+                #if FPGA_DEBUG_TOP_MODE_ONLY
+                ui_send_log(ctx, "FPGA bank push skipped (debug top)\r\n");
+                ui_send_log(ctx, "FPGA push stage: mode\r\n");
+                detail = fpga_push_mode(s_cfg_store.mode);
+                #else
+                ui_send_log(ctx, "FPGA push stage: EO bank\r\n");
+                detail = fpga_push_bank(CFG_BANK_EO, &s_cfg_store.eo);
+
+                if (detail == CFG_APPLY_OK) {
+                    ui_send_log(ctx, "FPGA push stage: IR bank\r\n");
+                    detail = fpga_push_bank(CFG_BANK_IR, &s_cfg_store.ir);
+                }
+
+                if (detail == CFG_APPLY_OK) {
+                    ui_send_log(ctx, "FPGA push stage: mode\r\n");
+                    detail = fpga_push_mode(s_cfg_store.mode);
+                }
+                #endif
+            }
+
+            if (detail == CFG_APPLY_OK) {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "FPGA runtime config push OK (%lums)\r\n",
+                         (unsigned long)(HAL_GetTick() - t0));
+                ui_send_log(ctx, msg);
+                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 1, ERR_OK);
+            } else {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "FPGA runtime config push FAIL detail=%u (%lums)\r\n",
+                         (unsigned)detail,
+                         (unsigned long)(HAL_GetTick() - t0));
+                ui_send_log(ctx, msg);
+                ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
+            }
+
+        } else {
+            ui_send_log(ctx, "FPGA I2C ping FAIL\r\n");
+            Send_UART3_Debug("FPGA I2C ping FAIL\r\n");
+
+             ui_send_init_ack(ctx->init_seq,NODE_FPGA, 0, 0, ERR_FAIL);
+        }
+
+        // Do NOT say Entered OPERATION here; we are not in OPERATION yet.
+        ctx->state = ST_INIT_TEMP;
+        break;
+    }
 
     case ST_INIT_TEMP: {
         float t = 0.0f, h = 0.0f;
@@ -1130,6 +1132,7 @@ void mcu_fsm_step(McuContext *ctx)
                  h_cp / 100.0f);
         Send_UART3_Debug(msg);
 
+        IR_Nuc_OnOperationEnter();
         ctx->state = ST_OPERATION;
         ui_send_log(ctx, "Entered OPERATION\r\n");
         break;
@@ -1137,6 +1140,7 @@ void mcu_fsm_step(McuContext *ctx)
 
     case ST_OPERATION: {
         fpga_service_orient();
+        IR_Nuc_Service(ctx);
         break;
     }
 

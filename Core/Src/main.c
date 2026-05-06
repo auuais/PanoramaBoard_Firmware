@@ -31,6 +31,13 @@
 #define RET_ERR_RX       -3
 #define RET_ERR_SPI      -4
 
+#define IR_NUC_MODE_DISABLED          0u
+#define IR_NUC_MODE_AUTO              1u
+#define IR_NUC_DEFAULT_INTERVAL_MIN   3u
+#define IR_NUC_MIN_INTERVAL_MIN       1u
+#define IR_NUC_MAX_INTERVAL_MIN      10u
+#define IR_NUC_STAGGER_MS           250u
+
 /* IIM-46234 command packets are always exactly 20 bytes (from ATMEL ref SIZE_PACKET_CMD) */
 #define IMU_CMD_PACKET_SIZE  20u
 
@@ -183,6 +190,15 @@ volatile bool ir_camera_data_received_flag = false;
 volatile uint16_t ir_camera_received_bytes = 0;
 uint8_t ir_camera_rx_buffer[128];
 uint8_t current_ir_camera = 0;  // Currently selected IR camera (0-5)
+static uint8_t s_ir_nuc_mode[6] = {
+    IR_NUC_MODE_DISABLED, IR_NUC_MODE_DISABLED, IR_NUC_MODE_DISABLED,
+    IR_NUC_MODE_DISABLED, IR_NUC_MODE_DISABLED, IR_NUC_MODE_DISABLED
+};
+static uint8_t s_ir_nuc_interval_min[6] = {
+    IR_NUC_DEFAULT_INTERVAL_MIN, IR_NUC_DEFAULT_INTERVAL_MIN, IR_NUC_DEFAULT_INTERVAL_MIN,
+    IR_NUC_DEFAULT_INTERVAL_MIN, IR_NUC_DEFAULT_INTERVAL_MIN, IR_NUC_DEFAULT_INTERVAL_MIN
+};
+static uint32_t s_ir_nuc_next_due_ms[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
 
 
 
@@ -995,7 +1011,9 @@ int Send_IR_Camera_Command(uint8_t message_id, uint8_t *params, uint32_t param_s
 
 bool Validate_IR_Parameter(uint16_t param_id, uint16_t value) {
     switch(param_id) {
-        case PARAM_ID_IR_NUC_COMMAND:    return value <= 1u;
+        case PARAM_ID_IR_NUC_COMMAND:    return value <= IR_NUC_MODE_AUTO;
+        case PARAM_ID_IR_NUC_INTERVAL:   return value >= IR_NUC_MIN_INTERVAL_MIN && value <= IR_NUC_MAX_INTERVAL_MIN;
+        case PARAM_ID_IR_NUC_TRIGGER:    return value == 1u;
         case PARAM_ID_IR_IMAGE_FLIP:     return value <= 3u;
         case PARAM_ID_IR_FRAME_RATE:     return value <= 8u;
         case PARAM_ID_IR_ICE_GAIN_BIAS:  return value <= 4095u;
@@ -1291,17 +1309,84 @@ static int IR_SetZoom(uint16_t zoom_id)
     return IR_SendCommandAndWaitAck(0xA4u, p, 2u);
 }
 
-static int IR_RunNuc(uint16_t mode)
+static void IR_NucScheduleCameraFromNow(uint8_t camera_num)
 {
-    if (mode == 0u) {
-        uint8_t p[2] = { 0x00u, 0x03u };
-        return IR_SendCommandAndWaitAck(0x27u, p, 2u);
+    if (camera_num >= 6u) return;
+    s_ir_nuc_next_due_ms[camera_num] = HAL_GetTick() + ((uint32_t)s_ir_nuc_interval_min[camera_num] * 60000u);
+}
+
+static int IR_SetAutoCalibration(uint16_t enabled)
+{
+    uint8_t p[2] = { 0x00u, (uint8_t)(enabled != 0u ? 0x01u : 0x00u) };
+    return IR_SendCommandAndWaitAck(0x26u, p, 2u);
+}
+
+static int IR_RunNucOnePoint(void)
+{
+    uint8_t p[2] = { 0x00u, 0x03u };
+    return IR_SendCommandAndWaitAck(0x27u, p, 2u);
+}
+
+static int IR_DisableAutoNucCamera(uint8_t camera_num)
+{
+    if (camera_num >= 6u) return RET_ERR_RX;
+
+    select_ir_camera(camera_num);
+    if (IR_SetAutoCalibration(0u) != RET_OK) {
+        return RET_ERR_RX;
     }
-    if (mode == 1u) {
-        uint8_t p[2] = { 0x00u, 0x04u };
-        return IR_SendCommandAndWaitAck(0x27u, p, 2u);
+    return RET_OK;
+}
+
+static int IR_DisableAutoNucTargets(uint8_t camera_sel)
+{
+    int first_error = RET_OK;
+
+    if (camera_sel == 0u) {
+        for (uint8_t cam = 0u; cam < 6u; ++cam) {
+            if (IR_DisableAutoNucCamera(cam) != RET_OK && first_error == RET_OK) {
+                first_error = RET_ERR_RX;
+            }
+        }
+        return first_error;
     }
-    return RET_ERR_TX;
+
+    if (camera_sel > 6u) return RET_ERR_RX;
+    return IR_DisableAutoNucCamera((uint8_t)(camera_sel - 1u));
+}
+
+static int IR_RunSequentialNucSweep(uint8_t camera_sel, const char *reason)
+{
+    int first_error = RET_OK;
+    char msg[96];
+
+    if (reason != NULL) {
+        snprintf(msg, sizeof(msg), "IR NUC sweep start: %s\r\n", reason);
+        mcu_ui_log(&g_ctx, "%s", msg);
+    }
+
+    uint8_t first_cam = (camera_sel == 0u) ? 0u : (uint8_t)(camera_sel - 1u);
+    uint8_t last_cam = (camera_sel == 0u) ? 5u : (uint8_t)(camera_sel - 1u);
+
+    for (uint8_t cam = first_cam; cam <= last_cam; ++cam) {
+        select_ir_camera(cam);
+        int rc = IR_RunNucOnePoint();
+        if (rc != RET_OK) {
+            if (first_error == RET_OK) first_error = rc;
+            snprintf(msg, sizeof(msg), "IR NUC cam %u trigger failed rc=%d\r\n",
+                     (unsigned)cam, rc);
+            mcu_ui_log(&g_ctx, "%s", msg);
+        }
+        HAL_Delay(IR_NUC_STAGGER_MS);
+    }
+
+    if (first_error == RET_OK) {
+        mcu_ui_log(&g_ctx, "IR NUC sweep complete\r\n");
+    } else {
+        mcu_ui_log(&g_ctx, "IR NUC sweep completed with errors\r\n");
+    }
+
+    return first_error;
 }
 
 static int apply_ir_param_single(uint8_t camera_num, uint16_t param_id, uint16_t value)
@@ -1313,7 +1398,9 @@ static int apply_ir_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
 
     switch (param_id) {
         case PARAM_ID_IR_NUC_COMMAND:
-            return IR_RunNuc(value);
+        case PARAM_ID_IR_NUC_INTERVAL:
+        case PARAM_ID_IR_NUC_TRIGGER:
+            return RET_ERR_RX;
         case PARAM_ID_IR_IMAGE_FLIP:
             return IR_SetOrientation(value);
         case PARAM_ID_IR_FRAME_RATE:
@@ -1660,6 +1747,87 @@ int Apply_IR_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value)
 {
     int rc = RET_OK;
 
+    if (!Validate_IR_Parameter(param_id, value)) return RET_ERR_RX;
+
+    if (param_id == PARAM_ID_IR_NUC_INTERVAL) {
+        if (camera_sel == 0u) {
+            for (uint8_t cam = 0u; cam < 6u; ++cam) {
+                s_ir_nuc_interval_min[cam] = (uint8_t)value;
+                if (s_ir_nuc_mode[cam] == IR_NUC_MODE_AUTO) {
+                    IR_NucScheduleCameraFromNow(cam);
+                }
+            }
+            return RET_OK;
+        }
+
+        if (camera_sel > 6u) return RET_ERR_RX;
+        s_ir_nuc_interval_min[camera_sel - 1u] = (uint8_t)value;
+        if (s_ir_nuc_mode[camera_sel - 1u] == IR_NUC_MODE_AUTO) {
+            IR_NucScheduleCameraFromNow((uint8_t)(camera_sel - 1u));
+        }
+        return RET_OK;
+    }
+
+    if (param_id == PARAM_ID_IR_NUC_COMMAND) {
+        if (IR_DisableAutoNucTargets(camera_sel) != RET_OK) {
+            return RET_ERR_RX;
+        }
+
+        if (value == IR_NUC_MODE_DISABLED) {
+            if (camera_sel == 0u) {
+                for (uint8_t cam = 0u; cam < 6u; ++cam) {
+                    s_ir_nuc_mode[cam] = IR_NUC_MODE_DISABLED;
+                    s_ir_nuc_next_due_ms[cam] = 0u;
+                }
+                mcu_ui_log(&g_ctx, "IR NUC mode set: disabled (all)\r\n");
+            } else {
+                if (camera_sel > 6u) return RET_ERR_RX;
+                s_ir_nuc_mode[camera_sel - 1u] = IR_NUC_MODE_DISABLED;
+                s_ir_nuc_next_due_ms[camera_sel - 1u] = 0u;
+                mcu_ui_log(&g_ctx, "IR NUC mode set: disabled cam %u\r\n",
+                           (unsigned)(camera_sel - 1u));
+            }
+            return RET_OK;
+        }
+
+        if (camera_sel == 0u) {
+            for (uint8_t cam = 0u; cam < 6u; ++cam) {
+                s_ir_nuc_mode[cam] = IR_NUC_MODE_AUTO;
+                IR_NucScheduleCameraFromNow(cam);
+            }
+            mcu_ui_log(&g_ctx, "IR NUC mode set: enabled all (%u min)\r\n",
+                       (unsigned)s_ir_nuc_interval_min[0]);
+        } else {
+            if (camera_sel > 6u) return RET_ERR_RX;
+            s_ir_nuc_mode[camera_sel - 1u] = IR_NUC_MODE_AUTO;
+            IR_NucScheduleCameraFromNow((uint8_t)(camera_sel - 1u));
+            mcu_ui_log(&g_ctx, "IR NUC mode set: enabled cam %u (%u min)\r\n",
+                       (unsigned)(camera_sel - 1u),
+                       (unsigned)s_ir_nuc_interval_min[camera_sel - 1u]);
+        }
+        return RET_OK;
+    }
+
+    if (param_id == PARAM_ID_IR_NUC_TRIGGER) {
+        if (IR_DisableAutoNucTargets(camera_sel) != RET_OK) {
+            return RET_ERR_RX;
+        }
+
+        rc = IR_RunSequentialNucSweep(camera_sel, "manual");
+        if (rc == RET_OK) {
+            if (camera_sel == 0u) {
+                for (uint8_t cam = 0u; cam < 6u; ++cam) {
+                    if (s_ir_nuc_mode[cam] == IR_NUC_MODE_AUTO) {
+                        IR_NucScheduleCameraFromNow(cam);
+                    }
+                }
+            } else if (camera_sel <= 6u && s_ir_nuc_mode[camera_sel - 1u] == IR_NUC_MODE_AUTO) {
+                IR_NucScheduleCameraFromNow((uint8_t)(camera_sel - 1u));
+            }
+        }
+        return rc;
+    }
+
     if (camera_sel == 0u) {
         for (uint8_t cam = 0u; cam < 6u; ++cam) {
             rc = apply_ir_param_single(cam, param_id, value);
@@ -1670,6 +1838,47 @@ int Apply_IR_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value)
 
     if (camera_sel > 6u) return RET_ERR_RX;
     return apply_ir_param_single((uint8_t)(camera_sel - 1u), param_id, value);
+}
+
+void IR_Nuc_Service(McuContext *ctx)
+{
+    (void)ctx;
+
+    uint32_t now = HAL_GetTick();
+    uint8_t due_list[6];
+    uint8_t due_count = 0u;
+
+    for (uint8_t cam = 0u; cam < 6u; ++cam) {
+        if (s_ir_nuc_mode[cam] != IR_NUC_MODE_AUTO || s_ir_nuc_next_due_ms[cam] == 0u) {
+            continue;
+        }
+
+        if ((int32_t)(now - s_ir_nuc_next_due_ms[cam]) >= 0) {
+            due_list[due_count++] = cam;
+        }
+    }
+
+    for (uint8_t i = 0u; i < due_count; ++i) {
+        uint8_t cam = due_list[i];
+        (void)IR_DisableAutoNucCamera(cam);
+        if (IR_RunSequentialNucSweep((uint8_t)(cam + 1u), "auto") != RET_OK) {
+            mcu_ui_log(&g_ctx, "IR auto NUC sweep failed cam %u\r\n", (unsigned)cam);
+        }
+        if (s_ir_nuc_mode[cam] == IR_NUC_MODE_AUTO) {
+            IR_NucScheduleCameraFromNow(cam);
+        }
+    }
+}
+
+void IR_Nuc_OnOperationEnter(void)
+{
+    for (uint8_t cam = 0u; cam < 6u; ++cam) {
+        if (s_ir_nuc_mode[cam] == IR_NUC_MODE_AUTO) {
+            IR_NucScheduleCameraFromNow(cam);
+        } else {
+            s_ir_nuc_next_due_ms[cam] = 0u;
+        }
+    }
 }
 
 int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value)
@@ -1800,12 +2009,22 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     mcu_ui_log(&g_ctx, "Verify FrameRate: NV16=%d\r\n", nv16);
 
     // --- Genlock slave / input ---
-    IR_SetNV(17, 1);       // NV#17 Genlock Direction = input (slave mode)
-    IR_SetNV(18, 0);       // NV#18 Genlock Mode = 0 (slave)
+    IR_SetNV(17, 0);       // NV#17 Genlock Direction = input (slave mode)
+    IR_SetNV(18, 1);       // NV#18 Genlock Mode = 0 (slave)
 
     int nv17=-1,nv18=-1;
     IR_GetNV(17,&nv17); IR_GetNV(18,&nv18);
     mcu_ui_log(&g_ctx, "Verify Genlock: NV17=%d NV18=%d\r\n", nv17, nv18);
+
+    s_ir_nuc_mode[camera_num] = IR_NUC_MODE_DISABLED;
+    s_ir_nuc_interval_min[camera_num] = IR_NUC_DEFAULT_INTERVAL_MIN;
+    s_ir_nuc_next_due_ms[camera_num] = 0u;
+
+    if (IR_SetAutoCalibration(0u) != RET_OK) {
+        mcu_ui_log(&g_ctx, "IR Camera %d auto NUC disable failed\r\n", camera_num);
+    } else {
+        mcu_ui_log(&g_ctx, "IR Camera %d auto NUC disabled\r\n", camera_num);
+    }
 
     mcu_ui_log(&g_ctx, "IR Camera %d initialization complete\r\n", camera_num);
     return RET_OK;
