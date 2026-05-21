@@ -266,7 +266,7 @@ static uint32_t cfg_flash_address(void)
 
 static bool cfg_mode_valid(uint8_t mode)
 {
-    if (mode == 0x00u || mode == 0x01u || mode == 0x02u || mode == 0x03u || mode == 0x06u || mode == 0x13u || mode == 0x14u) {
+    if (mode == 0x00u || mode == 0x01u || mode == 0x02u || mode == 0x03u || mode == 0x06u || mode == 0x13u || mode == 0x14u || mode == 0x15u) {
         return true;
     }
     if (mode >= 0x07u && mode <= 0x12u) {
