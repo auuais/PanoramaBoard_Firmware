@@ -34,6 +34,8 @@ extern void Read_HDC3022_Sensor(float* temp, float* hum);
 extern void Send_UART3_Debug(const char *format, ...);
 extern int test_day_camera_controls(uint8_t camera_num);
 extern int Initialize_IR_Camera(uint8_t camera_num);
+extern int ir_camera_handshake(uint8_t camera_num);
+extern const char *mcu_get_reset_cause_str(void);
 extern int Apply_IR_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
 extern int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
 extern void IR_Nuc_OnOperationEnter(void);
@@ -75,6 +77,8 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define CMD_INIT_SYSTEM  0x13
 #define CMD_CAMERA_RESET 0x14
 #define CMD_PING         0x15
+#define CMD_GET_VERSION  0x16
+#define CMD_SET_CAMERA_POWER 0x17
 #define CMD_GET_CONFIG   0x30
 #define CMD_APPLY_CONFIG 0x31
 #define CMD_CAMERA_CONTROL 0x32
@@ -107,6 +111,11 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define LOG_CTRL_SAVE         0x02u
 #define LOG_CAPTURE_SAVE_DELAY_MS 45000u
 #define FPGA_DEBUG_TOP_MODE_ONLY 0u
+#define FW_VERSION_MAJOR 1u
+#define FW_VERSION_MINOR 0u
+#define FW_VERSION_YEAR  26u
+#define FW_VERSION_MONTH 6u
+#define FW_VERSION_DAY   17u
 
 // ---- IMU command packets (matching ATMEL IIM4623x reference exactly) ----
 // WHO_AM_I = ReadRegister(addr=0x00, len=1, page=0)
@@ -596,6 +605,57 @@ static void ui_send_resp_simple(uint8_t seq, uint8_t err)
     ui_send_frame(MSG_RESP, seq, p, sizeof(p));
 }
 
+static void ui_send_version(uint8_t seq)
+{
+    uint8_t p[9] = {
+        ERR_OK,
+        NODE_SYSTEM,
+        0xFEu,
+        1u,
+        FW_VERSION_MAJOR,
+        FW_VERSION_MINOR,
+        FW_VERSION_YEAR,
+        FW_VERSION_MONTH,
+        FW_VERSION_DAY
+    };
+    ui_send_frame(MSG_RESP, seq, p, sizeof(p));
+}
+
+static int camera_power_set(uint8_t node_type, uint8_t id, uint8_t on)
+{
+    GPIO_TypeDef *port = NULL;
+    uint16_t pin = 0u;
+
+    if (id >= 6u) return -1;
+
+    if (node_type == NODE_DAY) {
+        switch (id) {
+        case 0u: port = GPIOC; pin = GPIO_PIN_11; break;
+        case 1u: port = GPIOC; pin = GPIO_PIN_12; break;
+        case 2u: port = GPIOC; pin = GPIO_PIN_13; break;
+        case 3u: port = GPIOD; pin = GPIO_PIN_5;  break;
+        case 4u: port = GPIOD; pin = GPIO_PIN_4;  break;
+        case 5u: port = GPIOD; pin = GPIO_PIN_3;  break;
+        default: return -1;
+        }
+    } else if (node_type == NODE_IR) {
+        switch (id) {
+        case 0u: port = GPIOD; pin = GPIO_PIN_1;  break;
+        case 1u: port = GPIOD; pin = GPIO_PIN_0;  break;
+        case 2u: port = GPIOC; pin = GPIO_PIN_9;  break;
+        case 3u: port = GPIOC; pin = GPIO_PIN_8;  break;
+        case 4u: port = GPIOA; pin = GPIO_PIN_15; break;
+        case 5u: port = GPIOA; pin = GPIO_PIN_8;  break;
+        default: return -1;
+        }
+    } else {
+        return -1;
+    }
+
+    HAL_GPIO_WritePin(port, pin, (on != 0u) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    return 0;
+}
+
 static void ui_send_camera_apply_result(uint8_t seq,
                                         uint8_t node_type,
                                         uint8_t camera_id,
@@ -797,6 +857,46 @@ static int fpga_rw_smoke_test(void)
   return (rd == wr) ? 0 : -2;
 }
 
+// ===================== SAFE NODE STATUS CHECKS =====================
+// These are handshake/liveness checks ONLY. They must never re-initialize a node
+// (no IMU_Reset, no FPGA register writes, no IR FactoryResetNV/NV reconfigure),
+// so they can run periodically (e.g. the 30 s UI status poll) without disturbing
+// live peripherals or tripping the power IC.
+
+// IMU: g_imu_drdy_edges_total is incremented by the IMU DRDY EXTI ISR (~1 kHz
+// while healthy). We watch it advance; if it stalls for longer than the timeout,
+// the IMU data has stopped. No SPI traffic, no reset.
+#define IMU_STALE_TIMEOUT_MS 250u
+static uint32_t s_imu_fresh_last_edges = 0u;
+static uint32_t s_imu_fresh_last_ms    = 0u;
+static volatile bool s_imu_data_stale  = true;   // assume stale until proven fresh
+
+static void imu_freshness_monitor(void)
+{
+    uint32_t now   = HAL_GetTick();
+    uint32_t edges = g_imu_drdy_edges_total;
+
+    if (edges != s_imu_fresh_last_edges) {
+        s_imu_fresh_last_edges = edges;
+        s_imu_fresh_last_ms    = now;
+        s_imu_data_stale       = false;
+    } else if ((uint32_t)(now - s_imu_fresh_last_ms) > IMU_STALE_TIMEOUT_MS) {
+        s_imu_data_stale = true;
+    }
+}
+
+static bool imu_status_ok(void)
+{
+    return !s_imu_data_stale;
+}
+
+// FPGA: pure I2C address-ACK probe. Confirms the FPGA's I2C slave is alive with
+// no register write (the old smoke test clobbered FPGA_REG_MODE_CURRENT).
+static bool fpga_status_ok(void)
+{
+    return (fpga_is_ready(&g_fpga, 2u, 50u) == HAL_OK);
+}
+
 
 // ===================== FSM =====================
 void mcu_fsm_init(McuContext *ctx)
@@ -838,6 +938,7 @@ void mcu_fsm_start_init(McuContext *ctx)
 void mcu_fsm_step(McuContext *ctx)
 {
     mcu_service_log_capture(ctx);
+    imu_freshness_monitor();   // keep the IMU data-stale flag current every step
 
 	switch (ctx->state) {
 
@@ -847,7 +948,7 @@ void mcu_fsm_step(McuContext *ctx)
     case ST_WAIT_UI_INIT: {
         // Do nothing until UI requests init
 
-    	ctx->state = ST_BOOT;
+//    	ctx->state = ST_BOOT;
         break;
     }
 
@@ -1134,6 +1235,7 @@ void mcu_fsm_step(McuContext *ctx)
 
         IR_Nuc_OnOperationEnter();
         ctx->state = ST_OPERATION;
+        ui_send_init_ack(ctx->init_seq, NODE_SYSTEM, 1, 1, ERR_OK);
         ui_send_log(ctx, "Entered OPERATION\r\n");
         break;
     }
@@ -1433,12 +1535,13 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
 
     const uint8_t *d = &p[4];
 
-    // Allow CMD_INIT_SYSTEM and CMD_GET_CONFIG from any state.
+    // Allow CMD_INIT_SYSTEM, CMD_GET_CONFIG, CMD_GET_VERSION, and CMD_PING from any state.
     // For any other command, reply BUSY until OPERATION.
     if (ctx->state != ST_OPERATION) {
         if (msg_type == MSG_CMD && plen >= 1) {
             uint8_t maybe_cmd = d[0];
-            if (maybe_cmd != CMD_INIT_SYSTEM && maybe_cmd != CMD_GET_CONFIG && maybe_cmd != CMD_PING) {
+            if (maybe_cmd != CMD_INIT_SYSTEM && maybe_cmd != CMD_GET_CONFIG &&
+                maybe_cmd != CMD_GET_VERSION && maybe_cmd != CMD_PING) {
                 ui_send_resp_simple(seq, ERR_BUSY);
                 return;
             }
@@ -1473,7 +1576,9 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
 
         // Always ACK the command itself
         ui_send_init_ack(seq, NODE_SYSTEM, 0, 1, ERR_OK);
+        ui_send_version(seq);
         ui_send_log(ctx, (ctx->state == ST_WAIT_UI_INIT) ? "INIT: started\r\n" : "INIT: restart\r\n");
+        ui_send_log(ctx, mcu_get_reset_cause_str());   // surface why the MCU last reset
         Send_UART3_Debug("INIT: requested (state=%d)\r\n", (int)ctx->state);
         mcu_fsm_start_init(ctx);
 
@@ -1537,6 +1642,33 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
 
     case CMD_PING: {
         ui_send_resp_simple(seq, ERR_OK);
+        break;
+    }
+
+    case CMD_GET_VERSION: {
+        ui_send_version(seq);
+        break;
+    }
+
+    case CMD_SET_CAMERA_POWER: {
+        if (plen < 4u) {
+            ui_send_resp_simple(seq, ERR_BADARG);
+            break;
+        }
+
+        uint8_t node_type = d[1];
+        uint8_t id = d[2];
+        uint8_t on = (d[3] != 0u) ? 1u : 0u;
+
+        if ((node_type != NODE_DAY && node_type != NODE_IR) || id >= 6u) {
+            ui_send_resp_simple(seq, ERR_BADARG);
+            break;
+        }
+
+        uint8_t ok = (camera_power_set(node_type, id, on) == 0) ? 1u : 0u;
+        uint8_t err = ok ? ERR_OK : ERR_FAIL;
+        uint8_t resp[4] = { err, node_type, id, ok };
+        ui_send_frame(MSG_RESP, seq, resp, sizeof(resp));
         break;
     }
 
@@ -1651,30 +1783,30 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
 
         switch (node_type) {
         case NODE_FPGA:
-            ok = (fpga_rw_smoke_test() == 0) ? 1 : 0;
+            // Safe: I2C address-ACK probe only (was: smoke-test write to mode reg).
+            ok = fpga_status_ok() ? 1 : 0;
             err = ok ? ERR_OK : ERR_FAIL;
             break;
 
         case NODE_DAY:
             if (id >= 6) { err = ERR_BADARG; break; }
+            // Non-destructive VISCA version inquiry (no re-init).
             ok = (test_day_camera_controls(id) == 0) ? 1 : 0;
             err = ok ? ERR_OK : ERR_FAIL;
             break;
 
         case NODE_IR:
             if (id >= 6) { err = ERR_BADARG; break; }
-            ok = (Initialize_IR_Camera(id) == 0) ? 1 : 0;
+            // Safe: handshake ping only (was: full Initialize_IR_Camera re-init).
+            ok = (ir_camera_handshake(id) == 0) ? 1 : 0;
             err = ok ? ERR_OK : ERR_FAIL;
             break;
 
-        case NODE_IMU: {
-            IMU_Reset();
-            HAL_Delay(10);
-            int r = send_imu_command(who_am_i_packet, sizeof(who_am_i_packet), SIZE_RESP_READ_REGS_BASE, "WHO_AM_I");
-            ok = (r == 0) ? 1 : 0;
+        case NODE_IMU:
+            // Safe: read the data-freshness flag (was: IMU_Reset + blocking SPI).
+            ok = imu_status_ok() ? 1 : 0;
             err = ok ? ERR_OK : ERR_FAIL;
             break;
-        }
 
         case NODE_TEMP: {
             float t = 0.0f, h = 0.0f;

@@ -117,6 +117,10 @@ static fpga_orient_shadow_t g_fpga_orient = {0};
 
 fpga_i2c_t g_fpga;
 
+static uint32_t g_boot_rcc_csr = 0u;
+static uint32_t g_boot_flash_optr = 0u;
+static bool g_boot_reset_reported = false;
+
 void fpga_init(void)
 {
     fpga_i2c_init(&g_fpga, &hi2c3, 0x42);
@@ -146,6 +150,9 @@ static int imu_drdy_ready(void);
 void build_cmd20(const uint8_t *cmd, uint32_t cmd_len, uint8_t out20[IMU_CMD_PACKET_SIZE]);
 
 void Send_UART3_Debug(const char *format, ...);
+static void Capture_Boot_Reset_State(void);
+static void Report_Boot_Reset_State_Once(void);
+const char *mcu_get_reset_cause_str(void);
 
 int send_imu_command(uint8_t *tx_packet, uint32_t tx_size, uint32_t rx_size, const char *cmd_name);
 int send_imu_command_ex(uint8_t *tx_packet, uint32_t tx_size, uint32_t rx_size, const char *cmd_name, uint8_t *rx_out);
@@ -164,6 +171,7 @@ void Process_IR_Camera_Received_Data(uint8_t* data, uint16_t length);
 int Apply_IR_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
 int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
 int Initialize_IR_Camera(uint8_t camera_num);
+int ir_camera_handshake(uint8_t camera_num);
 bool Validate_IR_Parameter(uint16_t param_id, uint16_t value);
 bool Validate_EO_Parameter(uint16_t param_id, uint16_t value);
 uint8_t ComputeChecksum(uint8_t* message_buffer, uint32_t length);
@@ -200,7 +208,6 @@ static uint8_t s_ir_nuc_interval_min[6] = {
 };
 static uint32_t s_ir_nuc_next_due_ms[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
 static bool s_ir_camera_present[6] = { false, false, false, false, false, false };
-
 
 
 void Enable_All_Camera_Power(void)
@@ -296,6 +303,85 @@ void Send_UART3_Debug(const char *format, ...) {
     vsnprintf(text, sizeof(text), format, args);
     va_end(args);
     ui_logf("%s", text);
+}
+
+static void Capture_Boot_Reset_State(void)
+{
+    g_boot_rcc_csr = RCC->CSR;
+    g_boot_flash_optr = FLASH->OPTR;
+    g_boot_reset_reported = false;
+}
+
+static const char *nrst_mode_text(uint32_t optr)
+{
+#if defined(FLASH_OPTR_NRST_MODE)
+    switch (optr & FLASH_OPTR_NRST_MODE) {
+    case FLASH_OPTR_NRST_MODE_0:
+        return "input-only";
+    case FLASH_OPTR_NRST_MODE_1:
+        return "GPIO-only";
+    case FLASH_OPTR_NRST_MODE:
+        return "input-output";
+    default:
+        return "reserved";
+    }
+#else
+    (void)optr;
+    return "not-supported";
+#endif
+}
+
+static void Report_Boot_Reset_State_Once(void)
+{
+    if (g_boot_reset_reported) {
+        return;
+    }
+
+    const uint32_t csr = g_boot_rcc_csr;
+    const bool any_reset_flag =
+        ((csr & (RCC_CSR_PINRSTF | RCC_CSR_PWRRSTF | RCC_CSR_SFTRSTF |
+                 RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF | RCC_CSR_LPWRRSTF |
+                 RCC_CSR_OBLRSTF)) != 0u);
+
+    Send_UART3_Debug("[BOOT] MCU reset cause: CSR=0x%08lX OPTR=0x%08lX NRST=%s flags:%s%s%s%s%s%s%s%s\r\n",
+                     (unsigned long)csr,
+                     (unsigned long)g_boot_flash_optr,
+                     nrst_mode_text(g_boot_flash_optr),
+                     any_reset_flag ? "" : " none",
+                     (csr & RCC_CSR_PINRSTF)  ? " PINRST"  : "",
+                     (csr & RCC_CSR_PWRRSTF)  ? " PWRRST(POR/BOR/PDR)" : "",
+                     (csr & RCC_CSR_SFTRSTF)  ? " SFTRST"  : "",
+                     (csr & RCC_CSR_IWDGRSTF) ? " IWDGRST" : "",
+                     (csr & RCC_CSR_WWDGRSTF) ? " WWDGRST" : "",
+                     (csr & RCC_CSR_LPWRRSTF) ? " LPWRRST" : "",
+                     (csr & RCC_CSR_OBLRSTF)  ? " OBLRST"  : "");
+
+    g_boot_reset_reported = true;
+}
+
+// Build a human-readable last-reset-cause string from the values captured at boot.
+// The UART3 [BOOT] report happens before the UI is connected, so this is emitted to
+// the UI log on INIT -> the reset cause is visible without a UART3 terminal.
+const char *mcu_get_reset_cause_str(void)
+{
+    static char buf[160];
+    const uint32_t csr = g_boot_rcc_csr;
+    const bool any =
+        (csr & (RCC_CSR_PINRSTF | RCC_CSR_PWRRSTF | RCC_CSR_SFTRSTF |
+                RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF | RCC_CSR_LPWRRSTF)) != 0u;
+
+    snprintf(buf, sizeof(buf),
+             "[BOOT] last reset:%s%s%s%s%s%s%s (CSR=0x%08lX NRST=%s)\r\n",
+             any ? "" : " none",
+             (csr & RCC_CSR_PINRSTF)  ? " PINRST"          : "",
+             (csr & RCC_CSR_PWRRSTF)  ? " PWRRST(BOR/POR)" : "",
+             (csr & RCC_CSR_SFTRSTF)  ? " SFTRST"          : "",
+             (csr & RCC_CSR_IWDGRSTF) ? " IWDGRST"         : "",
+             (csr & RCC_CSR_WWDGRSTF) ? " WWDGRST"         : "",
+             (csr & RCC_CSR_LPWRRSTF) ? " LPWRRST"         : "",
+             (unsigned long)csr,
+             nrst_mode_text(g_boot_flash_optr));
+    return buf;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2091,6 +2177,60 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     return RET_OK;
 }
 
+// Lightweight IR camera presence/handshake check. Selects the camera's control
+// channel and sends only the handshake ping (msg 0x07), then waits briefly for a
+// valid ACK (0x02) or text (0x00) reply. Performs NO FactoryResetNV and NO NV
+// reconfiguration, so it is safe to call periodically (status checks) without
+// disturbing a running camera.
+int ir_camera_handshake(uint8_t camera_num)
+{
+    if (camera_num > 5u) return RET_ERR_TX;
+
+    select_ir_camera(camera_num);
+    HAL_Delay(50);
+
+    ir_camera_data_received_flag = false;
+    ir_camera_received_bytes = 0;
+    memset(ir_camera_rx_buffer, 0, sizeof ir_camera_rx_buffer);
+
+    if (Send_IR_Camera_Command(0x07, NULL, 0) != RET_OK) {
+        s_ir_camera_present[camera_num] = false;
+        return RET_ERR_TX;
+    }
+
+    uint32_t t0 = HAL_GetTick();
+    while (!ir_camera_data_received_flag && (HAL_GetTick() - t0) < 250u) {
+        /* IR camera UART RX is interrupt-driven; wait briefly for the reply */
+        HAL_Delay(1);
+    }
+
+    bool handshake_success = false;
+    if (ir_camera_data_received_flag) {
+        uint16_t current_pos = 0;
+        while (current_pos < ir_camera_received_bytes) {
+            if (ir_camera_rx_buffer[current_pos] == 0x01) {
+                if (current_pos + 3 < ir_camera_received_bytes) {
+                    uint8_t message_id = ir_camera_rx_buffer[current_pos + 1];
+                    uint8_t param_len  = ir_camera_rx_buffer[current_pos + 2];
+                    uint32_t total_msg_len = 4u + param_len;
+                    if (current_pos + total_msg_len <= ir_camera_received_bytes) {
+                        uint8_t* msg_ptr = &ir_camera_rx_buffer[current_pos];
+                        if (msg_ptr[total_msg_len - 1] == ComputeChecksum(msg_ptr, total_msg_len - 1)) {
+                            if (message_id == 0x02) { handshake_success = true; break; }
+                            else if (message_id == 0x00) { handshake_success = true; }
+                        }
+                    }
+                }
+            }
+            current_pos++;
+        }
+        ir_camera_data_received_flag = false;
+    }
+
+    s_ir_camera_present[camera_num] = handshake_success;
+    return handshake_success ? RET_OK : RET_ERR_TX;
+}
+
 
 
 void Read_HDC3022_Sensor(float* temp, float* hum) {
@@ -2200,6 +2340,7 @@ static void ui_process_bytes(const uint8_t *data, uint16_t len)
                 uint8_t payload[UI_PAYLOAD_MAX];
                 size_t pay_len = uart_frame_parse(ui_acc, ui_acc_len, payload, sizeof(payload));
                 if (pay_len > 0) {
+                    Report_Boot_Reset_State_Once();
                     mcu_on_ui_payload(&g_ctx, payload, (uint16_t)pay_len);
                 }
             }
@@ -2226,7 +2367,9 @@ static void ui_process_bytes(const uint8_t *data, uint16_t len)
 int main(void)
 {
   /* MCU Configuration--------------------------------------------------------*/
+  Capture_Boot_Reset_State();
   HAL_Init();
+  __HAL_RCC_CLEAR_RESET_FLAGS();
   SystemClock_Config();
 
   MX_GPIO_Init();
