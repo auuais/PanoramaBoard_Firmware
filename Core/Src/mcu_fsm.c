@@ -21,6 +21,7 @@
 static void fpga_service_orient(void);
 static int imu_stream_read_raw(uint8_t *dst);
 static void ui_send_log(McuContext *ctx, const char *s);
+static void icd_service_periodic(McuContext *ctx);
 
 
 // ---- externs from existing codebase ----
@@ -83,6 +84,29 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define CMD_APPLY_CONFIG 0x31
 #define CMD_CAMERA_CONTROL 0x32
 
+#define ICD_RITA_PIPA_MODE_CONTROL       0x2201u
+#define ICD_RITA_PIPA_CAMERA_CONTROL     0x2202u
+#define ICD_RITA_PIPA_PANORAMA_CONTROL   0x2203u
+#define ICD_RITA_PIPA_MAINTENANCE        0x2204u
+#define ICD_RITA_PIPA_UTC_INFO           0x2205u
+#define ICD_PIPA_RITA_STATUS             0x2210u
+#define ICD_PIPA_RITA_MAINTENANCE_STATUS 0x2211u
+#define ICD_PIPA_RITA_PARAMETER          0x2212u
+#define ICD_PIPA_RITA_PBIT               0x2213u
+#define ICD_PIPA_RITA_CBIT               0x2214u
+#define ICD_PIPA_RITA_IBIT               0x2215u
+#define ICD_PIPA_RITA_MODE_CONTROL_ACK   0x22A1u
+#define ICD_PIPA_RITA_CAMERA_CONTROL_ACK 0x22A2u
+#define ICD_PIPA_RITA_PANORAMA_ACK       0x22A3u
+#define ICD_PIPA_RITA_MAINTENANCE_ACK    0x22A4u
+
+#define ICD_OPERATION_STANDBY      1u
+#define ICD_OPERATION_TRACKING     2u
+#define ICD_OPERATION_BASIC        3u
+#define ICD_OPERATION_MAST         4u
+#define ICD_OPERATION_MAINTENANCE  5u
+#define ICD_OPERATION_IBIT         6u
+
 // ---- Node types (for CHECK) ----
 #define NODE_SYSTEM 0x00
 #define NODE_IMU   0x01
@@ -96,6 +120,12 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define ERR_BUSY   0x01
 #define ERR_BADARG 0x02
 #define ERR_FAIL   0x03
+
+static bool s_icd_enabled = false;
+static uint8_t s_icd_operation_mode = ICD_OPERATION_STANDBY;
+static uint32_t s_icd_last_cbit_ms = 0u;
+static uint8_t s_day_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
+static uint8_t s_ir_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
 
 // ---- Parameter/config protocol ----
 #define CFG_BANK_EO      0x00
@@ -653,6 +683,11 @@ static int camera_power_set(uint8_t node_type, uint8_t id, uint8_t on)
     }
 
     HAL_GPIO_WritePin(port, pin, (on != 0u) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    if (node_type == NODE_DAY) {
+        s_day_power_on[id] = (on != 0u) ? 1u : 0u;
+    } else if (node_type == NODE_IR) {
+        s_ir_power_on[id] = (on != 0u) ? 1u : 0u;
+    }
     return 0;
 }
 
@@ -1243,6 +1278,7 @@ void mcu_fsm_step(McuContext *ctx)
     case ST_OPERATION: {
         fpga_service_orient();
         IR_Nuc_Service(ctx);
+        icd_service_periodic(ctx);
         break;
     }
 
@@ -1862,6 +1898,278 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
     }
 }
 
+static void icd_write_le16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+
+static void icd_write_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static uint16_t icd_crc16_ccitt_payload(const uint8_t *data, uint32_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    for (uint32_t i = 0u; i < len; ++i) {
+        crc ^= (uint16_t)((uint16_t)data[i] << 8);
+        for (uint8_t b = 0u; b < 8u; ++b) {
+            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+static void icd_send_frame(uint16_t msg_id, uint32_t seq, const uint8_t *payload, uint32_t payload_len)
+{
+    uint8_t frame[UI_TX_MAX];
+    const uint32_t total_len = 14u + payload_len + 6u;
+    if (payload_len > 400u || total_len > sizeof(frame)) {
+        return;
+    }
+
+    icd_write_le32(&frame[0], 0x70717883u);
+    icd_write_le16(&frame[4], msg_id);
+    icd_write_le32(&frame[6], seq);
+    icd_write_le32(&frame[10], payload_len);
+    if (payload_len && payload) {
+        memcpy(&frame[14], payload, payload_len);
+    }
+
+    const uint16_t crc = icd_crc16_ccitt_payload(payload, payload_len);
+    const uint32_t crc_off = 14u + payload_len;
+    icd_write_le16(&frame[crc_off], crc);
+    icd_write_le32(&frame[crc_off + 2u], 0x83787170u);
+    (void)HAL_UART_Transmit(&huart3, frame, (uint16_t)total_len, 50);
+}
+
+static uint8_t icd_status_from_power(uint8_t on)
+{
+    return on ? 1u : 2u;
+}
+
+static uint8_t icd_video_select_from_mode(uint8_t mode)
+{
+    if (mode >= 0x07u && mode <= 0x0Cu) return (uint8_t)(1u + (mode - 0x07u));
+    if (mode >= 0x0Du && mode <= 0x12u) return (uint8_t)(7u + (mode - 0x0Du));
+    if (mode == 0x14u) return 13u;
+    if (mode == 0x15u) return 14u;
+    return 0u;
+}
+
+static uint8_t icd_mode_from_video_select(uint8_t select)
+{
+    if (select >= 1u && select <= 6u) return (uint8_t)(0x07u + (select - 1u));
+    if (select >= 7u && select <= 12u) return (uint8_t)(0x0Du + (select - 7u));
+    if (select == 13u) return 0x14u;
+    if (select == 14u) return 0x15u;
+    return 0xFFu;
+}
+
+static uint8_t icd_apply_mode(uint8_t mode_id)
+{
+    if (!cfg_mode_valid(mode_id)) {
+        return ERR_BADARG;
+    }
+
+    uint8_t detail = fpga_push_mode(mode_id);
+    if (detail != CFG_APPLY_OK) {
+        return ERR_FAIL;
+    }
+
+    ParamStoreBlob prev = s_cfg_store;
+    s_cfg_store.mode = mode_id;
+    s_cfg_store.write_count = prev.write_count + 1u;
+    if (!cfg_save_to_flash()) {
+        s_cfg_store = prev;
+        (void)fpga_push_mode(prev.mode);
+        return ERR_FAIL;
+    }
+    return ERR_OK;
+}
+
+static void icd_fill_status(uint8_t p[20])
+{
+    memset(p, 0, 20u);
+    p[0] = s_icd_operation_mode;
+    for (uint8_t i = 0u; i < 6u; ++i) {
+        p[1u + i] = icd_status_from_power(s_day_power_on[i]);
+        p[7u + i] = icd_status_from_power(s_ir_power_on[i]);
+    }
+    p[13] = icd_video_select_from_mode(s_cfg_store.mode);
+    p[14] = 100u; // Auto brightness.
+    p[15] = 100u; // Auto contrast.
+    p[16] = 0u;
+    p[17] = 2u;
+    p[18] = 0u;
+    p[19] = 0u;
+}
+
+static void icd_send_status(uint32_t seq)
+{
+    uint8_t p[20];
+    icd_fill_status(p);
+    icd_send_frame(ICD_PIPA_RITA_STATUS, seq, p, sizeof(p));
+}
+
+static void icd_fill_pbit(uint8_t *p, uint32_t len)
+{
+    memset(p, 0, len);
+    if (len < 23u) return;
+
+    p[0] = FW_VERSION_MAJOR;
+    p[1] = FW_VERSION_MINOR;
+    p[2] = FW_VERSION_YEAR;
+    p[3] = FW_VERSION_MONTH;
+    p[4] = FW_VERSION_DAY;
+    p[5] = 1u;
+    for (uint8_t i = 0u; i < 6u; ++i) {
+        p[6u + i] = s_ir_power_on[i] ? 1u : 0u;
+        p[12u + i] = s_day_power_on[i] ? 1u : 0u;
+    }
+    p[18] = fpga_status_ok() ? 1u : 0u;
+    p[19] = 1u;
+    p[20] = 1u;
+    p[21] = imu_status_ok() ? 1u : 0u;
+    p[22] = 1u;
+}
+
+static void icd_fill_cbit(uint8_t p[21])
+{
+    memset(p, 0, 21u);
+    p[0] = 1u;
+    for (uint8_t i = 0u; i < 6u; ++i) {
+        p[1u + i] = s_ir_power_on[i] ? 1u : 0u;
+        p[7u + i] = s_day_power_on[i] ? 1u : 0u;
+    }
+    p[13] = imu_status_ok() ? 1u : 0u;
+    p[14] = 25u;
+    p[15] = 1u;
+    p[16] = 1u;
+
+    float t = 0.0f, h = 0.0f;
+    Read_HDC3022_Sensor(&t, &h);
+    p[17] = (uint8_t)((t < -40.0f) ? 0u : (t > 85.0f ? 85u : (uint8_t)lroundf(t)));
+    p[18] = (uint8_t)((h < 0.0f) ? 0u : (h > 100.0f ? 100u : (uint8_t)lroundf(h)));
+    p[19] = (t > -900.0f && h > -900.0f) ? 0u : 1u;
+    p[20] = 0u;
+}
+
+static void icd_fill_ibit(uint8_t p[28])
+{
+    memset(p, 0, 28u);
+    icd_fill_pbit(p, 23u);
+    p[23] = 25u;
+    p[24] = 1u;
+    p[25] = 1u;
+    p[26] = 0u;
+    p[27] = 0u;
+}
+
+static void icd_service_periodic(McuContext *ctx)
+{
+    if (!s_icd_enabled || ctx->state != ST_OPERATION) {
+        return;
+    }
+
+    uint32_t now = HAL_GetTick();
+    if ((uint32_t)(now - s_icd_last_cbit_ms) < 1000u) {
+        return;
+    }
+    s_icd_last_cbit_ms = now;
+
+    uint8_t p[21];
+    icd_fill_cbit(p);
+    icd_send_frame(ICD_PIPA_RITA_CBIT, 0u, p, sizeof(p));
+}
+
+static void icd_apply_camera_power_range(uint8_t node, uint8_t cam_id, uint8_t on_off)
+{
+    if (on_off == 0u) return;
+    const uint8_t on = (on_off == 1u) ? 1u : 0u;
+
+    if (cam_id == 7u || cam_id == 0u) {
+        for (uint8_t i = 0u; i < 6u; ++i) {
+            (void)camera_power_set(node, i, on);
+        }
+        return;
+    }
+
+    if (cam_id >= 1u && cam_id <= 6u) {
+        (void)camera_power_set(node, (uint8_t)(cam_id - 1u), on);
+    }
+}
+
+void mcu_on_icd_frame(McuContext *ctx,
+                      uint16_t msg_id,
+                      uint32_t seq,
+                      const uint8_t *payload,
+                      uint32_t payload_len)
+{
+    if (!ctx) return;
+
+    s_icd_enabled = true;
+    if (s_icd_last_cbit_ms == 0u) {
+        s_icd_last_cbit_ms = HAL_GetTick();
+    }
+
+    switch (msg_id) {
+    case ICD_RITA_PIPA_MODE_CONTROL: {
+        if (payload_len < 1u) return;
+        s_icd_operation_mode = payload[0];
+        icd_send_frame(ICD_PIPA_RITA_MODE_CONTROL_ACK, seq, payload, 1u);
+        if (payload[0] == ICD_OPERATION_IBIT) {
+            uint8_t ibit[28];
+            icd_fill_ibit(ibit);
+            icd_send_frame(ICD_PIPA_RITA_IBIT, seq, ibit, sizeof(ibit));
+        } else if (payload[0] == ICD_OPERATION_BASIC && ctx->state == ST_WAIT_UI_INIT) {
+            ctx->init_seq = (uint8_t)(seq & 0xFFu);
+            mcu_fsm_start_init(ctx);
+        }
+        icd_send_status(seq);
+        break;
+    }
+
+    case ICD_RITA_PIPA_CAMERA_CONTROL: {
+        if (payload_len < 9u) return;
+        icd_apply_camera_power_range(NODE_DAY, payload[0], payload[1]);
+        icd_apply_camera_power_range(NODE_IR, payload[2], payload[4]);
+        icd_send_frame(ICD_PIPA_RITA_CAMERA_CONTROL_ACK, seq, payload, 5u);
+        icd_send_status(seq);
+        break;
+    }
+
+    case ICD_RITA_PIPA_PANORAMA_CONTROL: {
+        if (payload_len < 8u) return;
+        uint8_t mode = icd_mode_from_video_select(payload[0]);
+        if (mode != 0xFFu && ctx->state == ST_OPERATION) {
+            (void)icd_apply_mode(mode);
+        }
+        icd_send_frame(ICD_PIPA_RITA_PANORAMA_ACK, seq, payload, 7u);
+        icd_send_status(seq);
+        break;
+    }
+
+    case ICD_RITA_PIPA_MAINTENANCE: {
+        if (payload_len < 37u) return;
+        icd_send_frame(ICD_PIPA_RITA_MAINTENANCE_ACK, seq, payload, 37u);
+        icd_send_frame(ICD_PIPA_RITA_MAINTENANCE_STATUS, seq, payload, 37u);
+        break;
+    }
+
+    case ICD_RITA_PIPA_UTC_INFO:
+        // UTC is accepted and ignored for now; no ACK is defined in the ICD list.
+        icd_send_status(seq);
+        break;
+
+    default:
+        break;
+    }
+}
 
 
 

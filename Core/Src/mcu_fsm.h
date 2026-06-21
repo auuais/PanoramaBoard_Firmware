@@ -42,6 +42,13 @@ void mcu_on_vsync(McuContext *ctx);
 // Called when a valid UI payload is received (already CRC/COBS-validated)
 void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n);
 
+// Called when a valid customer ICD RS-422 frame is received.
+void mcu_on_icd_frame(McuContext *ctx,
+                      uint16_t msg_id,
+                      uint32_t seq,
+                      const uint8_t *payload,
+                      uint32_t payload_len);
+
 /**
  * @brief Send a printf-style message to the UI log window.
  *

@@ -68,6 +68,10 @@ extern UART_HandleTypeDef huart3;
 #define UI_RX_DMA_MAX      128u
 #define UI_ACC_MAX         512u
 #define UI_PAYLOAD_MAX     256u
+#define ICD_ACC_MAX        1200u
+#define ICD_HEADER_SIZE    14u
+#define ICD_TAIL_SIZE      6u
+#define ICD_MAX_PAYLOAD    1024u
 
 /* USER CODE END PD */
 
@@ -103,6 +107,10 @@ static volatile uint8_t  ui_rx_chunk_ready = 0;
 // Accumulator so we can parse frames split across idle events:
 static uint8_t  ui_acc[UI_ACC_MAX];
 static uint16_t ui_acc_len = 0;
+
+static uint8_t  icd_acc[ICD_ACC_MAX];
+static uint16_t icd_acc_len = 0;
+static bool     icd_acc_active = false;
 
 
 typedef struct {
@@ -2327,12 +2335,115 @@ static void ui_acc_reset(void)
     memset(ui_acc, 0, sizeof(ui_acc));
 }
 
+static void icd_acc_reset(void)
+{
+    icd_acc_len = 0u;
+    icd_acc_active = false;
+    memset(icd_acc, 0, sizeof(icd_acc));
+}
+
+static uint16_t icd_read_le16(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t icd_read_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0]
+        | ((uint32_t)p[1] << 8)
+        | ((uint32_t)p[2] << 16)
+        | ((uint32_t)p[3] << 24);
+}
+
+static uint16_t icd_crc16_ccitt_payload(const uint8_t *data, uint32_t len)
+{
+    uint16_t crc = 0xFFFFu;
+    for (uint32_t i = 0u; i < len; ++i) {
+        crc ^= (uint16_t)((uint16_t)data[i] << 8);
+        for (uint8_t b = 0u; b < 8u; ++b) {
+            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+static bool icd_process_byte(uint8_t b)
+{
+    static const uint8_t som_bytes[4] = { 0x83u, 0x78u, 0x71u, 0x70u };
+    static const uint8_t eom_bytes[4] = { 0x70u, 0x71u, 0x78u, 0x83u };
+
+    if (!icd_acc_active) {
+        if (b != som_bytes[0]) {
+            return false;
+        }
+        icd_acc_reset();
+        icd_acc_active = true;
+    }
+
+    if (icd_acc_len >= ICD_ACC_MAX) {
+        icd_acc_reset();
+        return true;
+    }
+
+    icd_acc[icd_acc_len++] = b;
+
+    if (icd_acc_len <= 4u) {
+        if (icd_acc[icd_acc_len - 1u] != som_bytes[icd_acc_len - 1u]) {
+            icd_acc_reset();
+        }
+        return true;
+    }
+
+    if (icd_acc_len < ICD_HEADER_SIZE) {
+        return true;
+    }
+
+    const uint32_t payload_len = icd_read_le32(&icd_acc[10]);
+    if (payload_len > ICD_MAX_PAYLOAD) {
+        icd_acc_reset();
+        return true;
+    }
+
+    const uint32_t total_len = ICD_HEADER_SIZE + payload_len + ICD_TAIL_SIZE;
+    if (icd_acc_len < total_len) {
+        return true;
+    }
+
+    if (icd_acc_len == total_len) {
+        const uint32_t crc_off = ICD_HEADER_SIZE + payload_len;
+        const uint8_t *payload = &icd_acc[ICD_HEADER_SIZE];
+        const uint16_t rx_crc = icd_read_le16(&icd_acc[crc_off]);
+        const uint16_t calc_crc = icd_crc16_ccitt_payload(payload, payload_len);
+
+        if (memcmp(&icd_acc[crc_off + 2u], eom_bytes, sizeof(eom_bytes)) == 0 &&
+            rx_crc == calc_crc) {
+            Report_Boot_Reset_State_Once();
+            mcu_on_icd_frame(&g_ctx,
+                             icd_read_le16(&icd_acc[4]),
+                             icd_read_le32(&icd_acc[6]),
+                             payload,
+                             payload_len);
+        }
+        icd_acc_reset();
+        return true;
+    }
+
+    icd_acc_reset();
+    return true;
+}
+
 // Feed bytes into accumulator, split frames by 0x00 delimiter,
 // parse each COBS frame, then forward payload to mcu_on_ui_payload().
 static void ui_process_bytes(const uint8_t *data, uint16_t len)
 {
     for (uint16_t i = 0; i < len; i++) {
         uint8_t b = data[i];
+
+        if (icd_acc_active || b == 0x83u) {
+            if (icd_process_byte(b)) {
+                continue;
+            }
+        }
 
         if (b == 0x00) {
             // delimiter -> parse current frame if any
@@ -2395,6 +2506,7 @@ int main(void)
 
   // Arm UART3 UI receiver
   ui_acc_reset();
+  icd_acc_reset();
   (void)HAL_UARTEx_ReceiveToIdle_IT(&huart3, ui_rx_chunk, UI_RX_DMA_MAX);
 
 
