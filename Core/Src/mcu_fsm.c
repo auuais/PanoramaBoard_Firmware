@@ -22,6 +22,9 @@ static void fpga_service_orient(void);
 static int imu_stream_read_raw(uint8_t *dst);
 static void ui_send_log(McuContext *ctx, const char *s);
 static void icd_service_periodic(McuContext *ctx);
+static void icd_maintenance_init_defaults(void);
+static uint8_t icd_apply_maintenance_payload(const uint8_t *payload, uint16_t payload_len);
+static void icd_fill_maintenance_status(uint8_t p[37]);
 
 
 // ---- externs from existing codebase ----
@@ -91,10 +94,12 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define ICD_RITA_PIPA_UTC_INFO           0x2205u
 #define ICD_PIPA_RITA_STATUS             0x2210u
 #define ICD_PIPA_RITA_MAINTENANCE_STATUS 0x2211u
-#define ICD_PIPA_RITA_PARAMETER          0x2212u
-#define ICD_PIPA_RITA_PBIT               0x2213u
-#define ICD_PIPA_RITA_CBIT               0x2214u
-#define ICD_PIPA_RITA_IBIT               0x2215u
+/* Customer "Message List(종합)" maps 0x2212/0x2213/0x2214 directly to
+ * PBIT/CBIT/IBIT. The older detailed-sheet PARAMETER row is not active here. */
+/* #define ICD_PIPA_RITA_PARAMETER       0x2212u */
+#define ICD_PIPA_RITA_PBIT               0x2212u
+#define ICD_PIPA_RITA_CBIT               0x2213u
+#define ICD_PIPA_RITA_IBIT               0x2214u
 #define ICD_PIPA_RITA_MODE_CONTROL_ACK   0x22A1u
 #define ICD_PIPA_RITA_CAMERA_CONTROL_ACK 0x22A2u
 #define ICD_PIPA_RITA_PANORAMA_ACK       0x22A3u
@@ -124,14 +129,58 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 static bool s_icd_enabled = false;
 static uint8_t s_icd_operation_mode = ICD_OPERATION_STANDBY;
 static uint32_t s_icd_last_cbit_ms = 0u;
+static const uint32_t ICD_CBIT_INTERVAL_MS = 3000u;
 static uint8_t s_day_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
 static uint8_t s_ir_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
+static uint8_t s_icd_maintenance_status[37] = {0};
+
+enum {
+    ICD_MAINT_SELECTED_IR_CAM = 0,
+    ICD_MAINT_IR_NUC = 1,
+    ICD_MAINT_IR_SCREEN_INV = 2,
+    ICD_MAINT_IR_FRAME_RATE = 3,
+    ICD_MAINT_IR_ICE_GAIN_L = 4,
+    ICD_MAINT_IR_ICE_GAIN_H = 5,
+    ICD_MAINT_IR_ICE_LEVEL_L = 6,
+    ICD_MAINT_IR_ICE_LEVEL_H = 7,
+    ICD_MAINT_IR_ICE_STRENGTH = 8,
+    ICD_MAINT_IR_COLOR_MODE = 9,
+    ICD_MAINT_IR_POLARITY = 10,
+    ICD_MAINT_IR_DZOOM = 11,
+    ICD_MAINT_IR_TNR_ENABLE = 12,
+    ICD_MAINT_IR_TNR_L = 13,
+    ICD_MAINT_IR_TNR_H = 14,
+    ICD_MAINT_SELECTED_EO_CAM = 15,
+    ICD_MAINT_EO_POWER_RESET = 16,
+    ICD_MAINT_EO_DZOOM = 17,
+    ICD_MAINT_EO_WHITE_BALANCE = 18,
+    ICD_MAINT_EO_RED_GAIN = 19,
+    ICD_MAINT_EO_BLUE_GAIN = 20,
+    ICD_MAINT_EO_CHROMA_GAIN = 21,
+    ICD_MAINT_EO_AGC = 22,
+    ICD_MAINT_EO_AE_SHUTTER = 23,
+    ICD_MAINT_EO_BRIGHTNESS = 24,
+    ICD_MAINT_EO_BLC = 25,
+    ICD_MAINT_EO_HLC_ONOFF = 26,
+    ICD_MAINT_EO_HLC_LEVEL = 27,
+    ICD_MAINT_EO_ACE_ONOFF = 28,
+    ICD_MAINT_EO_ACE_LEVEL = 29,
+    ICD_MAINT_EO_DEFOG_ONOFF = 30,
+    ICD_MAINT_EO_DEFOG_LEVEL = 31,
+    ICD_MAINT_EO_DNR = 32,
+    ICD_MAINT_EO_GAMMA = 33,
+    ICD_MAINT_EO_SHARPNESS = 34,
+    ICD_MAINT_EO_MIRROR = 35,
+    ICD_MAINT_EO_FLIP = 36,
+    ICD_MAINT_LEN = 37
+};
 
 // ---- Parameter/config protocol ----
 #define CFG_BANK_EO      0x00
 #define CFG_BANK_IR      0x01
 #define CFG_CAM_COUNT    6
 #define CFG_BANK_PAYLOAD_SIZE 42u
+#define CFG_DEFAULT_MODE_EO_PANORAMA 0x15u
 
 // ---- Orientation safety clamp (hard limits, not artificial) ----
 #define ORIENT_CLAMP_DEG      (90.0f)
@@ -349,7 +398,7 @@ static void cfg_set_defaults(ParamStoreBlob* cfg)
     cfg->magic = PARAM_STORE_MAGIC;
     cfg->version = PARAM_STORE_VERSION;
     cfg->length = (uint16_t)sizeof(*cfg);
-    cfg->mode = 0x01u;
+    cfg->mode = CFG_DEFAULT_MODE_EO_PANORAMA;
     cfg_set_bank_defaults(&cfg->eo, CFG_BANK_EO);
     cfg_set_bank_defaults(&cfg->ir, CFG_BANK_IR);
     cfg->write_count = 0;
@@ -948,7 +997,11 @@ void mcu_fsm_init(McuContext *ctx)
     if (!loaded) {
         (void)cfg_save_to_flash();
     }
+    /* Bring-up always starts in EO panorama. Keep loaded EO/IR bank calibration,
+     * but do not let a previously saved runtime mode override startup. */
+    s_cfg_store.mode = CFG_DEFAULT_MODE_EO_PANORAMA;
 
+    icd_maintenance_init_defaults();
     s_vsync_pending = false;
     s_orient_tx_seq = 0;
 }
@@ -1696,12 +1749,21 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
         uint8_t id = d[2];
         uint8_t on = (d[3] != 0u) ? 1u : 0u;
 
-        if ((node_type != NODE_DAY && node_type != NODE_IR) || id >= 6u) {
+        if ((node_type != NODE_DAY && node_type != NODE_IR) || (id >= 6u && id != 7u)) {
             ui_send_resp_simple(seq, ERR_BADARG);
             break;
         }
 
-        uint8_t ok = (camera_power_set(node_type, id, on) == 0) ? 1u : 0u;
+        uint8_t ok = 1u;
+        if (id == 7u) {
+            for (uint8_t i = 0u; i < 6u; ++i) {
+                if (camera_power_set(node_type, i, on) != 0) {
+                    ok = 0u;
+                }
+            }
+        } else {
+            ok = (camera_power_set(node_type, id, on) == 0) ? 1u : 0u;
+        }
         uint8_t err = ok ? ERR_OK : ERR_FAIL;
         uint8_t resp[4] = { err, node_type, id, ok };
         ui_send_frame(MSG_RESP, seq, resp, sizeof(resp));
@@ -1947,6 +2009,260 @@ static void icd_send_frame(uint16_t msg_id, uint32_t seq, const uint8_t *payload
     (void)HAL_UART_Transmit(&huart3, frame, (uint16_t)total_len, 50);
 }
 
+static uint8_t icd_payload_all_zero(const uint8_t *payload, uint16_t payload_len)
+{
+    if (payload == NULL) return 1u;
+    for (uint16_t i = 0u; i < payload_len; ++i) {
+        if (payload[i] != 0u) return 0u;
+    }
+    return 1u;
+}
+
+static uint8_t icd_payload_changed(const uint8_t *a, const uint8_t *b, uint8_t off, uint8_t len)
+{
+    for (uint8_t i = 0u; i < len; ++i) {
+        if (a[off + i] != b[off + i]) return 1u;
+    }
+    return 0u;
+}
+
+static uint16_t icd_read_u16(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static void icd_write_u16(uint8_t *p, uint16_t value)
+{
+    p[0] = (uint8_t)(value & 0xFFu);
+    p[1] = (uint8_t)((value >> 8) & 0xFFu);
+}
+
+static void icd_maintenance_init_defaults(void)
+{
+    memset(s_icd_maintenance_status, 0, sizeof(s_icd_maintenance_status));
+
+    // Values here mirror the ICD defaults or harmless camera defaults. Real
+    // register readback requires camera-driver query APIs, which do not exist
+    // in the current firmware; until then 0x2211 reports the last accepted ICD
+    // maintenance values plus live board-owned state.
+    s_icd_maintenance_status[ICD_MAINT_IR_FRAME_RATE] = 0u;      // 60 Hz
+    s_icd_maintenance_status[ICD_MAINT_IR_POLARITY] = 1u;        // UI default: White-Hot
+    s_icd_maintenance_status[ICD_MAINT_EO_WHITE_BALANCE] = 0u;   // Auto in the existing EO VISCA apply layer
+    s_icd_maintenance_status[ICD_MAINT_EO_GAMMA] = 3u;           // UI default: 0.45
+}
+
+static uint8_t icd_apply_ir_maint_u8(uint8_t cam_sel, uint8_t offset, uint16_t param_id)
+{
+    uint8_t value = s_icd_maintenance_status[offset];
+    int rc = Apply_IR_Camera_Param(cam_sel, param_id, value);
+    return (rc == 0) ? ERR_OK : ((rc == -2) ? ERR_BUSY : ERR_FAIL);
+}
+
+static uint8_t icd_apply_ir_maint_u16(uint8_t cam_sel, uint8_t offset_l, uint16_t param_id)
+{
+    uint16_t value = icd_read_u16(&s_icd_maintenance_status[offset_l]);
+    int rc = Apply_IR_Camera_Param(cam_sel, param_id, value);
+    return (rc == 0) ? ERR_OK : ((rc == -2) ? ERR_BUSY : ERR_FAIL);
+}
+
+static uint8_t icd_apply_eo_maint_u8(uint8_t cam_sel, uint8_t offset, uint16_t param_id)
+{
+    uint8_t value = s_icd_maintenance_status[offset];
+    int rc = Apply_EO_Camera_Param(cam_sel, param_id, value);
+    return (rc == 0) ? ERR_OK : ((rc == -2) ? ERR_BUSY : ERR_FAIL);
+}
+
+static uint8_t icd_apply_maintenance_payload(const uint8_t *payload, uint16_t payload_len)
+{
+    if (payload == NULL || payload_len < ICD_MAINT_LEN) {
+        return ERR_BADARG;
+    }
+
+    if (icd_payload_all_zero(payload, ICD_MAINT_LEN)) {
+        return ERR_OK; // All-zero frame is treated as a status request.
+    }
+
+    uint8_t prev[ICD_MAINT_LEN];
+    memcpy(prev, s_icd_maintenance_status, ICD_MAINT_LEN);
+    memcpy(s_icd_maintenance_status, payload, ICD_MAINT_LEN);
+
+    uint8_t overall = ERR_OK;
+    uint8_t ir_cam = s_icd_maintenance_status[ICD_MAINT_SELECTED_IR_CAM];
+    uint8_t eo_cam = s_icd_maintenance_status[ICD_MAINT_SELECTED_EO_CAM];
+
+    if (ir_cam > 6u || eo_cam > 6u) {
+        return ERR_BADARG;
+    }
+
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_NUC, 1u) &&
+        s_icd_maintenance_status[ICD_MAINT_IR_NUC] == 1u) {
+        int rc = Apply_IR_Camera_Param(ir_cam, PARAM_ID_IR_NUC_TRIGGER, 3u);
+        if (rc != 0) overall = ERR_FAIL;
+    } else if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_NUC, 1u) &&
+               s_icd_maintenance_status[ICD_MAINT_IR_NUC] == 2u) {
+        int rc = Apply_IR_Camera_Param(ir_cam, PARAM_ID_IR_NUC_TRIGGER, 4u);
+        if (rc != 0) overall = ERR_FAIL;
+    }
+
+    uint8_t err;
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_SCREEN_INV, 1u)) {
+        err = icd_apply_ir_maint_u8(ir_cam, ICD_MAINT_IR_SCREEN_INV, PARAM_ID_IR_IMAGE_FLIP);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_FRAME_RATE, 1u)) {
+        err = icd_apply_ir_maint_u8(ir_cam, ICD_MAINT_IR_FRAME_RATE, PARAM_ID_IR_FRAME_RATE);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_ICE_GAIN_L, 2u)) {
+        err = icd_apply_ir_maint_u16(ir_cam, ICD_MAINT_IR_ICE_GAIN_L, PARAM_ID_IR_ICE_GAIN_BIAS);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_ICE_LEVEL_L, 2u)) {
+        err = icd_apply_ir_maint_u16(ir_cam, ICD_MAINT_IR_ICE_LEVEL_L, PARAM_ID_IR_ICE_LEVEL_BIAS);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_ICE_STRENGTH, 1u)) {
+        err = icd_apply_ir_maint_u8(ir_cam, ICD_MAINT_IR_ICE_STRENGTH, PARAM_ID_IR_ICE_STRENGTH);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_COLOR_MODE, 1u)) {
+        err = icd_apply_ir_maint_u8(ir_cam, ICD_MAINT_IR_COLOR_MODE, PARAM_ID_IR_PALETTE);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_POLARITY, 1u)) {
+        err = icd_apply_ir_maint_u8(ir_cam, ICD_MAINT_IR_POLARITY, PARAM_ID_IR_POLARITY);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_DZOOM, 1u)) {
+        err = icd_apply_ir_maint_u8(ir_cam, ICD_MAINT_IR_DZOOM, PARAM_ID_IR_D_ZOOM);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_TNR_ENABLE, 1u)) {
+        err = icd_apply_ir_maint_u8(ir_cam, ICD_MAINT_IR_TNR_ENABLE, PARAM_ID_IR_TNR_ENABLE);
+        if (err != ERR_OK) overall = err;
+    }
+
+    uint16_t tnr = icd_read_u16(&s_icd_maintenance_status[ICD_MAINT_IR_TNR_L]);
+    if (tnr <= 32u && icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_TNR_L, 2u)) {
+        int rc = Apply_IR_Camera_Param(ir_cam, PARAM_ID_IR_TNR_THRESHOLD, tnr);
+        if (rc != 0) overall = ERR_FAIL;
+    }
+
+    if (s_icd_maintenance_status[ICD_MAINT_EO_POWER_RESET] != 0u &&
+        icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_POWER_RESET, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_POWER_RESET, PARAM_ID_EO_POWER_RESET);
+        if (err != ERR_OK) overall = err;
+    }
+
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_DZOOM, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_DZOOM, PARAM_ID_EO_D_ZOOM);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_WHITE_BALANCE, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_WHITE_BALANCE, PARAM_ID_EO_WHITE_BALANCE);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_RED_GAIN, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_RED_GAIN, PARAM_ID_EO_RED_GAIN);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_BLUE_GAIN, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_BLUE_GAIN, PARAM_ID_EO_BLUE_GAIN);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_CHROMA_GAIN, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_CHROMA_GAIN, PARAM_ID_EO_CHROMA_GAIN);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_AGC, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_AGC, PARAM_ID_EO_AGC);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_AE_SHUTTER, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_AE_SHUTTER, PARAM_ID_EO_AE_SHUTTER);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_BRIGHTNESS, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_BRIGHTNESS, PARAM_ID_EO_BRIGHTNESS);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_BLC, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_BLC, PARAM_ID_EO_BLC);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_HLC_ONOFF, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_HLC_ONOFF, PARAM_ID_EO_HLC);
+        if (err != ERR_OK) overall = err;
+    }
+    if (s_icd_maintenance_status[ICD_MAINT_EO_HLC_LEVEL] != 0u &&
+        icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_HLC_LEVEL, 1u)) {
+        int rc = Apply_EO_Camera_Param(eo_cam, PARAM_ID_EO_HLC,
+                                       (uint16_t)(100u + s_icd_maintenance_status[ICD_MAINT_EO_HLC_LEVEL]));
+        if (rc != 0) overall = ERR_FAIL;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_ACE_ONOFF, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_ACE_ONOFF, PARAM_ID_EO_ACE);
+        if (err != ERR_OK) overall = err;
+    }
+    if (s_icd_maintenance_status[ICD_MAINT_EO_ACE_LEVEL] != 0u &&
+        icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_ACE_LEVEL, 1u)) {
+        int rc = Apply_EO_Camera_Param(eo_cam, PARAM_ID_EO_ACE,
+                                       (uint16_t)(100u + s_icd_maintenance_status[ICD_MAINT_EO_ACE_LEVEL]));
+        if (rc != 0) overall = ERR_FAIL;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_DEFOG_ONOFF, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_DEFOG_ONOFF, PARAM_ID_EO_DEFOG);
+        if (err != ERR_OK) overall = err;
+    }
+    if (s_icd_maintenance_status[ICD_MAINT_EO_DEFOG_LEVEL] != 0u &&
+        icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_DEFOG_LEVEL, 1u)) {
+        int rc = Apply_EO_Camera_Param(eo_cam, PARAM_ID_EO_DEFOG,
+                                       (uint16_t)(100u + s_icd_maintenance_status[ICD_MAINT_EO_DEFOG_LEVEL]));
+        if (rc != 0) overall = ERR_FAIL;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_DNR, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_DNR, PARAM_ID_EO_DNR);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_GAMMA, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_GAMMA, PARAM_ID_EO_GAMMA);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_SHARPNESS, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_SHARPNESS, PARAM_ID_EO_SHARPNESS);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_MIRROR, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_MIRROR, PARAM_ID_EO_MIRROR);
+        if (err != ERR_OK) overall = err;
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_FLIP, 1u)) {
+        err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_FLIP, PARAM_ID_EO_IMAGE_FLIP);
+        if (err != ERR_OK) overall = err;
+    }
+
+    return overall;
+}
+
+static void icd_fill_maintenance_status(uint8_t p[ICD_MAINT_LEN])
+{
+    memcpy(p, s_icd_maintenance_status, ICD_MAINT_LEN);
+
+    // Report selected camera IDs from the last accepted maintenance command.
+    if (p[ICD_MAINT_SELECTED_IR_CAM] > 6u) p[ICD_MAINT_SELECTED_IR_CAM] = 0u;
+    if (p[ICD_MAINT_SELECTED_EO_CAM] > 6u) p[ICD_MAINT_SELECTED_EO_CAM] = 0u;
+
+    // Power reset is a momentary command, not a latched state.
+    p[ICD_MAINT_EO_POWER_RESET] = 0u;
+
+    // Keep 16-bit fields packed little-endian and within what our camera
+    // drivers can actually apply today.
+    uint16_t tnr = icd_read_u16(&p[ICD_MAINT_IR_TNR_L]);
+    if (tnr > 32u) {
+        icd_write_u16(&p[ICD_MAINT_IR_TNR_L], 32u);
+    }
+}
+
 static uint8_t icd_status_from_power(uint8_t on)
 {
     return on ? 1u : 2u;
@@ -2038,6 +2354,13 @@ static void icd_fill_pbit(uint8_t *p, uint32_t len)
     p[22] = 1u;
 }
 
+static void icd_send_pbit(uint32_t seq)
+{
+    uint8_t p[23];
+    icd_fill_pbit(p, sizeof(p));
+    icd_send_frame(ICD_PIPA_RITA_PBIT, seq, p, sizeof(p));
+}
+
 static void icd_fill_cbit(uint8_t p[21])
 {
     memset(p, 0, 21u);
@@ -2077,7 +2400,7 @@ static void icd_service_periodic(McuContext *ctx)
     }
 
     uint32_t now = HAL_GetTick();
-    if ((uint32_t)(now - s_icd_last_cbit_ms) < 1000u) {
+    if ((uint32_t)(now - s_icd_last_cbit_ms) < ICD_CBIT_INTERVAL_MS) {
         return;
     }
     s_icd_last_cbit_ms = now;
@@ -2126,9 +2449,13 @@ void mcu_on_icd_frame(McuContext *ctx,
             uint8_t ibit[28];
             icd_fill_ibit(ibit);
             icd_send_frame(ICD_PIPA_RITA_IBIT, seq, ibit, sizeof(ibit));
-        } else if (payload[0] == ICD_OPERATION_BASIC && ctx->state == ST_WAIT_UI_INIT) {
-            ctx->init_seq = (uint8_t)(seq & 0xFFu);
-            mcu_fsm_start_init(ctx);
+        } else {
+            // ICD defines PBIT as PIPA->RITA only. For integration tooling, use
+            // any non-IBIT mode command as a safe request for the current PBIT snapshot.
+            // Do not start initialization from ICD mode control; START/CMD_INIT_SYSTEM
+            // remains the only initialization path so legacy bring-up behavior is
+            // unchanged and deterministic.
+            icd_send_pbit(seq);
         }
         icd_send_status(seq);
         break;
@@ -2156,8 +2483,17 @@ void mcu_on_icd_frame(McuContext *ctx,
 
     case ICD_RITA_PIPA_MAINTENANCE: {
         if (payload_len < 37u) return;
-        icd_send_frame(ICD_PIPA_RITA_MAINTENANCE_ACK, seq, payload, 37u);
-        icd_send_frame(ICD_PIPA_RITA_MAINTENANCE_STATUS, seq, payload, 37u);
+        /* Apply the requested camera/maintenance changes first. 0x22A4 is
+         * intentionally emitted only after all synchronous apply attempts have
+         * returned, so the ACK/status payload represents the post-apply copy. */
+        uint8_t apply_err = icd_apply_maintenance_payload(payload, (uint16_t)payload_len);
+        uint8_t status[ICD_MAINT_LEN];
+        icd_fill_maintenance_status(status);
+        icd_send_frame(ICD_PIPA_RITA_MAINTENANCE_ACK, seq, status, sizeof(status));
+        icd_send_frame(ICD_PIPA_RITA_MAINTENANCE_STATUS, seq, status, sizeof(status));
+        if (apply_err == ERR_OK) {
+            icd_send_status(seq);
+        }
         break;
     }
 
@@ -2170,6 +2506,3 @@ void mcu_on_icd_frame(McuContext *ctx,
         break;
     }
 }
-
-
-
