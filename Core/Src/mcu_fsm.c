@@ -22,6 +22,7 @@ static void fpga_service_orient(void);
 static int imu_stream_read_raw(uint8_t *dst);
 static void ui_send_log(McuContext *ctx, const char *s);
 static void icd_service_periodic(McuContext *ctx);
+static void icd_send_pbit(uint32_t seq);
 static void icd_maintenance_init_defaults(void);
 static uint8_t icd_apply_maintenance_payload(const uint8_t *payload, uint16_t payload_len);
 static void icd_fill_maintenance_status(uint8_t p[37]);
@@ -129,7 +130,27 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 static bool s_icd_enabled = false;
 static uint8_t s_icd_operation_mode = ICD_OPERATION_STANDBY;
 static uint32_t s_icd_last_cbit_ms = 0u;
-static const uint32_t ICD_CBIT_INTERVAL_MS = 3000u;
+static bool s_icd_initial_pbit_sent = false;
+static bool s_icd_time_valid = false;
+static uint16_t s_icd_time_year = 0u;
+static uint8_t s_icd_time_month = 0u;
+static uint8_t s_icd_time_day = 0u;
+static uint8_t s_icd_time_hour = 0u;
+static uint8_t s_icd_time_min = 0u;
+static uint8_t s_icd_time_sec = 0u;
+static uint8_t s_icd_time_centisec = 0u;
+static uint32_t s_icd_time_base_ms = 0u;
+static uint32_t s_icd_seq_status = 1u;
+static uint32_t s_icd_seq_maintenance_status = 1u;
+static uint32_t s_icd_seq_pbit = 1u;
+static uint32_t s_icd_seq_cbit = 1u;
+static uint32_t s_icd_seq_ibit = 1u;
+static uint32_t s_icd_seq_mode_ack = 1u;
+static uint32_t s_icd_seq_camera_ack = 1u;
+static uint32_t s_icd_seq_panorama_ack = 1u;
+static uint32_t s_icd_seq_maintenance_ack = 1u;
+static uint32_t s_icd_seq_default = 1u;
+static const uint32_t ICD_CBIT_INTERVAL_MS = 1000u;
 static uint8_t s_day_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
 static uint8_t s_ir_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
 static uint8_t s_icd_maintenance_status[37] = {0};
@@ -986,7 +1007,7 @@ static bool fpga_status_ok(void)
 void mcu_fsm_init(McuContext *ctx)
 {
     memset(ctx, 0, sizeof(*ctx));
-    ctx->state = ST_WAIT_UI_INIT;   // <-- NEW: wait for UI init command
+    ctx->state = ST_BOOT;
     ctx->debug_enabled = true;
     g_debug_enabled = true;
     ctx->log_capture_active = false;
@@ -1002,6 +1023,29 @@ void mcu_fsm_init(McuContext *ctx)
     s_cfg_store.mode = CFG_DEFAULT_MODE_EO_PANORAMA;
 
     icd_maintenance_init_defaults();
+    s_icd_enabled = true;
+    s_icd_operation_mode = ICD_OPERATION_STANDBY;
+    s_icd_last_cbit_ms = 0u;
+    s_icd_initial_pbit_sent = false;
+    s_icd_time_valid = false;
+    s_icd_time_year = 0u;
+    s_icd_time_month = 0u;
+    s_icd_time_day = 0u;
+    s_icd_time_hour = 0u;
+    s_icd_time_min = 0u;
+    s_icd_time_sec = 0u;
+    s_icd_time_centisec = 0u;
+    s_icd_time_base_ms = HAL_GetTick();
+    s_icd_seq_status = 1u;
+    s_icd_seq_maintenance_status = 1u;
+    s_icd_seq_pbit = 1u;
+    s_icd_seq_cbit = 1u;
+    s_icd_seq_ibit = 1u;
+    s_icd_seq_mode_ack = 1u;
+    s_icd_seq_camera_ack = 1u;
+    s_icd_seq_panorama_ack = 1u;
+    s_icd_seq_maintenance_ack = 1u;
+    s_icd_seq_default = 1u;
     s_vsync_pending = false;
     s_orient_tx_seq = 0;
 }
@@ -1034,9 +1078,7 @@ void mcu_fsm_step(McuContext *ctx)
 
 
     case ST_WAIT_UI_INIT: {
-        // Do nothing until UI requests init
-
-//    	ctx->state = ST_BOOT;
+    	ctx->state = ST_BOOT;
         break;
     }
 
@@ -1323,15 +1365,21 @@ void mcu_fsm_step(McuContext *ctx)
 
         IR_Nuc_OnOperationEnter();
         ctx->state = ST_OPERATION;
+        s_icd_enabled = true;
+        s_icd_last_cbit_ms = HAL_GetTick();
         ui_send_init_ack(ctx->init_seq, NODE_SYSTEM, 1, 1, ERR_OK);
         ui_send_log(ctx, "Entered OPERATION\r\n");
+        if (!s_icd_initial_pbit_sent) {
+            icd_send_pbit(0u);
+            s_icd_initial_pbit_sent = true;
+        }
         break;
     }
 
     case ST_OPERATION: {
+        icd_service_periodic(ctx);
         fpga_service_orient();
         IR_Nuc_Service(ctx);
-        icd_service_periodic(ctx);
         break;
     }
 
@@ -1545,6 +1593,11 @@ void mcu_on_imu_drdy(McuContext *ctx)
 {
     if (ctx->state != ST_OPERATION) return;
 
+    /* The main loop intentionally drains IMU DRDY before the normal FSM step.
+     * At high ODR that can delay periodic ICD work, so service CBIT here too.
+     */
+    icd_service_periodic(ctx);
+
     /* The IMU streams into a 40-entry FIFO in streaming mode. If we process only
      * one packet per DRDY event and fall behind, the queue can stay non-empty and
      * the delivered DRDY edge rate collapses well below the internal sample rate.
@@ -1659,17 +1712,16 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
         }
         mcu_ui_log(ctx, "INIT cmd rx: seq=%u plen=%u\r\n", (unsigned)seq, (unsigned)plen);
 
-        // Store the UI's seq so all subsequent init ACKs from mcu_fsm_step()
-        // carry the correct sequence number back to the UI.
         ctx->init_seq = seq;
 
-        // Always ACK the command itself
         ui_send_init_ack(seq, NODE_SYSTEM, 0, 1, ERR_OK);
         ui_send_version(seq);
-        ui_send_log(ctx, (ctx->state == ST_WAIT_UI_INIT) ? "INIT: started\r\n" : "INIT: restart\r\n");
+        ui_send_log(ctx, "INIT: bypassed - autonomous boot path is active\r\n");
         ui_send_log(ctx, mcu_get_reset_cause_str());   // surface why the MCU last reset
-        Send_UART3_Debug("INIT: requested (state=%d)\r\n", (int)ctx->state);
-        mcu_fsm_start_init(ctx);
+        Send_UART3_Debug("INIT: bypassed (state=%d)\r\n", (int)ctx->state);
+        if (ctx->state == ST_WAIT_UI_INIT) {
+            ctx->state = ST_BOOT;
+        }
 
         break;
     }
@@ -1986,24 +2038,193 @@ static uint16_t icd_crc16_ccitt_payload(const uint8_t *data, uint32_t len)
     return crc;
 }
 
+static uint32_t *icd_sequence_slot(uint16_t msg_id)
+{
+    switch (msg_id) {
+    case ICD_PIPA_RITA_STATUS: return &s_icd_seq_status;
+    case ICD_PIPA_RITA_MAINTENANCE_STATUS: return &s_icd_seq_maintenance_status;
+    case ICD_PIPA_RITA_PBIT: return &s_icd_seq_pbit;
+    case ICD_PIPA_RITA_CBIT: return &s_icd_seq_cbit;
+    case ICD_PIPA_RITA_IBIT: return &s_icd_seq_ibit;
+    case ICD_PIPA_RITA_MODE_CONTROL_ACK: return &s_icd_seq_mode_ack;
+    case ICD_PIPA_RITA_CAMERA_CONTROL_ACK: return &s_icd_seq_camera_ack;
+    case ICD_PIPA_RITA_PANORAMA_ACK: return &s_icd_seq_panorama_ack;
+    case ICD_PIPA_RITA_MAINTENANCE_ACK: return &s_icd_seq_maintenance_ack;
+    default: return &s_icd_seq_default;
+    }
+}
+
+static uint32_t icd_next_sequence(uint16_t msg_id)
+{
+    uint32_t *slot = icd_sequence_slot(msg_id);
+    uint32_t seq = *slot;
+    *slot = seq + 1u;
+    if (*slot == 0u) {
+        *slot = 1u;
+    }
+    return seq;
+}
+
+static uint8_t icd_to_bcd(uint8_t v)
+{
+    return (uint8_t)(((v / 10u) << 4) | (v % 10u));
+}
+
+static uint8_t icd_from_bcd(uint8_t bcd, uint8_t max, uint8_t *out)
+{
+    uint8_t hi = (uint8_t)((bcd >> 4) & 0x0Fu);
+    uint8_t lo = (uint8_t)(bcd & 0x0Fu);
+    if (hi > 9u || lo > 9u) {
+        return 0u;
+    }
+
+    uint8_t v = (uint8_t)(hi * 10u + lo);
+    if (v > max) {
+        return 0u;
+    }
+
+    *out = v;
+    return 1u;
+}
+
+static void icd_set_time_from_components(uint16_t year,
+                                         uint8_t month,
+                                         uint8_t day,
+                                         uint8_t hour,
+                                         uint8_t min,
+                                         uint8_t sec,
+                                         uint8_t centisec)
+{
+    if (year > 9999u || month > 12u || day > 31u ||
+        hour > 23u || min > 59u || sec > 59u || centisec > 99u) {
+        return;
+    }
+
+    s_icd_time_year = year;
+    s_icd_time_month = month;
+    s_icd_time_day = day;
+    s_icd_time_hour = hour;
+    s_icd_time_min = min;
+    s_icd_time_sec = sec;
+    s_icd_time_centisec = centisec;
+    s_icd_time_base_ms = HAL_GetTick();
+    s_icd_time_valid = true;
+}
+
+static void icd_set_time_from_tag(const uint8_t tag[8])
+{
+    if (tag == NULL) {
+        return;
+    }
+
+    uint8_t century, yy, month, day, hour, min, sec, centisec;
+    if (!icd_from_bcd(tag[0], 99u, &century) ||
+        !icd_from_bcd(tag[1], 99u, &yy) ||
+        !icd_from_bcd(tag[2], 12u, &month) ||
+        !icd_from_bcd(tag[3], 31u, &day) ||
+        !icd_from_bcd(tag[4], 23u, &hour) ||
+        !icd_from_bcd(tag[5], 59u, &min) ||
+        !icd_from_bcd(tag[6], 59u, &sec) ||
+        !icd_from_bcd(tag[7], 99u, &centisec)) {
+        return;
+    }
+
+    if (month == 0u || day == 0u) {
+        return;
+    }
+
+    icd_set_time_from_components((uint16_t)(century * 100u + yy),
+                                 month,
+                                 day,
+                                 hour,
+                                 min,
+                                 sec,
+                                 centisec);
+}
+
+static void icd_write_time_tag(uint8_t *p)
+{
+    if (!s_icd_time_valid) {
+        memset(p, 0, 8u);
+        return;
+    }
+
+    uint32_t elapsed_cs = (uint32_t)((HAL_GetTick() - s_icd_time_base_ms) / 10u);
+    uint32_t total_cs =
+        ((uint32_t)s_icd_time_hour * 360000u) +
+        ((uint32_t)s_icd_time_min * 6000u) +
+        ((uint32_t)s_icd_time_sec * 100u) +
+        (uint32_t)s_icd_time_centisec +
+        elapsed_cs;
+    total_cs %= 8640000u;
+
+    uint8_t hour = (uint8_t)(total_cs / 360000u);
+    uint8_t min = (uint8_t)((total_cs / 6000u) % 60u);
+    uint8_t sec = (uint8_t)((total_cs / 100u) % 60u);
+    uint8_t centisec = (uint8_t)(total_cs % 100u);
+
+    p[0] = icd_to_bcd((uint8_t)(s_icd_time_year / 100u));
+    p[1] = icd_to_bcd((uint8_t)(s_icd_time_year % 100u));
+    p[2] = icd_to_bcd(s_icd_time_month);
+    p[3] = icd_to_bcd(s_icd_time_day);
+    p[4] = icd_to_bcd(hour);
+    p[5] = icd_to_bcd(min);
+    p[6] = icd_to_bcd(sec);
+    p[7] = icd_to_bcd(centisec);
+}
+
+static uint32_t icd_read_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0]
+        | ((uint32_t)p[1] << 8)
+        | ((uint32_t)p[2] << 16)
+        | ((uint32_t)p[3] << 24);
+}
+
+static void icd_set_time_from_utc_payload(const uint8_t *payload, uint32_t payload_len)
+{
+    if (payload == NULL || payload_len < 24u) {
+        return;
+    }
+
+    uint32_t year = icd_read_u32(&payload[0]);
+    uint32_t month = icd_read_u32(&payload[4]);
+    uint32_t day = icd_read_u32(&payload[8]);
+    uint32_t hour = icd_read_u32(&payload[12]);
+    uint32_t min = icd_read_u32(&payload[16]);
+    uint32_t sec = icd_read_u32(&payload[20]);
+    if (year <= 9999u && month <= 12u && day <= 31u &&
+        hour <= 23u && min <= 59u && sec <= 59u) {
+        icd_set_time_from_components((uint16_t)year,
+                                     (uint8_t)month,
+                                     (uint8_t)day,
+                                     (uint8_t)hour,
+                                     (uint8_t)min,
+                                     (uint8_t)sec,
+                                     0u);
+    }
+}
+
 static void icd_send_frame(uint16_t msg_id, uint32_t seq, const uint8_t *payload, uint32_t payload_len)
 {
+    (void)seq;
     uint8_t frame[UI_TX_MAX];
-    const uint32_t total_len = 14u + payload_len + 6u;
+    const uint32_t total_len = 22u + payload_len + 6u;
     if (payload_len > 400u || total_len > sizeof(frame)) {
         return;
     }
 
     icd_write_le32(&frame[0], 0x70717883u);
     icd_write_le16(&frame[4], msg_id);
-    icd_write_le32(&frame[6], seq);
+    icd_write_le32(&frame[6], icd_next_sequence(msg_id));
     icd_write_le32(&frame[10], payload_len);
+    icd_write_time_tag(&frame[14]);
     if (payload_len && payload) {
-        memcpy(&frame[14], payload, payload_len);
+        memcpy(&frame[22], payload, payload_len);
     }
 
     const uint16_t crc = icd_crc16_ccitt_payload(payload, payload_len);
-    const uint32_t crc_off = 14u + payload_len;
+    const uint32_t crc_off = 22u + payload_len;
     icd_write_le16(&frame[crc_off], crc);
     icd_write_le32(&frame[crc_off + 2u], 0x83787170u);
     (void)HAL_UART_Transmit(&huart3, frame, (uint16_t)total_len, 50);
@@ -2430,11 +2651,13 @@ static void icd_apply_camera_power_range(uint8_t node, uint8_t cam_id, uint8_t o
 void mcu_on_icd_frame(McuContext *ctx,
                       uint16_t msg_id,
                       uint32_t seq,
+                      const uint8_t time_tag[8],
                       const uint8_t *payload,
                       uint32_t payload_len)
 {
     if (!ctx) return;
 
+    icd_set_time_from_tag(time_tag);
     s_icd_enabled = true;
     if (s_icd_last_cbit_ms == 0u) {
         s_icd_last_cbit_ms = HAL_GetTick();
@@ -2498,7 +2721,7 @@ void mcu_on_icd_frame(McuContext *ctx,
     }
 
     case ICD_RITA_PIPA_UTC_INFO:
-        // UTC is accepted and ignored for now; no ACK is defined in the ICD list.
+        icd_set_time_from_utc_payload(payload, payload_len);
         icd_send_status(seq);
         break;
 

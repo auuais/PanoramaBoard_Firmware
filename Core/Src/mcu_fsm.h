@@ -46,6 +46,7 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n);
 void mcu_on_icd_frame(McuContext *ctx,
                       uint16_t msg_id,
                       uint32_t seq,
+                      const uint8_t time_tag[8],
                       const uint8_t *payload,
                       uint32_t payload_len);
 

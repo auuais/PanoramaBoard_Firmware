@@ -69,7 +69,8 @@ extern UART_HandleTypeDef huart3;
 #define UI_ACC_MAX         512u
 #define UI_PAYLOAD_MAX     256u
 #define ICD_ACC_MAX        1200u
-#define ICD_HEADER_SIZE    14u
+#define ICD_HEADER_SIZE    22u
+#define ICD_TIME_TAG_OFF   14u
 #define ICD_TAIL_SIZE      6u
 #define ICD_MAX_PAYLOAD    1024u
 
@@ -2421,6 +2422,7 @@ static bool icd_process_byte(uint8_t b)
             mcu_on_icd_frame(&g_ctx,
                              icd_read_le16(&icd_acc[4]),
                              icd_read_le32(&icd_acc[6]),
+                             &icd_acc[ICD_TIME_TAG_OFF],
                              payload,
                              payload_len);
         }
@@ -2842,7 +2844,7 @@ static void MX_USART3_UART_Init(void)
 
   /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
-  huart3.Init.BaudRate = 460800;   /* 921600: ~0.16 ms/frame vs 1.3 ms at 115200 ??needed for 1kHz IMU */
+  huart3.Init.BaudRate = 115200;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_NONE;
