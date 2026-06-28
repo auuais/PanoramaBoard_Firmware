@@ -27,7 +27,7 @@ static void icd_send_status(uint32_t seq);
 static void icd_maintenance_init_defaults(void);
 static uint8_t icd_apply_maintenance_payload(const uint8_t *payload, uint16_t payload_len);
 static void icd_fill_maintenance_ack(uint8_t p[43]);
-static void icd_fill_maintenance_status(uint8_t p[43]);
+static void icd_fill_maintenance_status(uint8_t p[109]);
 
 
 // ---- externs from existing codebase ----
@@ -166,7 +166,7 @@ enum {
      * until customer confirms the live parser changed. */
     ICD_STATUS_LEN = 21,
     ICD_MAINT_ACK_LEN = 43,
-    ICD_MAINT_STATUS_LEN = 43
+    ICD_MAINT_STATUS_LEN = 109
 };
 
 enum {
@@ -2470,7 +2470,33 @@ static void icd_fill_maintenance_ack(uint8_t p[ICD_MAINT_ACK_LEN])
 
 static void icd_fill_maintenance_status(uint8_t p[ICD_MAINT_STATUS_LEN])
 {
-    icd_fill_maintenance_ack(p);
+    memset(p, 0, ICD_MAINT_STATUS_LEN);
+    memcpy(p, s_icd_maintenance_status, ICD_MAINT_LEN);
+
+    if (p[ICD_MAINT_SELECTED_IR_CAM] > 6u) p[ICD_MAINT_SELECTED_IR_CAM] = 0u;
+    if (p[ICD_MAINT_SELECTED_EO_CAM] > 6u) p[ICD_MAINT_SELECTED_EO_CAM] = 0u;
+    p[ICD_MAINT_EO_POWER_RESET] = 0u;
+
+    uint16_t tnr = icd_read_u16(&p[ICD_MAINT_IR_TNR_L]);
+    if (tnr > 32u) {
+        icd_write_u16(&p[ICD_MAINT_IR_TNR_L], 32u);
+    }
+
+    // ICD v0.92 0x2211 payload = 37 maintenance bytes followed by per-camera
+    // Roll, Pitch, Yaw uint16 triples for IR cam1..6 then EO cam1..6.
+    uint8_t off = ICD_MAINT_LEN;
+    for (uint8_t i = 0; i < CFG_CAM_COUNT; ++i) {
+        icd_write_u16(&p[off + 0u], (uint16_t)s_cfg_store.ir.roll_cd[i]);
+        icd_write_u16(&p[off + 2u], (uint16_t)s_cfg_store.ir.pitch_cd[i]);
+        icd_write_u16(&p[off + 4u], s_cfg_store.ir.yaw_cd[i]);
+        off = (uint8_t)(off + 6u);
+    }
+    for (uint8_t i = 0; i < CFG_CAM_COUNT; ++i) {
+        icd_write_u16(&p[off + 0u], (uint16_t)s_cfg_store.eo.roll_cd[i]);
+        icd_write_u16(&p[off + 2u], (uint16_t)s_cfg_store.eo.pitch_cd[i]);
+        icd_write_u16(&p[off + 4u], s_cfg_store.eo.yaw_cd[i]);
+        off = (uint8_t)(off + 6u);
+    }
 }
 
 static uint8_t icd_status_from_power(uint8_t on)
