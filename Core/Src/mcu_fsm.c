@@ -166,7 +166,9 @@ enum {
      * until customer confirms the live parser changed. */
     ICD_STATUS_LEN = 21,
     ICD_MAINT_ACK_LEN = 43,
-    ICD_MAINT_STATUS_LEN = 109
+    ICD_MAINT_STATUS_LEN = 109,
+    ICD_IR_TNR_MAX_VALUE = 16383,
+    ICD_IR_TNR_STEPS = 15
 };
 
 enum {
@@ -2263,6 +2265,16 @@ static uint8_t icd_apply_ir_maint_u16(uint8_t cam_sel, uint8_t offset_l, uint16_
     return (rc == 0) ? ERR_OK : ((rc == -2) ? ERR_BUSY : ERR_FAIL);
 }
 
+static uint16_t icd_tnr_icd_value_to_camera_step(uint16_t value)
+{
+    if (value >= ICD_IR_TNR_MAX_VALUE) {
+        return (uint16_t)(ICD_IR_TNR_STEPS - 1u);
+    }
+
+    return (uint16_t)((((uint32_t)value * (ICD_IR_TNR_STEPS - 1u)) +
+                       (ICD_IR_TNR_MAX_VALUE / 2u)) / ICD_IR_TNR_MAX_VALUE);
+}
+
 static uint8_t icd_apply_eo_maint_u8(uint8_t cam_sel, uint8_t offset, uint16_t param_id)
 {
     uint8_t value = s_icd_maintenance_status[offset];
@@ -2341,9 +2353,14 @@ static uint8_t icd_apply_maintenance_payload(const uint8_t *payload, uint16_t pa
     }
 
     uint16_t tnr = icd_read_u16(&s_icd_maintenance_status[ICD_MAINT_IR_TNR_L]);
-    if (tnr <= 32u && icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_TNR_L, 2u)) {
-        int rc = Apply_IR_Camera_Param(ir_cam, PARAM_ID_IR_TNR_THRESHOLD, tnr);
-        if (rc != 0) overall = ERR_FAIL;
+    if (tnr > ICD_IR_TNR_MAX_VALUE) {
+        tnr = ICD_IR_TNR_MAX_VALUE;
+        icd_write_u16(&s_icd_maintenance_status[ICD_MAINT_IR_TNR_L], tnr);
+    }
+    if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_TNR_L, 2u)) {
+        uint16_t camera_tnr_step = icd_tnr_icd_value_to_camera_step(tnr);
+        int rc = Apply_IR_Camera_Param(ir_cam, PARAM_ID_IR_TNR_THRESHOLD, camera_tnr_step);
+        if (rc != 0) overall = (rc == -2) ? ERR_BUSY : ERR_FAIL;
     }
 
     if (s_icd_maintenance_status[ICD_MAINT_EO_POWER_RESET] != 0u &&
@@ -2454,11 +2471,11 @@ static void icd_fill_maintenance_ack(uint8_t p[ICD_MAINT_ACK_LEN])
     // Power reset is a momentary command, not a latched state.
     p[ICD_MAINT_EO_POWER_RESET] = 0u;
 
-    // Keep 16-bit fields packed little-endian and within what our camera
-    // drivers can actually apply today.
+    // Keep ICD TNR packed little-endian. The wire value is 0..16383 and is
+    // mapped to the camera's 15 available hardware steps only when applying.
     uint16_t tnr = icd_read_u16(&p[ICD_MAINT_IR_TNR_L]);
-    if (tnr > 32u) {
-        icd_write_u16(&p[ICD_MAINT_IR_TNR_L], 32u);
+    if (tnr > ICD_IR_TNR_MAX_VALUE) {
+        icd_write_u16(&p[ICD_MAINT_IR_TNR_L], ICD_IR_TNR_MAX_VALUE);
     }
 
     // Customer maintenance wire frame appends Roll/Pitch/Heading as uint16.
@@ -2478,8 +2495,8 @@ static void icd_fill_maintenance_status(uint8_t p[ICD_MAINT_STATUS_LEN])
     p[ICD_MAINT_EO_POWER_RESET] = 0u;
 
     uint16_t tnr = icd_read_u16(&p[ICD_MAINT_IR_TNR_L]);
-    if (tnr > 32u) {
-        icd_write_u16(&p[ICD_MAINT_IR_TNR_L], 32u);
+    if (tnr > ICD_IR_TNR_MAX_VALUE) {
+        icd_write_u16(&p[ICD_MAINT_IR_TNR_L], ICD_IR_TNR_MAX_VALUE);
     }
 
     // ICD v0.92 0x2211 payload = 37 maintenance bytes followed by per-camera
