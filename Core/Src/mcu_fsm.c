@@ -17,6 +17,10 @@
 #include <stddef.h>
 #include <limits.h>
 
+#ifndef ICD_ONLY_UI_PROTOCOL
+#define ICD_ONLY_UI_PROTOCOL 1
+#endif
+
 //
 static void fpga_service_orient(void);
 static int imu_stream_read_raw(uint8_t *dst);
@@ -698,6 +702,13 @@ static uint8_t fpga_push_all_runtime_config(void)
 // ===================== UI TX =====================
 static void ui_send_frame(uint8_t msg_type, uint8_t seq, const uint8_t *payload, uint16_t plen)
 {
+#if ICD_ONLY_UI_PROTOCOL
+    (void)msg_type;
+    (void)seq;
+    (void)payload;
+    (void)plen;
+    return;
+#else
     uint8_t buf[UI_TX_MAX];
     uint8_t tmp[UI_PAY_MAX];
 
@@ -714,6 +725,7 @@ static void ui_send_frame(uint8_t msg_type, uint8_t seq, const uint8_t *payload,
     if (frame_len) {
         (void)HAL_UART_Transmit(&huart3, buf, (uint16_t)frame_len, 50);
     }
+#endif
 }
 
 static void ui_send_resp_simple(uint8_t seq, uint8_t err)

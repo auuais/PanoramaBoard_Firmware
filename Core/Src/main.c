@@ -62,6 +62,10 @@ extern UART_HandleTypeDef huart3;
 // same IDs as your FSM
 #define MSG_LOG   0x7F
 
+#ifndef ICD_ONLY_UI_PROTOCOL
+#define ICD_ONLY_UI_PROTOCOL 1
+#endif
+
 // ------------------------------
 // UI (UART3) framing buffers
 // ------------------------------
@@ -279,6 +283,10 @@ int Power_Cycle_All_Cameras(void)
 #define MSG_LOG   0x7F
 
 static void ui_logf(const char *fmt, ...) {
+#if ICD_ONLY_UI_PROTOCOL
+    (void)fmt;
+    return;
+#else
     char text[200];
     va_list args;
     va_start(args, fmt);
@@ -302,16 +310,22 @@ static void ui_logf(const char *fmt, ...) {
     if (flen) {
         HAL_UART_Transmit(&huart3, frame, (uint16_t)flen, 50);
     }
+#endif
 }
 
 // Backward-compatible name used by older code paths:
 void Send_UART3_Debug(const char *format, ...) {
+#if ICD_ONLY_UI_PROTOCOL
+    (void)format;
+    return;
+#else
     char text[200];
     va_list args;
     va_start(args, format);
     vsnprintf(text, sizeof(text), format, args);
     va_end(args);
     ui_logf("%s", text);
+#endif
 }
 
 static void Capture_Boot_Reset_State(void)
@@ -2434,8 +2448,8 @@ static bool icd_process_byte(uint8_t b)
     return true;
 }
 
-// Feed bytes into accumulator, split frames by 0x00 delimiter,
-// parse each COBS frame, then forward payload to mcu_on_ui_payload().
+// Feed bytes into the ICD parser. Legacy COBS frames are ignored when the
+// customer ICD protocol is the only allowed PC-facing protocol.
 static void ui_process_bytes(const uint8_t *data, uint16_t len)
 {
     for (uint16_t i = 0; i < len; i++) {
@@ -2447,6 +2461,7 @@ static void ui_process_bytes(const uint8_t *data, uint16_t len)
             }
         }
 
+#if !ICD_ONLY_UI_PROTOCOL
         if (b == 0x00) {
             // delimiter -> parse current frame if any
             if (ui_acc_len > 0) {
@@ -2468,6 +2483,9 @@ static void ui_process_bytes(const uint8_t *data, uint16_t len)
             // overflow -> drop
             ui_acc_reset();
         }
+#else
+        ui_acc_reset();
+#endif
     }
 }
 
