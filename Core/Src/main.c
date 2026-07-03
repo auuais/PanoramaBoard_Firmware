@@ -136,7 +136,7 @@ static bool g_boot_reset_reported = false;
 
 void fpga_init(void)
 {
-    fpga_i2c_init(&g_fpga, &hi2c3, 0x42);
+    fpga_i2c_init(&g_fpga, &hi2c3, FPGA_I2C_ADDR7);
 }
 
 
@@ -1847,8 +1847,16 @@ static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
             return day_send_visca_u8(camera_num, 0x04u, 0x2Cu, (uint8_t)value);
         case PARAM_ID_EO_AE_SHUTTER:
             return day_send_visca_u16_direct(camera_num, 0x04u, 0x4Au, value);
-        case PARAM_ID_EO_BRIGHTNESS:
+        case PARAM_ID_EO_BRIGHTNESS: {
+            // Datasheet CAM_ExpComp (the OSD "Brightness" control) ignores Direct
+            // position writes (0x4E) unless compensation mode is first enabled
+            // via 0x3E 0x02 ("On"). Best-effort: always still issue the Direct
+            // write even if the "On" command's ACK wait fails/times out, so a
+            // flaky/missing ACK on the enable command can't silently swallow
+            // the actual brightness change.
+            (void)day_send_visca_simple(camera_num, 0x04u, 0x3Eu, 0x02u);
             return day_send_visca_u16_direct(camera_num, 0x04u, 0x4Eu, value);
+        }
         case PARAM_ID_EO_BLC:
             return day_send_visca_simple(camera_num, 0x04u, 0x33u, (value != 0u) ? 0x02u : 0x03u);
         case PARAM_ID_EO_HLC:
@@ -2992,10 +3000,12 @@ static void MX_GPIO_Init(void)
           HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
 
-  /*Configure GPIO pin : PC6 */
+  /*Configure GPIO pin : PC6 FPGA_RESET_N, active-low idle high */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
   GPIO_InitStruct.Pin = GPIO_PIN_6;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
 

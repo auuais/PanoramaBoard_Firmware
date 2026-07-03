@@ -163,6 +163,11 @@ static uint8_t s_icd_ir_image_polarity = 0u;
 static uint8_t s_icd_video_stabilization = 0u;
 static uint8_t s_icd_video_stabilization_method = 0u;
 static uint16_t s_icd_blending_area_px = 0u;
+static uint8_t s_icd_env_temp_c = 0u;
+static uint8_t s_icd_env_humidity_pct = 0u;
+static uint8_t s_icd_env_ok = 0u;
+static uint8_t s_icd_env_valid = 0u;
+static uint32_t s_icd_env_last_ms = 0u;
 static uint8_t s_icd_maintenance_status[37] = {0};
 enum {
     /* Golden customer frames use 21 bytes for 0x2210. The v0.92 workbook
@@ -172,7 +177,10 @@ enum {
     ICD_MAINT_ACK_LEN = 43,
     ICD_MAINT_STATUS_LEN = 109,
     ICD_IR_TNR_MAX_VALUE = 16383,
-    ICD_IR_TNR_STEPS = 15
+    ICD_IR_TNR_STEPS = 15,
+    ICD_PANORAMA_BASE_LEN = 8,
+    ICD_PANORAMA_EXT_LEN = 9,
+    ICD_PANORAMA_FPGA_RESET_OFF = 8
 };
 
 enum {
@@ -1050,6 +1058,11 @@ void mcu_fsm_init(McuContext *ctx)
     /* Bring-up always starts in EO panorama. Keep loaded EO/IR bank calibration,
      * but do not let a previously saved runtime mode override startup. */
     s_cfg_store.mode = CFG_DEFAULT_MODE_EO_PANORAMA;
+    if (loaded) {
+        /* Keep the persisted config aligned with the boot-time default so
+         * any later runtime re-apply also comes up in EO panorama. */
+        (void)cfg_save_to_flash();
+    }
 
     icd_maintenance_init_defaults();
     s_icd_enabled = true;
@@ -1265,6 +1278,11 @@ void mcu_fsm_step(McuContext *ctx)
             int r = test_day_camera_controls(ctx->day_idx);   // change it to return status if it doesn?�t
             uint8_t ok = (r == 0) ? 1 : 0;
             ui_send_init_ack(ctx->init_seq,NODE_DAY, ctx->day_idx, ok, ok ? ERR_OK : ERR_FAIL);
+            // Default Shutter Speed (CAM_Shutter, step 10 = "X2" digital slow
+            // shutter, one step brighter than baseline 1/30 at step 11) at
+            // boot. Unlike Brightness/ExpComp, Shutter Speed stays directly
+            // settable even in MANUAL/External Trigger mode.
+            (void)Apply_EO_Camera_Param((uint8_t)(ctx->day_idx + 1u), PARAM_ID_EO_AE_SHUTTER, 10u);
             ctx->day_idx++;
         } else {
             ctx->ir_idx = 0;
@@ -1325,17 +1343,21 @@ void mcu_fsm_step(McuContext *ctx)
                 ui_send_log(ctx, "FPGA push stage: mode\r\n");
                 detail = fpga_push_mode(s_cfg_store.mode);
                 #else
-                ui_send_log(ctx, "FPGA push stage: EO bank\r\n");
-                detail = fpga_push_bank(CFG_BANK_EO, &s_cfg_store.eo);
+                /* Push the display mode FIRST so a later bank-config failure
+                 * cannot leave the FPGA stuck on its power-on default (IR0).
+                 * The mode register (0x00) is independent of the config banks
+                 * (0x20+), so setting it first is safe. */
+                ui_send_log(ctx, "FPGA push stage: mode\r\n");
+                detail = fpga_push_mode(s_cfg_store.mode);
+
+                if (detail == CFG_APPLY_OK) {
+                    ui_send_log(ctx, "FPGA push stage: EO bank\r\n");
+                    detail = fpga_push_bank(CFG_BANK_EO, &s_cfg_store.eo);
+                }
 
                 if (detail == CFG_APPLY_OK) {
                     ui_send_log(ctx, "FPGA push stage: IR bank\r\n");
                     detail = fpga_push_bank(CFG_BANK_IR, &s_cfg_store.ir);
-                }
-
-                if (detail == CFG_APPLY_OK) {
-                    ui_send_log(ctx, "FPGA push stage: mode\r\n");
-                    detail = fpga_push_mode(s_cfg_store.mode);
                 }
                 #endif
             }
@@ -2714,9 +2736,9 @@ static void icd_fill_status(uint8_t p[ICD_STATUS_LEN])
     icd_write_u16(&p[19], s_icd_blending_area_px);
 }
 
-static void icd_fill_panorama_ack(uint8_t p[8])
+static void icd_fill_panorama_ack(uint8_t *p, uint8_t len, uint8_t fpga_reset_ack)
 {
-    memset(p, 0, 8u);
+    memset(p, 0, len);
     p[0] = icd_video_select_from_mode(s_cfg_store.mode);
     p[1] = s_icd_video_brightness;
     p[2] = s_icd_video_contrast;
@@ -2724,6 +2746,9 @@ static void icd_fill_panorama_ack(uint8_t p[8])
     p[4] = s_icd_video_stabilization;
     p[5] = s_icd_video_stabilization_method;
     icd_write_u16(&p[6], s_icd_blending_area_px);
+    if (len > ICD_PANORAMA_FPGA_RESET_OFF) {
+        p[ICD_PANORAMA_FPGA_RESET_OFF] = fpga_reset_ack;
+    }
 }
 
 static void icd_send_status(uint32_t seq)
@@ -2736,6 +2761,50 @@ static void icd_send_status(uint32_t seq)
 static uint8_t icd_ok_code(uint8_t ok)
 {
     return ok ? 0u : 1u;
+}
+
+static uint8_t icd_clamp_u8_from_float(float value, float min_value, float max_value)
+{
+    if (value < min_value) value = min_value;
+    if (value > max_value) value = max_value;
+    int32_t rounded = (int32_t)lroundf(value);
+    if (rounded < 0) return 0u;
+    if (rounded > 255) return 255u;
+    return (uint8_t)rounded;
+}
+
+static void icd_update_env_sample(uint8_t force)
+{
+    const uint32_t now = HAL_GetTick();
+    if (!force && s_icd_env_valid && (uint32_t)(now - s_icd_env_last_ms) < 900u) {
+        return;
+    }
+
+    float t = -999.0f;
+    float h = -999.0f;
+    Read_HDC3022_Sensor(&t, &h);
+
+    s_icd_env_ok = (t >= -40.0f && t <= 85.0f && h >= 0.0f && h <= 100.0f) ? 1u : 0u;
+    if (s_icd_env_ok) {
+        /* ICD declares these fields as UINT8. Current UI/customer use positive
+         * board temperatures, so clamp the transmitted display value to 0..85 C.
+         */
+        s_icd_env_temp_c = icd_clamp_u8_from_float(t, 0.0f, 85.0f);
+        s_icd_env_humidity_pct = icd_clamp_u8_from_float(h, 0.0f, 100.0f);
+    } else {
+        s_icd_env_temp_c = 0u;
+        s_icd_env_humidity_pct = 0u;
+    }
+
+    s_icd_env_valid = 1u;
+    s_icd_env_last_ms = now;
+}
+
+static void fpga_reset_pulse_active_low(void)
+{
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
+    HAL_Delay(500);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
 }
 
 static void icd_fill_pbit(uint8_t *p, uint32_t len)
@@ -2755,7 +2824,8 @@ static void icd_fill_pbit(uint8_t *p, uint32_t len)
     }
     p[18] = icd_ok_code(fpga_status_ok() ? 1u : 0u);
     p[19] = 0u;
-    p[20] = 0u;
+    icd_update_env_sample(0u);
+    p[20] = icd_ok_code(s_icd_env_ok);
     p[21] = icd_ok_code(imu_status_ok() ? 1u : 0u);
     p[22] = 0u;
 }
@@ -2779,20 +2849,22 @@ static void icd_fill_cbit(uint8_t p[21])
     p[14] = 0u;
     p[15] = 0u;
     p[16] = 0u;
-    p[17] = 0u;
-    p[18] = 0u;
-    p[19] = 0u;
+    icd_update_env_sample(0u);
+    p[17] = s_icd_env_temp_c;
+    p[18] = s_icd_env_humidity_pct;
+    p[19] = s_icd_env_ok ? 0u : 1u;
     p[20] = 0u;
 }
 
 static void icd_fill_ibit(uint8_t p[28])
 {
     memset(p, 0, 28u);
+    icd_update_env_sample(1u);
     icd_fill_pbit(p, 23u);
     p[23] = 0u;
-    p[24] = 0u;
-    p[25] = 0u;
-    p[26] = 0u;
+    p[24] = s_icd_env_temp_c;
+    p[25] = s_icd_env_humidity_pct;
+    p[26] = s_icd_env_ok ? 0u : 1u;
     p[27] = 0u;
 }
 
@@ -2888,7 +2960,7 @@ void mcu_on_icd_frame(McuContext *ctx,
     }
 
     case ICD_RITA_PIPA_PANORAMA_CONTROL: {
-        if (payload_len < 8u) return;
+        if (payload_len < ICD_PANORAMA_BASE_LEN) return;
         if (payload[0] != 0u) {
             uint8_t mode = icd_mode_from_video_select(payload[0]);
             if (mode != 0xFFu && ctx->state == ST_OPERATION) {
@@ -2896,9 +2968,16 @@ void mcu_on_icd_frame(McuContext *ctx,
             }
         }
         (void)icd_apply_panorama_camera_params(payload);
-        uint8_t ack[8];
-        icd_fill_panorama_ack(ack);
-        icd_send_frame(ICD_PIPA_RITA_PANORAMA_ACK, seq, ack, sizeof(ack));
+        uint8_t fpga_reset_ack = 0u;
+        uint8_t ack_len = ICD_PANORAMA_BASE_LEN;
+        if (payload_len > ICD_PANORAMA_FPGA_RESET_OFF && payload[ICD_PANORAMA_FPGA_RESET_OFF] != 0u) {
+            fpga_reset_pulse_active_low();
+            fpga_reset_ack = 1u;
+            ack_len = ICD_PANORAMA_EXT_LEN;
+        }
+        uint8_t ack[ICD_PANORAMA_EXT_LEN];
+        icd_fill_panorama_ack(ack, ack_len, fpga_reset_ack);
+        icd_send_frame(ICD_PIPA_RITA_PANORAMA_ACK, seq, ack, ack_len);
         icd_send_status(seq);
         break;
     }
