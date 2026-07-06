@@ -66,6 +66,9 @@ extern UART_HandleTypeDef huart3;
 #define ICD_ONLY_UI_PROTOCOL 1
 #endif
 
+// Keep legacy MSG_LOG frames compiled out while ICD-only protocol is active.
+#define TEMP_ENABLE_LEGACY_LOGS 0
+
 // ------------------------------
 // UI (UART3) framing buffers
 // ------------------------------
@@ -283,7 +286,7 @@ int Power_Cycle_All_Cameras(void)
 #define MSG_LOG   0x7F
 
 static void ui_logf(const char *fmt, ...) {
-#if ICD_ONLY_UI_PROTOCOL
+#if ICD_ONLY_UI_PROTOCOL && !TEMP_ENABLE_LEGACY_LOGS
     (void)fmt;
     return;
 #else
@@ -315,7 +318,7 @@ static void ui_logf(const char *fmt, ...) {
 
 // Backward-compatible name used by older code paths:
 void Send_UART3_Debug(const char *format, ...) {
-#if ICD_ONLY_UI_PROTOCOL
+#if ICD_ONLY_UI_PROTOCOL && !TEMP_ENABLE_LEGACY_LOGS
     (void)format;
     return;
 #else
@@ -969,18 +972,44 @@ void select_day_camera(uint8_t camera_num) {
 }
 
 void parse_and_print_version_response(uint8_t* data, uint8_t len) {
-    if (len < 10) {
-        Send_UART3_Debug("Day camera incomplete version response\r\n");
+    uint8_t pkt[16];
+    uint8_t pkt_len = 0;
+    uint8_t start = 0;
+    bool found = false;
+
+    while (start < len) {
+        uint8_t end = start;
+        while (end < len && data[end] != 0xFF) {
+            end++;
+        }
+
+        if (end < len) {
+            uint8_t cur_len = (uint8_t)(end - start + 1u);
+            if (cur_len >= 7u && data[start] == 0x90u && data[start + 1u] == 0x50u) {
+                memcpy(pkt, &data[start], cur_len);
+                pkt_len = cur_len;
+                found = true;
+                break;
+            }
+            start = (uint8_t)(end + 1u);
+        } else {
+            break;
+        }
+    }
+
+    if (!found || pkt_len < 7u) {
+        ui_logf("Day camera version response not found (len=%u)\r\n", len);
         return;
     }
-    uint8_t address = (data[0] & 0x0F);
-    (void)address;
-    uint16_t model_code = (data[2] << 8) | data[3];
-    uint8_t fw_major = data[4];
-    uint8_t fw_minor = data[5];
 
-    Send_UART3_Debug("Day Camera %d - Model: 0x%04X, FW: %d.%03d\r\n",
-                     current_day_camera, model_code, fw_major, fw_minor);
+    uint8_t address = (pkt[0] & 0x0F);
+    (void)address;
+    uint16_t model_code = ((uint16_t)pkt[2] << 8) | pkt[3];
+    uint8_t fw_major = pkt[4];
+    uint8_t fw_minor = pkt[5];
+
+    ui_logf("Day Camera %d - Model: 0x%04X, FW: %d.%03d\r\n",
+            current_day_camera, model_code, fw_major, fw_minor);
 }
 
 // was: void wait_for_visca_ack_and_completion(...)
@@ -997,8 +1026,33 @@ int wait_for_visca_ack_and_completion(uint32_t timeout_ms, int parse_version)
         }
     }
 
-    // Optional: parse/validate response buffer here and return RET_ERR_RX if invalid
-    // If parse_version != 0, parse version fields and confirm.
+    if (parse_version) {
+        uint32_t version_wait_start = HAL_GetTick();
+        while ((HAL_GetTick() - version_wait_start) < 300u) {
+            bool saw_version = false;
+            uint8_t i = 0u;
+            while (i + 6u < visca_rx_idx) {
+                uint8_t end = i;
+                while (end < visca_rx_idx && visca_rx_buffer[end] != 0xFFu) {
+                    end++;
+                }
+                if (end < visca_rx_idx) {
+                    if ((end - i + 1u) >= 7u &&
+                        visca_rx_buffer[i] == 0x90u &&
+                        visca_rx_buffer[i + 1u] == 0x50u) {
+                        saw_version = true;
+                        break;
+                    }
+                    i = (uint8_t)(end + 1u);
+                } else {
+                    break;
+                }
+            }
+            if (saw_version) break;
+            HAL_Delay(1);
+        }
+        parse_and_print_version_response(visca_rx_buffer, visca_rx_idx);
+    }
 
 //    Send_UART3_Debug("ACK Received! \r\n");
     return RET_OK;
@@ -1192,6 +1246,40 @@ void Process_IR_Camera_Received_Data(uint8_t* data, uint16_t length) {
         }
         current_pos++;
     }
+}
+
+static bool IR_LogVersionResponse(uint8_t camera_num, uint8_t *data, uint16_t length)
+{
+    bool saw_valid_response = false;
+    uint16_t current_pos = 0;
+
+    while (current_pos < length) {
+        if (data[current_pos] == 0x01) {
+            if (current_pos + 3 < length) {
+                uint8_t message_id = data[current_pos + 1];
+                uint8_t param_len = data[current_pos + 2];
+                uint32_t total_msg_len = 4u + param_len;
+
+                if (current_pos + total_msg_len <= length) {
+                    uint8_t* msg_ptr = &data[current_pos];
+                    if (msg_ptr[total_msg_len - 1] == ComputeChecksum(msg_ptr, total_msg_len - 1)) {
+                        if (message_id == 0x00) {
+                            ui_logf("IR Camera %d Version: %.*s\r\n",
+                                    camera_num, param_len, (char*)&msg_ptr[3]);
+                            saw_valid_response = true;
+                        } else if (message_id == 0x02) {
+                            ui_logf("IR Camera %d Version ACK received\r\n",
+                                    camera_num);
+                            saw_valid_response = true;
+                        }
+                    }
+                }
+            }
+        }
+        current_pos++;
+    }
+
+    return saw_valid_response;
 }
 
 
@@ -2081,7 +2169,7 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     HAL_Delay(100);
     s_ir_camera_present[camera_num] = false;
 
-    Send_UART3_Debug("Initializing IR Camera %d...\r\n", camera_num);
+    ui_logf("Initializing IR Camera %d...\r\n", camera_num);
 
     // Factory reset NV ??restores all NV parameters to defaults before writing ours
     {
@@ -2104,44 +2192,31 @@ int Initialize_IR_Camera(uint8_t camera_num) {
 //        return RET_OK;
     }
 
-    Send_UART3_Debug("\r\n--- STEP 2: Here Performing Handshake ---\r\n");
+    ui_logf("\r\n--- STEP 2: Here Performing Handshake ---\r\n");
+    IR_ArmRx();
     Send_IR_Camera_Command(0x07, NULL, 0);
-    HAL_Delay(100);
 
     bool handshake_success = false;
-    if (ir_camera_data_received_flag) {
-        // Parse and validate the response
-        uint16_t current_pos = 0;
-        while (current_pos < ir_camera_received_bytes) {
-            if (ir_camera_rx_buffer[current_pos] == 0x01) {
-                if (current_pos + 3 < ir_camera_received_bytes) {
-                    uint8_t message_id = ir_camera_rx_buffer[current_pos + 1];
-                    uint8_t param_len = ir_camera_rx_buffer[current_pos + 2];
-                    uint32_t total_msg_len = 4 + param_len;
-
-                    if (current_pos + total_msg_len <= ir_camera_received_bytes) {
-                        uint8_t* msg_ptr = &ir_camera_rx_buffer[current_pos];
-                        // Validate checksum
-                        if (msg_ptr[total_msg_len - 1] == ComputeChecksum(msg_ptr, total_msg_len - 1)) {
-                            if (message_id == 0x02) { // ACK message
-                                handshake_success = true;
-                                Send_UART3_Debug("\r\n--- !!!!!!!!!!!!! Handshake successful - Valid ACK received ---\r\n\n\n");
-                                break;
-                            } else if (message_id == 0x00) { // Text message
-                                Send_UART3_Debug("Camera %d Text: %.*s\r\n", camera_num, param_len, (char*)&msg_ptr[3]);
-                                handshake_success = true; // Text response also indicates camera is responding
-                            }
-                        }
-                    }
+    {
+        uint32_t version_wait_start = HAL_GetTick();
+        while ((HAL_GetTick() - version_wait_start) < 500u) {
+            if (ir_camera_data_received_flag) {
+                handshake_success |= IR_LogVersionResponse(camera_num,
+                                                           ir_camera_rx_buffer,
+                                                           ir_camera_received_bytes);
+                ir_camera_data_received_flag = false;
+                if (handshake_success) {
+                    ui_logf("\r\n--- IR Camera %d version query successful ---\r\n\n",
+                            camera_num);
+                    break;
                 }
             }
-            current_pos++;
+            HAL_Delay(1);
         }
-        ir_camera_data_received_flag = false;
     }
 
     if (!handshake_success) {
-        Send_UART3_Debug("\r\n--- ERROR: Camera %d handshake failed - No valid response ---\r\n\n\n", camera_num);
+        ui_logf("\r\n--- ERROR: Camera %d handshake failed - No valid response ---\r\n\n\n", camera_num);
         s_ir_camera_present[camera_num] = false;
         return RET_ERR_TX; // Exit if handshake failed
     }
@@ -2186,8 +2261,8 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     mcu_ui_log(&g_ctx, "Verify FrameRate: NV16=%d\r\n", nv16);
 
     // --- Genlock slave / input ---
-    IR_SetNV(17, 0);       // NV#17 Genlock Direction = input (slave mode)
-    IR_SetNV(18, 1);       // NV#18 Genlock Mode = 0 (slave)
+    IR_SetNV(17, 1);       // NV#17 Genlock Direction = input (slave mode)
+    IR_SetNV(18, 0);       // NV#18 Genlock Mode = 0 (slave)
 
     int nv17=-1,nv18=-1;
     IR_GetNV(17,&nv17); IR_GetNV(18,&nv18);
@@ -2220,9 +2295,7 @@ int ir_camera_handshake(uint8_t camera_num)
     select_ir_camera(camera_num);
     HAL_Delay(50);
 
-    ir_camera_data_received_flag = false;
-    ir_camera_received_bytes = 0;
-    memset(ir_camera_rx_buffer, 0, sizeof ir_camera_rx_buffer);
+    IR_ArmRx();
 
     if (Send_IR_Camera_Command(0x07, NULL, 0) != RET_OK) {
         s_ir_camera_present[camera_num] = false;

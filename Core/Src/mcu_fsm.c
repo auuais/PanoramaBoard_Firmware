@@ -133,6 +133,13 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define ERR_BADARG 0x02
 #define ERR_FAIL   0x03
 
+#define ICD_CAMERA_ACK_LEN        17u
+#define ICD_CAM_ACK_NA            0u
+#define ICD_CAM_ACK_POWER_ON_OK   1u
+#define ICD_CAM_ACK_POWER_OFF_OK  2u
+#define ICD_CAM_ACK_NUC_OK        3u
+#define ICD_CAM_ACK_FAIL          4u
+
 static bool s_icd_enabled = false;
 static uint8_t s_icd_operation_mode = ICD_OPERATION_STANDBY;
 static uint32_t s_icd_last_cbit_ms = 0u;
@@ -156,6 +163,8 @@ static const uint32_t ICD_STATUS_INTERVAL_MS = 100u;
 static const uint32_t ICD_NUC_STATUS_HOLD_MS = 1500u;
 static uint8_t s_day_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
 static uint8_t s_ir_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
+static uint8_t s_ir_bit_ok[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
+static uint8_t s_ir_cbit_next_idx = 0u;
 static uint32_t s_ir_nuc_status_until_ms[6] = {0};
 static uint8_t s_icd_video_brightness = 0u;
 static uint8_t s_icd_video_contrast = 0u;
@@ -2555,51 +2564,41 @@ static uint8_t icd_status_from_power(uint8_t on)
     return on ? 1u : 2u;
 }
 
+static uint8_t icd_refresh_ir_presence(uint8_t cam_idx)
+{
+    if (cam_idx >= 6u) {
+        return 0u;
+    }
+
+    if (!s_ir_power_on[cam_idx]) {
+        s_ir_bit_ok[cam_idx] = 0u;
+        return 0u;
+    }
+
+    s_ir_bit_ok[cam_idx] = (ir_camera_handshake(cam_idx) == 0) ? 1u : 0u;
+    return s_ir_bit_ok[cam_idx];
+}
+
+static void icd_refresh_all_ir_presence(void)
+{
+    for (uint8_t i = 0u; i < 6u; ++i) {
+        (void)icd_refresh_ir_presence(i);
+    }
+}
+
+static void icd_refresh_next_ir_presence(void)
+{
+    (void)icd_refresh_ir_presence(s_ir_cbit_next_idx);
+    s_ir_cbit_next_idx = (uint8_t)((s_ir_cbit_next_idx + 1u) % 6u);
+}
+
 static uint8_t icd_ir_status_from_power_or_nuc(uint8_t cam_idx, uint32_t now)
 {
     if (cam_idx < 6u && s_ir_nuc_status_until_ms[cam_idx] != 0u &&
         (int32_t)(now - s_ir_nuc_status_until_ms[cam_idx]) < 0) {
         return 3u;
     }
-    return icd_status_from_power(s_ir_power_on[cam_idx]);
-}
-
-static void icd_mark_ir_nuc_brief(uint8_t cam_id)
-{
-    const uint32_t until = HAL_GetTick() + ICD_NUC_STATUS_HOLD_MS;
-    if (cam_id == 7u || cam_id == 0u) {
-        for (uint8_t i = 0u; i < 6u; ++i) {
-            s_ir_nuc_status_until_ms[i] = until;
-        }
-        return;
-    }
-
-    if (cam_id >= 1u && cam_id <= 6u) {
-        s_ir_nuc_status_until_ms[cam_id - 1u] = until;
-    }
-}
-
-static uint8_t icd_apply_ir_nuc_control(uint8_t cam_id, uint8_t nuc)
-{
-    if (nuc == 0u) {
-        return ERR_OK;
-    }
-    if (nuc > 2u || cam_id == 0u) {
-        return ERR_BADARG;
-    }
-
-    uint8_t target = (cam_id == 7u) ? 0u : cam_id;
-    if (target > 6u) {
-        return ERR_BADARG;
-    }
-
-    uint16_t trigger = (nuc == 1u) ? 3u : 4u;
-    int rc = Apply_IR_Camera_Param(target, PARAM_ID_IR_NUC_TRIGGER, trigger);
-    if (rc == 0) {
-        icd_mark_ir_nuc_brief(cam_id);
-        return ERR_OK;
-    }
-    return (rc == -2) ? ERR_BUSY : ERR_FAIL;
+    return (s_ir_power_on[cam_idx] && s_ir_bit_ok[cam_idx]) ? 1u : 2u;
 }
 
 static uint8_t icd_scale_u8_to_range(uint8_t value, uint8_t in_min, uint8_t in_max, uint8_t out_max)
@@ -2812,6 +2811,8 @@ static void icd_fill_pbit(uint8_t *p, uint32_t len)
     memset(p, 0, len);
     if (len < 23u) return;
 
+    icd_refresh_all_ir_presence();
+
     p[0] = FW_VERSION_MAJOR;
     p[1] = FW_VERSION_MINOR;
     p[2] = FW_VERSION_YEAR;
@@ -2819,7 +2820,7 @@ static void icd_fill_pbit(uint8_t *p, uint32_t len)
     p[4] = FW_VERSION_DAY;
     p[5] = 0u;
     for (uint8_t i = 0u; i < 6u; ++i) {
-        p[6u + i] = icd_ok_code(s_ir_power_on[i]);
+        p[6u + i] = icd_ok_code(s_ir_power_on[i] && s_ir_bit_ok[i]);
         p[12u + i] = icd_ok_code(s_day_power_on[i]);
     }
     p[18] = icd_ok_code(fpga_status_ok() ? 1u : 0u);
@@ -2842,7 +2843,7 @@ static void icd_fill_cbit(uint8_t p[21])
     memset(p, 0, 21u);
     p[0] = 0u;
     for (uint8_t i = 0u; i < 6u; ++i) {
-        p[1u + i] = icd_ok_code(s_ir_power_on[i]);
+        p[1u + i] = icd_ok_code(s_ir_power_on[i] && s_ir_bit_ok[i]);
         p[7u + i] = icd_ok_code(s_day_power_on[i]);
     }
     p[13] = icd_ok_code(imu_status_ok() ? 1u : 0u);
@@ -2877,6 +2878,7 @@ static void icd_service_periodic(McuContext *ctx)
     uint32_t now = HAL_GetTick();
     if ((uint32_t)(now - s_icd_last_cbit_ms) >= ICD_CBIT_INTERVAL_MS) {
         s_icd_last_cbit_ms = now;
+        icd_refresh_next_ir_presence();
 
         uint8_t p[21];
         icd_fill_cbit(p);
@@ -2890,27 +2892,89 @@ static void icd_service_periodic(McuContext *ctx)
     }
 }
 
-static uint8_t icd_apply_camera_power_range(uint8_t node, uint8_t cam_id, uint8_t on_off)
+static uint8_t icd_apply_camera_power_action_single(uint8_t node,
+                                                    uint8_t cam_idx,
+                                                    uint8_t on_off)
 {
-    if (on_off == 0u) return ERR_OK;
-    if (on_off > 2u || cam_id == 0u || cam_id > 7u) return ERR_BADARG;
-    const uint8_t on = (on_off == 1u) ? 1u : 0u;
-    uint8_t overall = ERR_OK;
+    if (cam_idx >= 6u || on_off == 0u || on_off > 2u) {
+        return ICD_CAM_ACK_NA;
+    }
+
+    uint8_t on = (on_off == 1u) ? 1u : 0u;
+    if (camera_power_set(node, cam_idx, on) != 0) {
+        return ICD_CAM_ACK_FAIL;
+    }
+
+    if (node == NODE_IR && !on) {
+        s_ir_bit_ok[cam_idx] = 0u;
+    }
+
+    return on ? ICD_CAM_ACK_POWER_ON_OK : ICD_CAM_ACK_POWER_OFF_OK;
+}
+
+static void icd_apply_camera_power_action(uint8_t node,
+                                          uint8_t cam_id,
+                                          uint8_t on_off,
+                                          uint8_t *ack_status)
+{
+    if (ack_status == NULL || on_off == 0u) {
+        return;
+    }
+
+    if (on_off > 2u || cam_id == 0u || cam_id > 7u) {
+        for (uint8_t i = 0u; i < 6u; ++i) {
+            ack_status[i] = ICD_CAM_ACK_FAIL;
+        }
+        return;
+    }
 
     if (cam_id == 7u) {
         for (uint8_t i = 0u; i < 6u; ++i) {
-            if (camera_power_set(node, i, on) != 0) {
-                overall = ERR_FAIL;
-            }
+            ack_status[i] = icd_apply_camera_power_action_single(node, i, on_off);
         }
-        return overall;
+        return;
     }
 
-    if (cam_id >= 1u && cam_id <= 6u) {
-        return (camera_power_set(node, (uint8_t)(cam_id - 1u), on) == 0) ? ERR_OK : ERR_FAIL;
+    ack_status[cam_id - 1u] = icd_apply_camera_power_action_single(node, (uint8_t)(cam_id - 1u), on_off);
+}
+
+static uint8_t icd_apply_ir_nuc_action_single(uint8_t cam_id, uint8_t nuc)
+{
+    if (cam_id == 0u || cam_id > 6u || nuc == 0u || nuc > 2u) {
+        return ICD_CAM_ACK_NA;
     }
 
-    return ERR_BADARG;
+    const uint16_t trigger = (nuc == 1u) ? 3u : 4u;
+    int rc = Apply_IR_Camera_Param(cam_id, PARAM_ID_IR_NUC_TRIGGER, trigger);
+    if (rc != 0) {
+        return ICD_CAM_ACK_FAIL;
+    }
+
+    s_ir_nuc_status_until_ms[cam_id - 1u] = HAL_GetTick() + ICD_NUC_STATUS_HOLD_MS;
+    return ICD_CAM_ACK_NUC_OK;
+}
+
+static void icd_apply_ir_nuc_action(uint8_t cam_id, uint8_t nuc, uint8_t *ack_status)
+{
+    if (ack_status == NULL || nuc == 0u) {
+        return;
+    }
+
+    if (nuc > 2u || cam_id == 0u || cam_id > 7u) {
+        for (uint8_t i = 0u; i < 6u; ++i) {
+            ack_status[i] = ICD_CAM_ACK_FAIL;
+        }
+        return;
+    }
+
+    if (cam_id == 7u) {
+        for (uint8_t i = 0u; i < 6u; ++i) {
+            ack_status[i] = icd_apply_ir_nuc_action_single((uint8_t)(i + 1u), nuc);
+        }
+        return;
+    }
+
+    ack_status[cam_id - 1u] = icd_apply_ir_nuc_action_single(cam_id, nuc);
 }
 
 void mcu_on_icd_frame(McuContext *ctx,
@@ -2951,10 +3015,18 @@ void mcu_on_icd_frame(McuContext *ctx,
 
     case ICD_RITA_PIPA_CAMERA_CONTROL: {
         if (payload_len < 5u) return;
-        (void)icd_apply_camera_power_range(NODE_DAY, payload[0], payload[1]);
-        (void)icd_apply_ir_nuc_control(payload[2], payload[3]);
-        (void)icd_apply_camera_power_range(NODE_IR, payload[2], payload[4]);
-        icd_send_frame(ICD_PIPA_RITA_CAMERA_CONTROL_ACK, seq, payload, 5u);
+        uint8_t ack[ICD_CAMERA_ACK_LEN];
+        memset(ack, 0, sizeof(ack));
+        memcpy(ack, payload, 5u);
+
+        icd_apply_camera_power_action(NODE_DAY, payload[0], payload[1], &ack[5]);
+        icd_apply_ir_nuc_action(payload[2], payload[3], &ack[11]);
+        icd_apply_camera_power_action(NODE_IR, payload[2], payload[4], &ack[11]);
+
+        /* ACK reports whether the requested action was applied. It is not a
+         * camera-health verdict; health is reported by CBIT/status.
+         */
+        icd_send_frame(ICD_PIPA_RITA_CAMERA_CONTROL_ACK, seq, ack, sizeof(ack));
         icd_send_status(seq);
         break;
     }
