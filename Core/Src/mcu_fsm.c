@@ -2351,10 +2351,15 @@ static uint8_t icd_apply_maintenance_payload(const uint8_t *payload, uint16_t pa
         s_icd_maintenance_status[ICD_MAINT_IR_NUC] == 1u) {
         int rc = Apply_IR_Camera_Param(ir_cam, PARAM_ID_IR_NUC_TRIGGER, 3u);
         if (rc != 0) overall = ERR_FAIL;
+        // NUC is a momentary trigger, not a latched state. Reset immediately so
+        // the next request - even with the same mode byte - is seen as a fresh
+        // 0->1/2 edge instead of being silently swallowed as "unchanged".
+        s_icd_maintenance_status[ICD_MAINT_IR_NUC] = 0u;
     } else if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_IR_NUC, 1u) &&
                s_icd_maintenance_status[ICD_MAINT_IR_NUC] == 2u) {
         int rc = Apply_IR_Camera_Param(ir_cam, PARAM_ID_IR_NUC_TRIGGER, 4u);
         if (rc != 0) overall = ERR_FAIL;
+        s_icd_maintenance_status[ICD_MAINT_IR_NUC] = 0u;
     }
 
     uint8_t err;
