@@ -2890,8 +2890,9 @@ static void icd_service_periodic(McuContext *ctx)
         icd_send_frame(ICD_PIPA_RITA_CBIT, 0u, p, sizeof(p));
     }
 
-    if (s_icd_operation_mode == ICD_OPERATION_BASIC &&
-        (uint32_t)(now - s_icd_last_status_ms) >= ICD_STATUS_INTERVAL_MS) {
+    // PIPA_RITA_STATUS is periodic in every Accessible Mode, not just BASIC -
+    // do not gate this on s_icd_operation_mode.
+    if ((uint32_t)(now - s_icd_last_status_ms) >= ICD_STATUS_INTERVAL_MS) {
         s_icd_last_status_ms = now;
         icd_send_status(0u);
     }
@@ -3006,14 +3007,9 @@ void mcu_on_icd_frame(McuContext *ctx,
             uint8_t ibit[28];
             icd_fill_ibit(ibit);
             icd_send_frame(ICD_PIPA_RITA_IBIT, seq, ibit, sizeof(ibit));
-        } else {
-            // ICD defines PBIT as PIPA->RITA only. For integration tooling, use
-            // any non-IBIT mode command as a safe request for the current PBIT snapshot.
-            // Do not start initialization from ICD mode control; START/CMD_INIT_SYSTEM
-            // remains the only initialization path so legacy bring-up behavior is
-            // unchanged and deterministic.
-            icd_send_pbit(seq);
         }
+        // PBIT is sent exactly once after boot (see s_icd_initial_pbit_sent at
+        // ST_OPERATION entry) - it must not be re-sent on every mode change.
         icd_send_status(seq);
         break;
     }
