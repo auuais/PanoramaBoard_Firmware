@@ -1210,7 +1210,7 @@ bool Validate_EO_Parameter(uint16_t param_id, uint16_t value) {
         case PARAM_ID_EO_DNR:            return value <= 4u;
         case PARAM_ID_EO_GAMMA:          return value <= 6u;
         case PARAM_ID_EO_SHARPNESS:      return value <= 20u;
-        case PARAM_ID_EO_MIRROR:         return value <= 1u;
+        case PARAM_ID_EO_MIRROR:         return value <= 2u;
         case PARAM_ID_EO_IMAGE_FLIP:     return value <= 1u;
         case PARAM_ID_EO_TRIGGER_MODE:   return value <= 1u;
         case PARAM_ID_EO_TRIG_IN_POLARITY: return value <= 1u;
@@ -1981,7 +1981,9 @@ static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
         case PARAM_ID_EO_SHARPNESS:
             return day_send_visca_u16_direct(camera_num, 0x04u, 0x42u, value);
         case PARAM_ID_EO_MIRROR:
-            return day_send_visca_simple(camera_num, 0x04u, 0x61u, (value != 0u) ? 0x02u : 0x03u);
+            // ICD encoding: 0=N/A (no-op, leave as-is), 1=On, 2=Off.
+            if (value == 0u) return RET_OK;
+            return day_send_visca_simple(camera_num, 0x04u, 0x61u, (value == 1u) ? 0x02u : 0x03u);
         case PARAM_ID_EO_IMAGE_FLIP:
             return day_send_visca_simple(camera_num, 0x04u, 0x66u, (value != 0u) ? 0x02u : 0x03u);
         case PARAM_ID_EO_TRIGGER_MODE:

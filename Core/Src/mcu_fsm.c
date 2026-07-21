@@ -287,6 +287,7 @@ static uint8_t start_streaming_packet[] = {
 
 static volatile int16_t s_roll_cd;
 static volatile int16_t s_pitch_cd;
+static volatile float s_imu_temp_c;
 static volatile int16_t s_rate_hz;
 static volatile bool s_vsync_pending = false;
 static uint16_t s_orient_tx_seq = 0;
@@ -1550,6 +1551,7 @@ static int mcu_process_imu_stream_packet(McuContext *ctx, uint8_t *delta_counter
     }
 
     s_stats_parse_ok++;
+    s_imu_temp_c = sample.temperature;
 
     if (!s_stream_valid_log_sent) {
         s_stream_valid_log_sent = 1u;
@@ -2852,8 +2854,8 @@ static void icd_fill_cbit(uint8_t p[21])
         p[7u + i] = icd_ok_code(s_day_power_on[i]);
     }
     p[13] = icd_ok_code(imu_status_ok() ? 1u : 0u);
-    p[14] = 0u;
-    p[15] = 0u;
+    p[14] = icd_clamp_u8_from_float(s_imu_temp_c, 0.0f, 85.0f);
+    p[15] = icd_ok_code(imu_status_ok() ? 1u : 0u);
     p[16] = 0u;
     icd_update_env_sample(0u);
     p[17] = s_icd_env_temp_c;
