@@ -1210,7 +1210,7 @@ bool Validate_EO_Parameter(uint16_t param_id, uint16_t value) {
         case PARAM_ID_EO_AGC:            return value <= 10u;
         case PARAM_ID_EO_AE_SHUTTER:     return value <= 21u;
         case PARAM_ID_EO_BRIGHTNESS:     return value <= 20u;
-        case PARAM_ID_EO_BLC:            return value <= 1u;
+        case PARAM_ID_EO_BLC:            return value <= 2u;
         case PARAM_ID_EO_HLC:            return (value <= 1u) || (value >= 100u && value <= 120u) || value == 210u;
         case PARAM_ID_EO_ACE:            return (value <= 1u) || (value >= 100u && value <= 111u);
         case PARAM_ID_EO_DEFOG:          return (value <= 1u) || (value >= 100u && value <= 111u);
@@ -1953,7 +1953,9 @@ static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
             return day_send_visca_u16_direct(camera_num, 0x04u, 0x4Eu, value);
         }
         case PARAM_ID_EO_BLC:
-            return day_send_visca_simple(camera_num, 0x04u, 0x33u, (value != 0u) ? 0x02u : 0x03u);
+            // ICD encoding: 0=N/A (no-op, leave as-is), 1=On, 2=Off.
+            if (value == 0u) return RET_OK;
+            return day_send_visca_simple(camera_num, 0x04u, 0x33u, (value == 1u) ? 0x02u : 0x03u);
         case PARAM_ID_EO_HLC:
             if (value == 0u || value == 1u) {
                 return day_send_visca_u8(camera_num, 0x04u, 0x32u, (uint8_t)value);

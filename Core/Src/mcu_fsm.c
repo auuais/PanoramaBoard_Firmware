@@ -2992,6 +2992,18 @@ static void icd_fill_ibit(uint8_t p[28])
     memset(p, 0, 28u);
     icd_update_env_sample(1u);
     icd_fill_pbit(p, 23u);
+
+    // icd_fill_pbit() wrote bytes 20-22 using PBIT's own field meaning at
+    // those offsets (Temp/Humidity Init, IMU Init, HD-SDI Init). IBIT uses a
+    // different, more detailed layout at the same offsets - IMU Output, IMU
+    // Temp (a true degC reading, not an ok/fail code), and IMU Temp Status -
+    // so overwrite them here with the real values instead of leaving PBIT's
+    // unrelated bytes in place.
+    p[20] = icd_ok_code(imu_status_ok() ? 1u : 0u);
+    p[21] = icd_clamp_u8_from_float(s_imu_temp_c, 0.0f, 85.0f);
+    bool imu_temp_in_range = (s_imu_temp_c >= 0.0f) && (s_imu_temp_c <= 85.0f);
+    p[22] = icd_ok_code(imu_temp_in_range ? 1u : 0u);
+
     p[23] = 0u;
     p[24] = s_icd_env_temp_c;
     p[25] = s_icd_env_humidity_pct;
