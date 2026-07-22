@@ -233,6 +233,27 @@ enum {
     ICD_MAINT_LEN = 37
 };
 
+// s_icd_maintenance_status is one SHARED "current commanded values" snapshot -
+// it does not remember each camera's own settings separately. The UI always
+// sends a complete field set (not sparse deltas) whenever it targets a
+// camera, so on every accepted maintenance command we additionally mirror the
+// IR/EO field spans into that camera's own slot below (or all 6 slots for a
+// broadcast/"All Cameras" command). This lets a later Maintenance-mode entry
+// report each camera's own last-applied values instead of one shared one.
+//
+// IR fields span offsets [ICD_MAINT_IR_NUC .. ICD_MAINT_IR_TNR_H] - this
+// deliberately excludes offset 0 (Selected IR Cam ID), which is a selector,
+// not a per-camera setting.
+#define ICD_MAINT_IR_FIELD_OFF  ICD_MAINT_IR_NUC
+#define ICD_MAINT_IR_FIELD_LEN  (ICD_MAINT_IR_TNR_H - ICD_MAINT_IR_NUC + 1u)
+// EO fields span offsets [ICD_MAINT_EO_POWER_RESET .. ICD_MAINT_EO_FLIP],
+// excluding offset 15 (Selected EO Cam ID) for the same reason.
+#define ICD_MAINT_EO_FIELD_OFF  ICD_MAINT_EO_POWER_RESET
+#define ICD_MAINT_EO_FIELD_LEN  (ICD_MAINT_EO_FLIP - ICD_MAINT_EO_POWER_RESET + 1u)
+
+static uint8_t s_icd_ir_cam_maint[6][ICD_MAINT_LEN];
+static uint8_t s_icd_eo_cam_maint[6][ICD_MAINT_LEN];
+
 // ---- Parameter/config protocol ----
 #define CFG_BANK_EO      0x00
 #define CFG_BANK_IR      0x01
@@ -2185,6 +2206,17 @@ static void icd_set_time_from_tag(const uint8_t tag[8])
     icd_set_time_from_epoch_ms(epoch_ms);
 }
 
+// Current PIPA time estimate: last-synced epoch plus elapsed ticks since that
+// sync. Returns 0 if never synced - callers that care must check
+// s_icd_time_valid themselves (icd_write_time_tag already does).
+static uint64_t icd_current_time_ms(void)
+{
+    if (!s_icd_time_valid) {
+        return 0u;
+    }
+    return s_icd_time_epoch_ms + (uint64_t)(HAL_GetTick() - s_icd_time_base_ms);
+}
+
 static void icd_write_time_tag(uint8_t *p)
 {
     if (!s_icd_time_valid) {
@@ -2192,8 +2224,7 @@ static void icd_write_time_tag(uint8_t *p)
         return;
     }
 
-    uint64_t now_ms = s_icd_time_epoch_ms + (uint64_t)(HAL_GetTick() - s_icd_time_base_ms);
-    icd_write_u64(p, now_ms);
+    icd_write_u64(p, icd_current_time_ms());
 }
 
 static uint32_t icd_read_u32(const uint8_t *p)
@@ -2224,7 +2255,23 @@ static void icd_set_time_from_utc_payload(const uint8_t *payload, uint32_t paylo
                                ((uint64_t)hour * 3600u) +
                                ((uint64_t)min * 60u) +
                                (uint64_t)sec;
-            icd_set_time_from_epoch_ms(seconds * 1000u);
+            uint64_t new_ms = seconds * 1000u;
+
+            // UI sends this at 1Hz. Only actually re-sync (jump the clock)
+            // when PIPA's own free-running estimate has drifted from it by
+            // more than 1000ms - the UTC_INFO payload only carries
+            // whole-second resolution, so anything within a second is just
+            // that quantization, not real drift. Always sync on the very
+            // first message (nothing to compare against yet).
+            if (!s_icd_time_valid) {
+                icd_set_time_from_epoch_ms(new_ms);
+            } else {
+                uint64_t cur_ms = icd_current_time_ms();
+                uint64_t diff_ms = (new_ms > cur_ms) ? (new_ms - cur_ms) : (cur_ms - new_ms);
+                if (diff_ms > 1000u) {
+                    icd_set_time_from_epoch_ms(new_ms);
+                }
+            }
         }
     }
 }
@@ -2285,6 +2332,8 @@ static void icd_write_u16(uint8_t *p, uint16_t value)
 static void icd_maintenance_init_defaults(void)
 {
     memset(s_icd_maintenance_status, 0, sizeof(s_icd_maintenance_status));
+    memset(s_icd_ir_cam_maint, 0, sizeof(s_icd_ir_cam_maint));
+    memset(s_icd_eo_cam_maint, 0, sizeof(s_icd_eo_cam_maint));
 
     // Values here mirror the ICD defaults or harmless camera defaults. Real
     // register readback requires camera-driver query APIs, which do not exist
@@ -2294,6 +2343,13 @@ static void icd_maintenance_init_defaults(void)
     s_icd_maintenance_status[ICD_MAINT_IR_POLARITY] = 0u;
     s_icd_maintenance_status[ICD_MAINT_EO_WHITE_BALANCE] = 2u;   // Golden frame default.
     s_icd_maintenance_status[ICD_MAINT_EO_GAMMA] = 0u;
+
+    // Seed every camera's own remembered snapshot with the same baseline
+    // defaults (the memset above already zeroed everything else to 0, which
+    // matches the rest of the defaults above).
+    for (uint8_t i = 0u; i < 6u; ++i) {
+        s_icd_eo_cam_maint[i][ICD_MAINT_EO_WHITE_BALANCE] = 2u;
+    }
 }
 
 static uint8_t icd_apply_ir_maint_u8(uint8_t cam_sel, uint8_t offset, uint16_t param_id)
@@ -2506,6 +2562,32 @@ static uint8_t icd_apply_maintenance_payload(const uint8_t *payload, uint16_t pa
         if (err != ERR_OK) overall = err;
     }
 
+    // Remember this camera's (or, for a broadcast/"All Cameras" command,
+    // every camera's) resulting field values, so a later Maintenance-mode
+    // entry can report each camera's own last-applied values instead of one
+    // shared snapshot. Recorded unconditionally, same as s_icd_maintenance_status
+    // itself above: this ICD's ACK/status reflects what was commanded, not a
+    // per-field verified camera-health verdict.
+    if (ir_cam == 0u) {
+        for (uint8_t i = 0u; i < 6u; ++i) {
+            memcpy(&s_icd_ir_cam_maint[i][ICD_MAINT_IR_FIELD_OFF],
+                   &s_icd_maintenance_status[ICD_MAINT_IR_FIELD_OFF], ICD_MAINT_IR_FIELD_LEN);
+        }
+    } else {
+        memcpy(&s_icd_ir_cam_maint[ir_cam - 1u][ICD_MAINT_IR_FIELD_OFF],
+               &s_icd_maintenance_status[ICD_MAINT_IR_FIELD_OFF], ICD_MAINT_IR_FIELD_LEN);
+    }
+
+    if (eo_cam == 0u) {
+        for (uint8_t i = 0u; i < 6u; ++i) {
+            memcpy(&s_icd_eo_cam_maint[i][ICD_MAINT_EO_FIELD_OFF],
+                   &s_icd_maintenance_status[ICD_MAINT_EO_FIELD_OFF], ICD_MAINT_EO_FIELD_LEN);
+        }
+    } else {
+        memcpy(&s_icd_eo_cam_maint[eo_cam - 1u][ICD_MAINT_EO_FIELD_OFF],
+               &s_icd_maintenance_status[ICD_MAINT_EO_FIELD_OFF], ICD_MAINT_EO_FIELD_LEN);
+    }
+
     return overall;
 }
 
@@ -2535,6 +2617,27 @@ static void icd_fill_maintenance_ack(uint8_t p[ICD_MAINT_ACK_LEN])
     icd_write_u16(&p[41], 0xFFFFu);
 }
 
+// ICD v0.92 0x2211 payload = 37 maintenance bytes followed by per-camera
+// Roll, Pitch, Yaw uint16 triples for IR cam1..6 then EO cam1..6. Shared by
+// every 0x2211 builder below - camera pose is independent of which camera is
+// "selected" in the leading 37 bytes.
+static void icd_append_maintenance_pose(uint8_t p[ICD_MAINT_STATUS_LEN])
+{
+    uint8_t off = ICD_MAINT_LEN;
+    for (uint8_t i = 0; i < CFG_CAM_COUNT; ++i) {
+        icd_write_u16(&p[off + 0u], (uint16_t)s_cfg_store.ir.roll_cd[i]);
+        icd_write_u16(&p[off + 2u], (uint16_t)s_cfg_store.ir.pitch_cd[i]);
+        icd_write_u16(&p[off + 4u], s_cfg_store.ir.yaw_cd[i]);
+        off = (uint8_t)(off + 6u);
+    }
+    for (uint8_t i = 0; i < CFG_CAM_COUNT; ++i) {
+        icd_write_u16(&p[off + 0u], (uint16_t)s_cfg_store.eo.roll_cd[i]);
+        icd_write_u16(&p[off + 2u], (uint16_t)s_cfg_store.eo.pitch_cd[i]);
+        icd_write_u16(&p[off + 4u], s_cfg_store.eo.yaw_cd[i]);
+        off = (uint8_t)(off + 6u);
+    }
+}
+
 static void icd_fill_maintenance_status(uint8_t p[ICD_MAINT_STATUS_LEN])
 {
     memset(p, 0, ICD_MAINT_STATUS_LEN);
@@ -2549,20 +2652,40 @@ static void icd_fill_maintenance_status(uint8_t p[ICD_MAINT_STATUS_LEN])
         icd_write_u16(&p[ICD_MAINT_IR_TNR_L], ICD_IR_TNR_MAX_VALUE);
     }
 
-    // ICD v0.92 0x2211 payload = 37 maintenance bytes followed by per-camera
-    // Roll, Pitch, Yaw uint16 triples for IR cam1..6 then EO cam1..6.
-    uint8_t off = ICD_MAINT_LEN;
-    for (uint8_t i = 0; i < CFG_CAM_COUNT; ++i) {
-        icd_write_u16(&p[off + 0u], (uint16_t)s_cfg_store.ir.roll_cd[i]);
-        icd_write_u16(&p[off + 2u], (uint16_t)s_cfg_store.ir.pitch_cd[i]);
-        icd_write_u16(&p[off + 4u], s_cfg_store.ir.yaw_cd[i]);
-        off = (uint8_t)(off + 6u);
+    icd_append_maintenance_pose(p);
+}
+
+// Builds a 0x2211 maintenance-status frame for ONE physical camera (0-5),
+// reporting that camera's own remembered last-applied IR/EO values rather
+// than the single shared "most recently commanded" snapshot.
+static void icd_fill_maintenance_status_for_camera(uint8_t p[ICD_MAINT_STATUS_LEN], uint8_t cam_idx)
+{
+    memset(p, 0, ICD_MAINT_STATUS_LEN);
+
+    p[ICD_MAINT_SELECTED_IR_CAM] = (uint8_t)(cam_idx + 1u);
+    memcpy(&p[ICD_MAINT_IR_FIELD_OFF], &s_icd_ir_cam_maint[cam_idx][ICD_MAINT_IR_FIELD_OFF], ICD_MAINT_IR_FIELD_LEN);
+
+    p[ICD_MAINT_SELECTED_EO_CAM] = (uint8_t)(cam_idx + 1u);
+    memcpy(&p[ICD_MAINT_EO_FIELD_OFF], &s_icd_eo_cam_maint[cam_idx][ICD_MAINT_EO_FIELD_OFF], ICD_MAINT_EO_FIELD_LEN);
+
+    uint16_t tnr = icd_read_u16(&p[ICD_MAINT_IR_TNR_L]);
+    if (tnr > ICD_IR_TNR_MAX_VALUE) {
+        icd_write_u16(&p[ICD_MAINT_IR_TNR_L], ICD_IR_TNR_MAX_VALUE);
     }
-    for (uint8_t i = 0; i < CFG_CAM_COUNT; ++i) {
-        icd_write_u16(&p[off + 0u], (uint16_t)s_cfg_store.eo.roll_cd[i]);
-        icd_write_u16(&p[off + 2u], (uint16_t)s_cfg_store.eo.pitch_cd[i]);
-        icd_write_u16(&p[off + 4u], s_cfg_store.eo.yaw_cd[i]);
-        off = (uint8_t)(off + 6u);
+
+    icd_append_maintenance_pose(p);
+}
+
+// Sent on every MODE_CONTROL request into Maintenance mode: one 0x2211 frame
+// per physical camera (0-5), each selecting that camera and reporting its own
+// last-applied/default IR+EO maintenance values, instead of a single shared
+// snapshot for whichever camera was last touched.
+static void icd_send_maintenance_camera_burst(uint32_t seq)
+{
+    for (uint8_t cam_idx = 0u; cam_idx < 6u; ++cam_idx) {
+        uint8_t status[ICD_MAINT_STATUS_LEN];
+        icd_fill_maintenance_status_for_camera(status, cam_idx);
+        icd_send_frame(ICD_PIPA_RITA_MAINTENANCE_STATUS, seq, status, sizeof(status));
     }
 }
 
@@ -3009,6 +3132,13 @@ void mcu_on_icd_frame(McuContext *ctx,
             uint8_t ibit[28];
             icd_fill_ibit(ibit);
             icd_send_frame(ICD_PIPA_RITA_IBIT, seq, ibit, sizeof(ibit));
+        }
+        if (payload[0] == ICD_OPERATION_MAINTENANCE) {
+            // Every request into Maintenance mode (not just a genuine
+            // transition) gets a full 6-camera status burst, so the UI
+            // always has each camera's own last-applied/default values
+            // freshly re-sent as soon as it opens the maintenance screen.
+            icd_send_maintenance_camera_burst(seq);
         }
         // PBIT is sent exactly once after boot (see s_icd_initial_pbit_sent at
         // ST_OPERATION entry) - it must not be re-sent on every mode change.

@@ -107,10 +107,17 @@ volatile uint32_t g_imu_drdy_edges_total = 0;
 volatile uint8_t g_vsync_flag = 0;
 
 // ---- UART3 UI RX ----
-// DMA/Idle chunk buffer:
-static uint8_t  ui_rx_chunk[UI_RX_DMA_MAX];
-static volatile uint16_t ui_rx_chunk_len = 0;
-static volatile uint8_t  ui_rx_chunk_ready = 0;
+// Ring of DMA/Idle chunk buffers. A single buffer re-armed in place would let
+// a second chunk arriving while the main loop is stuck in a blocking FSM step
+// (VISCA waits, HAL_Delay()s) silently overwrite the first, unread one -
+// dropping a command. Four slots give plenty of headroom for UI command
+// bursts arriving during the worst-case ~6s "apply to all EO cameras" wait.
+#define UI_RX_RING_DEPTH 4u
+static uint8_t  ui_rx_ring[UI_RX_RING_DEPTH][UI_RX_DMA_MAX];
+static volatile uint16_t ui_rx_ring_len[UI_RX_RING_DEPTH];
+static volatile uint8_t  ui_rx_ring_head = 0u;   // next slot the ISR will fill
+static volatile uint8_t  ui_rx_ring_tail = 0u;   // next slot the main loop will drain
+static volatile uint8_t  ui_rx_ring_count = 0u;  // number of filled, unread slots
 
 // Accumulator so we can parse frames split across idle events:
 static uint8_t  ui_acc[UI_ACC_MAX];
@@ -2415,11 +2422,53 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         HAL_UARTEx_ReceiveToIdle_IT(&huart1, ir_camera_rx_buffer, sizeof ir_camera_rx_buffer);
     }
     else if (huart->Instance == USART3) { // UI protocol (COBS + CRC)
-        ui_rx_chunk_len = Size;
-        ui_rx_chunk_ready = 1;
+        if (ui_rx_ring_count >= UI_RX_RING_DEPTH) {
+            // Ring full: drop the oldest unread chunk to make room for the
+            // newest rather than overwriting the slot the main loop is about
+            // to read. Extremely unlikely in practice (4 slots), but a live
+            // control channel should favor the freshest command if it ever
+            // happens.
+            ui_rx_ring_tail = (uint8_t)((ui_rx_ring_tail + 1u) % UI_RX_RING_DEPTH);
+            ui_rx_ring_count--;
+        }
+        ui_rx_ring_len[ui_rx_ring_head] = Size;
+        ui_rx_ring_head = (uint8_t)((ui_rx_ring_head + 1u) % UI_RX_RING_DEPTH);
+        ui_rx_ring_count++;
 
-        // re-arm for next chunk
-        HAL_UARTEx_ReceiveToIdle_IT(&huart3, ui_rx_chunk, UI_RX_DMA_MAX);
+        // re-arm into the next free slot
+        HAL_UARTEx_ReceiveToIdle_IT(&huart3, ui_rx_ring[ui_rx_ring_head], UI_RX_DMA_MAX);
+    }
+}
+
+// ------------------------------------------------------------
+// UART error recovery.
+//
+// On any RX line error (overrun/ORE, framing, noise, parity) the HAL IRQ
+// handler aborts the in-progress interrupt reception (RxState -> READY) and
+// calls this weak callback. Without re-arming here, that UART goes deaf
+// permanently after the FIRST such error. Overruns become increasingly likely
+// the longer the board runs because the main loop is busy draining IMU DRDY at
+// high ODR and the FSM performs blocking HAL_Delay()s during which incoming
+// bytes can overrun. That is the root cause of "commands become unresponsive
+// after a large time elapses". Clear the sticky error flags and re-arm the
+// affected UART so a transient error self-heals.
+// ------------------------------------------------------------
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    __HAL_UART_CLEAR_FEFLAG(huart);
+    __HAL_UART_CLEAR_NEFLAG(huart);
+    __HAL_UART_CLEAR_PEFLAG(huart);
+
+    if (huart->Instance == USART3) {          // UI / ICD command channel
+        // Whatever partial bytes were mid-flight into the current head slot
+        // are incomplete/corrupt - re-arm into that same slot rather than
+        // advancing head (no chunk was actually completed here).
+        (void)HAL_UARTEx_ReceiveToIdle_IT(&huart3, ui_rx_ring[ui_rx_ring_head], UI_RX_DMA_MAX);
+    } else if (huart->Instance == USART1) {   // IR camera
+        (void)HAL_UARTEx_ReceiveToIdle_IT(&huart1, ir_camera_rx_buffer, sizeof ir_camera_rx_buffer);
+    } else if (huart->Instance == USART2) {   // Day camera (VISCA)
+        (void)HAL_UART_Receive_IT(&huart2, &visca_rx_byte, 1);
     }
 }
 
@@ -2593,7 +2642,7 @@ int main(void)
   HAL_UART_Receive_IT(&huart2, &visca_rx_byte, 1);
 
   MX_USART3_UART_Init();
-  HAL_UARTEx_ReceiveToIdle_IT(&huart3, ui_rx_chunk, UI_RX_DMA_MAX);
+  HAL_UARTEx_ReceiveToIdle_IT(&huart3, ui_rx_ring[ui_rx_ring_head], UI_RX_DMA_MAX);
 
   MX_I2C2_Init();
   MX_I2C3_Init();
@@ -2610,7 +2659,7 @@ int main(void)
   // Arm UART3 UI receiver
   ui_acc_reset();
   icd_acc_reset();
-  (void)HAL_UARTEx_ReceiveToIdle_IT(&huart3, ui_rx_chunk, UI_RX_DMA_MAX);
+  (void)HAL_UARTEx_ReceiveToIdle_IT(&huart3, ui_rx_ring[ui_rx_ring_head], UI_RX_DMA_MAX);
 
 
 //  Send_UART3_Debug("waiting for INIT");
@@ -2638,16 +2687,53 @@ int main(void)
     }
 
     // Consume UI RX only after latency-sensitive IMU/VSYNC servicing.
-    if (ui_rx_chunk_ready) {
-        ui_rx_chunk_ready = 0;
-        if (ui_rx_chunk_len > 0) {
-            ui_process_bytes(ui_rx_chunk, ui_rx_chunk_len);
+    // Drain every chunk queued while we were busy (e.g. inside a blocking FSM
+    // step) rather than just the newest one, so a burst of commands received
+    // during that window is all processed instead of silently lost.
+    __disable_irq();
+    uint8_t ui_pending = ui_rx_ring_count;
+    __enable_irq();
+
+    while (ui_pending > 0u) {
+        uint8_t slot = ui_rx_ring_tail;
+        uint16_t len = ui_rx_ring_len[slot];
+
+        if (len > 0u) {
+            ui_process_bytes(ui_rx_ring[slot], len);
         }
-        ui_rx_chunk_len = 0;
+
+        __disable_irq();
+        ui_rx_ring_tail = (uint8_t)((ui_rx_ring_tail + 1u) % UI_RX_RING_DEPTH);
+        ui_rx_ring_count--;
+        __enable_irq();
+
+        ui_pending--;
     }
 
     // Progress FSM (contains blocking delays by design)
     mcu_fsm_step(&g_ctx);
+
+    // Reception-health watchdog for the UI/ICD command channel
+    // (belt-and-suspenders on top of HAL_UART_ErrorCallback). If UART3 RX is
+    // ever found not armed - a missed re-arm, or a HAL edge case after an
+    // error - restart it so the command channel can never stay permanently
+    // deaf. Rate-limited so it costs nothing at the IMU DRDY loop rate. Scoped
+    // to UART3 only: the IR camera UART has its own arm/re-arm handshake
+    // discipline and is recovered by HAL_UART_ErrorCallback instead.
+    {
+        static uint32_t s_rx_health_last_ms = 0u;
+        uint32_t now_ms = HAL_GetTick();
+        if ((uint32_t)(now_ms - s_rx_health_last_ms) >= 200u) {
+            s_rx_health_last_ms = now_ms;
+            // Always clear a sticky overrun flag (no-op when not set): defends
+            // against a HAL edge case that leaves ORE set while RxState stays
+            // BUSY_RX, which would silently wedge reception.
+            __HAL_UART_CLEAR_OREFLAG(&huart3);
+            if (huart3.RxState == HAL_UART_STATE_READY) {
+                (void)HAL_UARTEx_ReceiveToIdle_IT(&huart3, ui_rx_ring[ui_rx_ring_head], UI_RX_DMA_MAX);
+            }
+        }
+    }
 
     // NOTE: No HAL_Delay() here. The main loop must be free-running so IMU
     // DRDY events at 416 Hz (every 2.4 ms) are processed with minimum latency.
