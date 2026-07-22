@@ -1202,7 +1202,7 @@ bool Validate_IR_Parameter(uint16_t param_id, uint16_t value) {
 bool Validate_EO_Parameter(uint16_t param_id, uint16_t value) {
     switch(param_id) {
         case PARAM_ID_EO_POWER_RESET:    return value <= 1u;
-        case PARAM_ID_EO_D_ZOOM:         return (value <= 5u) || (value >= 100u && value <= 105u);
+        case PARAM_ID_EO_D_ZOOM:         return value <= 11u;
         case PARAM_ID_EO_WHITE_BALANCE:  return value <= 5u;
         case PARAM_ID_EO_RED_GAIN:       return value <= 20u;
         case PARAM_ID_EO_BLUE_GAIN:      return value <= 20u;
@@ -1914,12 +1914,16 @@ static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
                 return day_send_visca_u16_direct(camera_num, 0x04u, 0x46u, dzoom_positions[value]);
             }
             switch (value) {
-                case 100u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x02u);
-                case 101u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x03u);
-                case 102u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x00u);
-                case 103u: return day_send_visca_u8(camera_num, 0x04u, 0x06u, 0x27u);
-                case 104u: return day_send_visca_u8(camera_num, 0x04u, 0x06u, 0x37u);
-                case 105u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x10u);
+                case 6u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x02u);  // Digital Zoom On
+                case 7u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x03u);  // Digital Zoom Off
+                case 8u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x00u);  // Digital Zoom Stop
+                // Tele/Wide (variable speed) need the full byte 0x27/0x37 sent as-is -
+                // day_send_visca_u8() masks its value to the low nibble (for the
+                // 0-0xF register-style writes elsewhere), which collapses both 0x27
+                // and 0x37 to the same 0x07 and made Tele and Wide indistinguishable.
+                case 9u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x27u);  // Digital Zoom Tele
+                case 10u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x37u); // Digital Zoom Wide
+                case 11u: return day_send_visca_simple(camera_num, 0x04u, 0x06u, 0x10u); // Digital Zoom x1/Max
                 default: return RET_ERR_TX;
             }
         case PARAM_ID_EO_WHITE_BALANCE:
@@ -2103,11 +2107,18 @@ int Apply_IR_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value)
     }
 
     if (camera_sel == 0u) {
+        // Apply to every camera regardless of individual failures - returning on
+        // the first non-OK result (e.g. an absent/unresponsive camera slot) used
+        // to abort the sweep, silently skipping every camera after it. That made
+        // "All IR Cameras" broadcast a config only as far as the first missing
+        // camera, while a single specific camera (which never hits this loop)
+        // always worked.
+        int worst_rc = RET_OK;
         for (uint8_t cam = 0u; cam < 6u; ++cam) {
             rc = apply_ir_param_single(cam, param_id, value);
-            if (rc != RET_OK) return rc;
+            if (rc != RET_OK) worst_rc = rc;
         }
-        return RET_OK;
+        return worst_rc;
     }
 
     if (camera_sel > 6u) return RET_ERR_RX;
@@ -2160,11 +2171,15 @@ int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value)
     int rc = RET_OK;
 
     if (camera_sel == 0u) {
+        // Same fix as Apply_IR_Camera_Param(): keep applying to every camera
+        // even if one fails, instead of aborting the whole broadcast sweep on
+        // the first non-OK result.
+        int worst_rc = RET_OK;
         for (uint8_t cam = 0u; cam < 6u; ++cam) {
             rc = apply_eo_param_single(cam, param_id, value);
-            if (rc != RET_OK) return rc;
+            if (rc != RET_OK) worst_rc = rc;
         }
-        return RET_OK;
+        return worst_rc;
     }
 
     if (camera_sel > 6u) return RET_ERR_TX;

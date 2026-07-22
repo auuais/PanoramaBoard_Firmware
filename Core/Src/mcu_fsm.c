@@ -2478,6 +2478,14 @@ static uint8_t icd_apply_maintenance_payload(const uint8_t *payload, uint16_t pa
     if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_DZOOM, 1u)) {
         err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_DZOOM, PARAM_ID_EO_D_ZOOM);
         if (err != ERR_OK) overall = err;
+        // Values 6-11 are momentary digital-zoom motion commands (On/Off/
+        // Stop/Tele/Wide/x1-Max toggle), not a persisted zoom-level state like
+        // 0-5. Reset immediately after firing so the next request - even with
+        // the same command byte - is seen as a fresh edge instead of being
+        // silently swallowed as "unchanged" (same fix already applied to NUC).
+        if (s_icd_maintenance_status[ICD_MAINT_EO_DZOOM] >= 6u) {
+            s_icd_maintenance_status[ICD_MAINT_EO_DZOOM] = 0u;
+        }
     }
     if (icd_payload_changed(prev, s_icd_maintenance_status, ICD_MAINT_EO_WHITE_BALANCE, 1u)) {
         err = icd_apply_eo_maint_u8(eo_cam, ICD_MAINT_EO_WHITE_BALANCE, PARAM_ID_EO_WHITE_BALANCE);
