@@ -46,6 +46,8 @@ extern void Send_UART3_Debug(const char *format, ...);
 extern int test_day_camera_controls(uint8_t camera_num);
 extern int Initialize_IR_Camera(uint8_t camera_num);
 extern int ir_camera_handshake(uint8_t camera_num);
+extern int IR_PresenceProbe_Start(uint8_t camera_num); // 0=started (non-blocking)
+extern int IR_PresenceProbe_Poll(void);  // -1 idle, 0 busy, 1 present, 2 absent, 3 aborted
 extern const char *mcu_get_reset_cause_str(void);
 extern int Apply_IR_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
 extern int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
@@ -165,6 +167,7 @@ static uint8_t s_day_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
 static uint8_t s_ir_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
 static uint8_t s_ir_bit_ok[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
 static uint8_t s_ir_cbit_next_idx = 0u;
+static uint8_t s_ir_probe_inflight_cam = 0xFFu;  // 0xFF = no background probe running
 static uint32_t s_ir_nuc_status_until_ms[6] = {0};
 static uint8_t s_icd_video_brightness = 0u;
 static uint8_t s_icd_video_contrast = 0u;
@@ -2341,14 +2344,17 @@ static void icd_maintenance_init_defaults(void)
     // maintenance values plus live board-owned state.
     s_icd_maintenance_status[ICD_MAINT_IR_FRAME_RATE] = 0u;      // 60 Hz
     s_icd_maintenance_status[ICD_MAINT_IR_POLARITY] = 0u;
-    s_icd_maintenance_status[ICD_MAINT_EO_WHITE_BALANCE] = 2u;   // Golden frame default.
+    // Golden frame default (3700K Manual). ICD White Balance is 0=Off,
+    // 1=Auto, 2=One Push AWB, 3=3700K Manual, 4=5100K Manual, 5=8000K
+    // Manual, 6=One Push AWB Trigger - value 3, not 2.
+    s_icd_maintenance_status[ICD_MAINT_EO_WHITE_BALANCE] = 3u;
     s_icd_maintenance_status[ICD_MAINT_EO_GAMMA] = 0u;
 
     // Seed every camera's own remembered snapshot with the same baseline
     // defaults (the memset above already zeroed everything else to 0, which
     // matches the rest of the defaults above).
     for (uint8_t i = 0u; i < 6u; ++i) {
-        s_icd_eo_cam_maint[i][ICD_MAINT_EO_WHITE_BALANCE] = 2u;
+        s_icd_eo_cam_maint[i][ICD_MAINT_EO_WHITE_BALANCE] = 3u;
     }
 }
 
@@ -2724,10 +2730,56 @@ static void icd_refresh_all_ir_presence(void)
     }
 }
 
-static void icd_refresh_next_ir_presence(void)
+// Advance any in-flight background IR presence probe and apply its result to
+// s_ir_bit_ok. Non-blocking; called frequently (every icd_service_periodic).
+// This replaces the per-second BLOCKING ir_camera_handshake() that used to run
+// on this path and freeze the whole main loop (and thus UI command handling)
+// for up to ~300 ms once per second.
+static void icd_service_ir_presence_probe(void)
 {
-    (void)icd_refresh_ir_presence(s_ir_cbit_next_idx);
+    if (s_ir_probe_inflight_cam == 0xFFu) {
+        return;
+    }
+    int r = IR_PresenceProbe_Poll();
+    switch (r) {
+        case 1: // completed - present
+            s_ir_bit_ok[s_ir_probe_inflight_cam] = 1u;
+            s_ir_probe_inflight_cam = 0xFFu;
+            break;
+        case 2: // completed - absent
+            s_ir_bit_ok[s_ir_probe_inflight_cam] = 0u;
+            s_ir_probe_inflight_cam = 0xFFu;
+            break;
+        case 3:  // aborted (mux disturbed by a command): leave bit_ok, retry later
+        case -1: // probe unexpectedly idle: stop tracking
+            s_ir_probe_inflight_cam = 0xFFu;
+            break;
+        default: // 0: still in progress
+            break;
+    }
+}
+
+// Non-blocking replacement for the old blocking per-CBIT presence refresh on
+// the 1 Hz path: advance the round-robin by one and, if that camera is powered,
+// kick a background probe whose result lands later via
+// icd_service_ir_presence_probe(). Unpowered cameras are marked not-present
+// immediately, exactly as before.
+static void icd_start_next_ir_presence(void)
+{
+    if (s_ir_probe_inflight_cam != 0xFFu) {
+        return;  // previous probe still running (< ~300 ms << 1 s CBIT); skip
+    }
+
+    uint8_t cam = s_ir_cbit_next_idx;
     s_ir_cbit_next_idx = (uint8_t)((s_ir_cbit_next_idx + 1u) % 6u);
+
+    if (!s_ir_power_on[cam]) {
+        s_ir_bit_ok[cam] = 0u;
+        return;
+    }
+    if (IR_PresenceProbe_Start(cam) == 0) {
+        s_ir_probe_inflight_cam = cam;
+    }
 }
 
 static uint8_t icd_ir_status_from_power_or_nuc(uint8_t cam_idx, uint32_t now)
@@ -3025,10 +3077,17 @@ static void icd_service_periodic(McuContext *ctx)
         return;
     }
 
+    // Advance any in-flight background IR presence probe (non-blocking). This
+    // runs on every service call so the probe progresses smoothly across
+    // iterations rather than blocking the main loop.
+    icd_service_ir_presence_probe();
+
     uint32_t now = HAL_GetTick();
     if ((uint32_t)(now - s_icd_last_cbit_ms) >= ICD_CBIT_INTERVAL_MS) {
         s_icd_last_cbit_ms = now;
-        icd_refresh_next_ir_presence();
+        // Kick the next round-robin presence probe (non-blocking) instead of the
+        // old blocking handshake that froze the main loop for up to ~300 ms here.
+        icd_start_next_ir_presence();
 
         uint8_t p[21];
         icd_fill_cbit(p);

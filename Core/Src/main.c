@@ -195,6 +195,8 @@ int Apply_IR_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value)
 int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value);
 int Initialize_IR_Camera(uint8_t camera_num);
 int ir_camera_handshake(uint8_t camera_num);
+int IR_PresenceProbe_Start(uint8_t camera_num);
+int IR_PresenceProbe_Poll(void);
 bool Validate_IR_Parameter(uint16_t param_id, uint16_t value);
 bool Validate_EO_Parameter(uint16_t param_id, uint16_t value);
 uint8_t ComputeChecksum(uint8_t* message_buffer, uint32_t length);
@@ -1187,6 +1189,11 @@ bool Validate_IR_Parameter(uint16_t param_id, uint16_t value) {
         case PARAM_ID_IR_NUC_TRIGGER:    return value == 3u || value == 4u;
         case PARAM_ID_IR_IMAGE_FLIP:     return value <= 3u;
         case PARAM_ID_IR_FRAME_RATE:     return value <= 8u;
+        // ICD document states RangeMax=4096 for both of these, but the field
+        // is a 12-bit-scale camera register value where 4095 (0xFFF) is the
+        // true maximum on hardware - kept at 4095 intentionally, not changed
+        // to match the document. See the maintenance defaults/options
+        // workbook for the documented discrepancy.
         case PARAM_ID_IR_ICE_GAIN_BIAS:  return value <= 4095u;
         case PARAM_ID_IR_ICE_LEVEL_BIAS: return value <= 4095u;
         case PARAM_ID_IR_ICE_STRENGTH:   return value <= 7u;
@@ -1202,11 +1209,17 @@ bool Validate_IR_Parameter(uint16_t param_id, uint16_t value) {
 bool Validate_EO_Parameter(uint16_t param_id, uint16_t value) {
     switch(param_id) {
         case PARAM_ID_EO_POWER_RESET:    return value <= 1u;
-        case PARAM_ID_EO_D_ZOOM:         return value <= 11u;
-        case PARAM_ID_EO_WHITE_BALANCE:  return value <= 5u;
-        case PARAM_ID_EO_RED_GAIN:       return value <= 20u;
-        case PARAM_ID_EO_BLUE_GAIN:      return value <= 20u;
-        case PARAM_ID_EO_CHROMA_GAIN:    return value <= 20u;
+        // ICD RangeMax=50: 0-5 zoom-level presets, 6-11 digital-zoom motion
+        // commands, and a documented (but illegibly encoded in the source ICD
+        // spreadsheet) "Digital Zoom Direct" position sub-range up to 50 that
+        // is not otherwise implemented - values 12-49 pass validation here but
+        // still correctly fail at apply time (apply_eo_param_single's D-Zoom
+        // switch has no case for them) until that sub-encoding is clarified.
+        case PARAM_ID_EO_D_ZOOM:         return value <= 50u;
+        case PARAM_ID_EO_WHITE_BALANCE:  return value <= 6u;
+        case PARAM_ID_EO_RED_GAIN:       return value <= 14u;
+        case PARAM_ID_EO_BLUE_GAIN:      return value <= 14u;
+        case PARAM_ID_EO_CHROMA_GAIN:    return value <= 14u;
         case PARAM_ID_EO_AGC:            return value <= 10u;
         case PARAM_ID_EO_AE_SHUTTER:     return value <= 21u;
         case PARAM_ID_EO_BRIGHTNESS:     return value <= 20u;
@@ -1216,9 +1229,9 @@ bool Validate_EO_Parameter(uint16_t param_id, uint16_t value) {
         case PARAM_ID_EO_DEFOG:          return (value <= 1u) || (value >= 100u && value <= 111u);
         case PARAM_ID_EO_DNR:            return value <= 4u;
         case PARAM_ID_EO_GAMMA:          return value <= 6u;
-        case PARAM_ID_EO_SHARPNESS:      return value <= 20u;
+        case PARAM_ID_EO_SHARPNESS:      return value <= 10u;
         case PARAM_ID_EO_MIRROR:         return value <= 2u;
-        case PARAM_ID_EO_IMAGE_FLIP:     return value <= 1u;
+        case PARAM_ID_EO_IMAGE_FLIP:     return value <= 2u;
         case PARAM_ID_EO_TRIGGER_MODE:   return value <= 1u;
         case PARAM_ID_EO_TRIG_IN_POLARITY: return value <= 1u;
         case PARAM_ID_EO_STROBE_POLARITY:  return value <= 1u;
@@ -1927,13 +1940,19 @@ static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
                 default: return RET_ERR_TX;
             }
         case PARAM_ID_EO_WHITE_BALANCE:
+            // ICD: 0=Off, 1=Auto, 2=One Push AWB, 3=3700K Manual, 4=5100K
+            // Manual, 5=8000K Manual, 6=One Push AWB Trigger. VISCA white
+            // balance has no documented distinct "disabled" mode, so 0=Off is
+            // treated as a no-op (leave as-is), matching the same N/A
+            // convention this ICD already uses for Mirror/Flip/BLC.
+            if (value == 0u) return RET_OK;
             switch (value) {
-                case 0u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x00u);
-                case 1u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x03u);
-                case 2u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x01u);
-                case 3u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x02u);
-                case 4u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x05u);
-                case 5u: return day_send_visca_simple(camera_num, 0x04u, 0x10u, 0x05u);
+                case 1u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x00u); // Auto
+                case 2u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x03u); // One Push AWB
+                case 3u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x01u); // 3700K Manual
+                case 4u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x02u); // 5100K Manual
+                case 5u: return day_send_visca_simple(camera_num, 0x04u, 0x35u, 0x05u); // 8000K Manual
+                case 6u: return day_send_visca_simple(camera_num, 0x04u, 0x10u, 0x05u); // One Push AWB Trigger
                 default: return RET_ERR_TX;
             }
         case PARAM_ID_EO_RED_GAIN:
@@ -1961,8 +1980,11 @@ static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
             if (value == 0u) return RET_OK;
             return day_send_visca_simple(camera_num, 0x04u, 0x33u, (value == 1u) ? 0x02u : 0x03u);
         case PARAM_ID_EO_HLC:
+            // ICD: 0=On, 1=Off - opposite of this VISCA register's own 0/1
+            // sense, so invert before forwarding to preserve the camera-level
+            // command that was already being sent for each logical state.
             if (value == 0u || value == 1u) {
-                return day_send_visca_u8(camera_num, 0x04u, 0x32u, (uint8_t)value);
+                return day_send_visca_u8(camera_num, 0x04u, 0x32u, (uint8_t)(value == 0u ? 1u : 0u));
             }
             if (value >= 100u && value <= 120u) {
                 return day_send_visca_sub_u16(camera_num, 0x04u, 0x32u, 0x10u, (uint16_t)(value - 100u));
@@ -1972,16 +1994,19 @@ static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
             }
             return RET_ERR_TX;
         case PARAM_ID_EO_ACE:
+            // ICD: 0=On, 1=Off - flip which wire value triggers VISCA's
+            // 0x02 (On)/0x03 (Off) so the camera-level command is unchanged.
             if (value == 0u || value == 1u) {
-                return day_send_visca_simple(camera_num, 0x04u, 0x1Au, (value != 0u) ? 0x02u : 0x03u);
+                return day_send_visca_simple(camera_num, 0x04u, 0x1Au, (value == 0u) ? 0x02u : 0x03u);
             }
             if (value >= 100u && value <= 111u) {
                 return day_send_visca_sub_u8(camera_num, 0x04u, 0x1Au, 0x10u, (uint8_t)(value - 100u));
             }
             return RET_ERR_TX;
         case PARAM_ID_EO_DEFOG:
+            // ICD: 0=On, 1=Off - same polarity fix as ACE above.
             if (value == 0u || value == 1u) {
-                return day_send_visca_simple(camera_num, 0x04u, 0x65u, (value != 0u) ? 0x02u : 0x03u);
+                return day_send_visca_simple(camera_num, 0x04u, 0x65u, (value == 0u) ? 0x02u : 0x03u);
             }
             if (value >= 100u && value <= 111u) {
                 return day_send_visca_sub_u8(camera_num, 0x04u, 0x65u, 0x10u, (uint8_t)(value - 100u));
@@ -1998,7 +2023,10 @@ static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
             if (value == 0u) return RET_OK;
             return day_send_visca_simple(camera_num, 0x04u, 0x61u, (value == 1u) ? 0x02u : 0x03u);
         case PARAM_ID_EO_IMAGE_FLIP:
-            return day_send_visca_simple(camera_num, 0x04u, 0x66u, (value != 0u) ? 0x02u : 0x03u);
+            // ICD encoding: 0=N/A (no-op, leave as-is), 1=On, 2=Off - same
+            // 3-state pattern as Mirror above.
+            if (value == 0u) return RET_OK;
+            return day_send_visca_simple(camera_num, 0x04u, 0x66u, (value == 1u) ? 0x02u : 0x03u);
         case PARAM_ID_EO_TRIGGER_MODE:
         case PARAM_ID_EO_TRIG_IN_POLARITY:
         case PARAM_ID_EO_STROBE_POLARITY:
@@ -2314,6 +2342,34 @@ int Initialize_IR_Camera(uint8_t camera_num) {
 // valid ACK (0x02) or text (0x00) reply. Performs NO FactoryResetNV and NO NV
 // reconfiguration, so it is safe to call periodically (status checks) without
 // disturbing a running camera.
+// Parse the currently-buffered IR RX reply and decide whether it indicates a
+// present, responsive camera (a valid 0x02 ACK or 0x00 text message with a
+// correct checksum). Shared by both the blocking handshake and the
+// non-blocking background probe so their acceptance criteria stay identical.
+static bool ir_reply_indicates_present(void)
+{
+    uint16_t current_pos = 0;
+    bool present = false;
+    while (current_pos < ir_camera_received_bytes) {
+        if (ir_camera_rx_buffer[current_pos] == 0x01) {
+            if (current_pos + 3 < ir_camera_received_bytes) {
+                uint8_t message_id = ir_camera_rx_buffer[current_pos + 1];
+                uint8_t param_len  = ir_camera_rx_buffer[current_pos + 2];
+                uint32_t total_msg_len = 4u + param_len;
+                if (current_pos + total_msg_len <= ir_camera_received_bytes) {
+                    uint8_t* msg_ptr = &ir_camera_rx_buffer[current_pos];
+                    if (msg_ptr[total_msg_len - 1] == ComputeChecksum(msg_ptr, total_msg_len - 1)) {
+                        if (message_id == 0x02) { present = true; break; }
+                        else if (message_id == 0x00) { present = true; }
+                    }
+                }
+            }
+        }
+        current_pos++;
+    }
+    return present;
+}
+
 int ir_camera_handshake(uint8_t camera_num)
 {
     if (camera_num > 5u) return RET_ERR_TX;
@@ -2336,24 +2392,7 @@ int ir_camera_handshake(uint8_t camera_num)
 
     bool handshake_success = false;
     if (ir_camera_data_received_flag) {
-        uint16_t current_pos = 0;
-        while (current_pos < ir_camera_received_bytes) {
-            if (ir_camera_rx_buffer[current_pos] == 0x01) {
-                if (current_pos + 3 < ir_camera_received_bytes) {
-                    uint8_t message_id = ir_camera_rx_buffer[current_pos + 1];
-                    uint8_t param_len  = ir_camera_rx_buffer[current_pos + 2];
-                    uint32_t total_msg_len = 4u + param_len;
-                    if (current_pos + total_msg_len <= ir_camera_received_bytes) {
-                        uint8_t* msg_ptr = &ir_camera_rx_buffer[current_pos];
-                        if (msg_ptr[total_msg_len - 1] == ComputeChecksum(msg_ptr, total_msg_len - 1)) {
-                            if (message_id == 0x02) { handshake_success = true; break; }
-                            else if (message_id == 0x00) { handshake_success = true; }
-                        }
-                    }
-                }
-            }
-            current_pos++;
-        }
+        handshake_success = ir_reply_indicates_present();
         ir_camera_data_received_flag = false;
     }
 
@@ -2361,19 +2400,132 @@ int ir_camera_handshake(uint8_t camera_num)
     return handshake_success ? RET_OK : RET_ERR_TX;
 }
 
+// ---------------------------------------------------------------------------
+// Non-blocking IR presence probe (background CBIT health sweep)
+//
+// The blocking ir_camera_handshake() above freezes the ENTIRE main loop for
+// its mux settle (HAL_Delay(50)) plus up to a 250 ms reply wait. Running that
+// every CBIT (1 Hz, round-robin one camera per second) via icd_service_periodic
+// meant UI command handling and the 10 Hz PIPA_RITA_STATUS cadence stalled for
+// up to ~300 ms once per second - the root cause of "command response time goes
+// huge after the board has been running a while": a UI command arriving during
+// that window sits unprocessed in the RX ring for the whole freeze.
+//
+// This state machine performs the IDENTICAL probe (same mux select, same 60 ms
+// total settle, same 0x07 ping, same 250 ms reply window, same accept criteria)
+// but spreads it across main-loop iterations so no single iteration blocks more
+// than the ~1 ms ping transmit. Because it is non-blocking, the settle and wait
+// windows cost no main-loop latency and are kept generous to preserve detection
+// reliability exactly.
+//
+// It shares the IR mux + UART1 with normal camera commands, which also run in
+// the main loop between polls. If an intervening command re-points the mux, the
+// probe ABORTS (leaving presence unchanged) rather than risk misreading another
+// camera's traffic - so a command can never cause a present camera to be
+// reported absent.
+// ---------------------------------------------------------------------------
+typedef enum {
+    IR_PROBE_IDLE = 0,
+    IR_PROBE_SETTLE,   // mux pointed, waiting out the settle window before ping
+    IR_PROBE_WAIT      // ping sent, waiting for a reply (or timeout)
+} IrProbePhase;
+
+#define IR_PROBE_SETTLE_MS  60u    // matches old select(10ms)+HAL_Delay(50ms)
+#define IR_PROBE_WAIT_MS    250u   // matches old blocking reply window
+
+static IrProbePhase s_ir_probe_phase = IR_PROBE_IDLE;
+static uint8_t      s_ir_probe_cam   = 0u;
+static uint32_t     s_ir_probe_deadline_ms = 0u;
+
+// Begin a probe for one camera. Non-blocking: points the IR mux and starts the
+// settle timer, then returns immediately. Returns 0 (RET_OK) if started.
+int IR_PresenceProbe_Start(uint8_t camera_num)
+{
+    if (camera_num > 5u) return RET_ERR_TX;
+    if (s_ir_probe_phase != IR_PROBE_IDLE) return RET_ERR_TX;
+
+    // Point the mux directly (skipping select_ir_camera()'s own HAL_Delay(10)
+    // and debug print); the settle window below covers the switch time.
+    current_ir_camera = camera_num;
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, (camera_num & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, (camera_num & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, (camera_num & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+    s_ir_probe_cam = camera_num;
+    s_ir_probe_deadline_ms = HAL_GetTick() + IR_PROBE_SETTLE_MS;
+    s_ir_probe_phase = IR_PROBE_SETTLE;
+    return RET_OK;
+}
+
+// Advance the probe. Non-blocking; safe to call many times per main-loop
+// iteration. Returns: -1 idle, 0 in progress, 1 completed-present,
+// 2 completed-absent, 3 aborted (mux disturbed; presence left unchanged).
+int IR_PresenceProbe_Poll(void)
+{
+    if (s_ir_probe_phase == IR_PROBE_IDLE) {
+        return -1;
+    }
+
+    // If an intervening IR command re-pointed the mux, our probe context is no
+    // longer valid - abort without touching presence.
+    if (current_ir_camera != s_ir_probe_cam) {
+        s_ir_probe_phase = IR_PROBE_IDLE;
+        return 3;
+    }
+
+    if (s_ir_probe_phase == IR_PROBE_SETTLE) {
+        if ((int32_t)(HAL_GetTick() - s_ir_probe_deadline_ms) < 0) {
+            return 0;  // still settling
+        }
+        IR_ArmRx();
+        if (Send_IR_Camera_Command(0x07, NULL, 0) != RET_OK) {
+            s_ir_camera_present[s_ir_probe_cam] = false;
+            s_ir_probe_phase = IR_PROBE_IDLE;
+            return 2;  // ping TX failed -> treat as absent, same as blocking path
+        }
+        s_ir_probe_deadline_ms = HAL_GetTick() + IR_PROBE_WAIT_MS;
+        s_ir_probe_phase = IR_PROBE_WAIT;
+        return 0;
+    }
+
+    // IR_PROBE_WAIT
+    if (ir_camera_data_received_flag) {
+        bool present = ir_reply_indicates_present();
+        ir_camera_data_received_flag = false;
+        s_ir_camera_present[s_ir_probe_cam] = present;
+        s_ir_probe_phase = IR_PROBE_IDLE;
+        return present ? 1 : 2;
+    }
+    if ((int32_t)(HAL_GetTick() - s_ir_probe_deadline_ms) >= 0) {
+        s_ir_camera_present[s_ir_probe_cam] = false;
+        s_ir_probe_phase = IR_PROBE_IDLE;
+        return 2;  // no reply within the window -> absent
+    }
+    return 0;  // still waiting
+}
+
 
 
 void Read_HDC3022_Sensor(float* temp, float* hum) {
     uint8_t sensor_data_buffer[6];
     uint8_t trigger_cmd[] = {0x24, 0x00};
-    if (HAL_I2C_Master_Transmit(&hi2c2, (0x44 << 1), trigger_cmd, 2, 1000) != HAL_OK) {
+    // This runs on the main loop's hot path (icd_service_periodic(), called
+    // from mcu_on_imu_drdy() every DRDY event) once per CBIT interval (~1s),
+    // via icd_update_env_sample(). The previous 1000ms HAL timeout on EACH of
+    // these two calls meant a single bus glitch or unresponsive sensor could
+    // block the whole main loop - IMU processing, UART3 command handling,
+    // and PIPA_RITA_STATUS's 100ms cadence - for up to ~2 seconds, once per
+    // CBIT interval. A healthy transaction of this size completes in well
+    // under 1ms, so a short timeout still gives huge headroom on the happy
+    // path while making a failure fail fast instead of stalling everything.
+    if (HAL_I2C_Master_Transmit(&hi2c2, (0x44 << 1), trigger_cmd, 2, 20) != HAL_OK) {
         Send_UART3_Debug("I2C Transmit Error\r\n");
         *temp = -999.0f;
         *hum = -999.0f;
         return;
     }
     HAL_Delay(20);
-    if (HAL_I2C_Master_Receive(&hi2c2, (0x44 << 1), sensor_data_buffer, 6, 1000) != HAL_OK) {
+    if (HAL_I2C_Master_Receive(&hi2c2, (0x44 << 1), sensor_data_buffer, 6, 20) != HAL_OK) {
         Send_UART3_Debug("I2C Receive Error\r\n");
         *temp = -999.0f;
         *hum = -999.0f;
