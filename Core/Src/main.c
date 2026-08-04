@@ -186,6 +186,8 @@ int send_visca_command(uint8_t* cmd, uint8_t cmd_len, int parse_version);
 int wait_for_visca_ack_and_completion(uint32_t timeout_ms, int parse_version);
 void parse_and_print_version_response(uint8_t* data, uint8_t len);
 int test_day_camera_controls(uint8_t camera_num);
+int EO_PresenceProbe_Start(uint8_t camera_num);
+int EO_PresenceProbe_Poll(void);
 
 // IR Camera Functions
 void select_ir_camera(uint8_t camera_num);
@@ -217,6 +219,9 @@ volatile uint8_t visca_rx_idx = 0;
 volatile uint8_t visca_rx_ready = 0;
 uint8_t visca_rx_byte;
 uint8_t current_day_camera = 0;  // Currently selected day camera (0-5)
+static uint8_t s_eo_probe_cam = 0xFFu;      // 0xFF = no non-blocking EO probe active
+static uint8_t s_eo_probe_mux_cam = 0xFFu;
+static uint32_t s_eo_probe_start_ms = 0u;
 
 // IR camera variables
 volatile bool ir_camera_data_received_flag = false;
@@ -964,7 +969,15 @@ int send_imu_command(uint8_t *tx_packet, uint32_t tx_size,
 
 
 // ===================== DAY CAMERA (VISCA) FUNCTIONS =====================
-void select_day_camera(uint8_t camera_num) {
+static void eo_presence_probe_abort(void)
+{
+    s_eo_probe_cam = 0xFFu;
+    s_eo_probe_mux_cam = 0xFFu;
+    s_eo_probe_start_ms = 0u;
+}
+
+static void day_set_mux(uint8_t camera_num, bool log_select)
+{
     if (camera_num > 5) camera_num = 5;
     if (current_day_camera == camera_num) {
         return;
@@ -977,7 +990,37 @@ void select_day_camera(uint8_t camera_num) {
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, (camera_num & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);  // C
 
     HAL_Delay(10);
-    Send_UART3_Debug("Selected day camera %d\r\n", camera_num);
+    if (log_select) {
+        Send_UART3_Debug("Selected day camera %d\r\n", camera_num);
+    }
+}
+
+void select_day_camera(uint8_t camera_num) {
+    day_set_mux(camera_num, true);
+}
+
+static bool day_visca_has_version_response(const uint8_t* data, uint8_t len)
+{
+    uint8_t start = 0u;
+    while (start < len) {
+        uint8_t end = start;
+        while (end < len && data[end] != 0xFFu) {
+            end++;
+        }
+
+        if (end >= len) {
+            break;
+        }
+
+        if ((end - start + 1u) >= 7u &&
+            data[start] == 0x90u &&
+            data[start + 1u] == 0x50u) {
+            return true;
+        }
+
+        start = (uint8_t)(end + 1u);
+    }
+    return false;
 }
 
 void parse_and_print_version_response(uint8_t* data, uint8_t len) {
@@ -1037,30 +1080,16 @@ int wait_for_visca_ack_and_completion(uint32_t timeout_ms, int parse_version)
 
     if (parse_version) {
         uint32_t version_wait_start = HAL_GetTick();
+        bool saw_version = day_visca_has_version_response(visca_rx_buffer, visca_rx_idx);
         while ((HAL_GetTick() - version_wait_start) < 300u) {
-            bool saw_version = false;
-            uint8_t i = 0u;
-            while (i + 6u < visca_rx_idx) {
-                uint8_t end = i;
-                while (end < visca_rx_idx && visca_rx_buffer[end] != 0xFFu) {
-                    end++;
-                }
-                if (end < visca_rx_idx) {
-                    if ((end - i + 1u) >= 7u &&
-                        visca_rx_buffer[i] == 0x90u &&
-                        visca_rx_buffer[i + 1u] == 0x50u) {
-                        saw_version = true;
-                        break;
-                    }
-                    i = (uint8_t)(end + 1u);
-                } else {
-                    break;
-                }
-            }
+            saw_version = day_visca_has_version_response(visca_rx_buffer, visca_rx_idx);
             if (saw_version) break;
             HAL_Delay(1);
         }
         parse_and_print_version_response(visca_rx_buffer, visca_rx_idx);
+        if (!saw_version) {
+            return RET_ERR_RX;
+        }
     }
 
 //    Send_UART3_Debug("ACK Received! \r\n");
@@ -1073,6 +1102,7 @@ int send_visca_command(uint8_t* cmd, uint8_t cmd_len, int parse_version)
 {
     if (cmd == NULL || cmd_len == 0) return RET_ERR_TX;
 
+    eo_presence_probe_abort();
     visca_rx_idx = 0;
     visca_rx_ready = 0;
     memset(visca_rx_buffer, 0, sizeof(visca_rx_buffer));
@@ -1132,6 +1162,67 @@ int test_day_camera_controls(uint8_t camera_num)
     Send_UART3_Debug("CAMERA %d OK!! \r\n\n", camera_num);
     return RET_OK;
 
+}
+
+int EO_PresenceProbe_Start(uint8_t camera_num)
+{
+    static uint8_t visca_version_inquiry[] = { 0x81u, 0x09u, 0x00u, 0x02u, 0xFFu };
+
+    if (camera_num >= 6u || s_eo_probe_cam != 0xFFu) {
+        return RET_ERR_TX;
+    }
+
+    day_set_mux(camera_num, false);
+    visca_rx_idx = 0u;
+    visca_rx_ready = 0u;
+    memset(visca_rx_buffer, 0, sizeof(visca_rx_buffer));
+
+    HAL_StatusTypeDef rxst = HAL_UART_Receive_IT(&huart2, &visca_rx_byte, 1);
+    if (rxst != HAL_OK && rxst != HAL_BUSY) {
+        (void)HAL_UART_AbortReceive_IT(&huart2);
+        rxst = HAL_UART_Receive_IT(&huart2, &visca_rx_byte, 1);
+        if (rxst != HAL_OK && rxst != HAL_BUSY) {
+            eo_presence_probe_abort();
+            return RET_ERR_RX;
+        }
+    }
+
+    if (HAL_UART_Transmit(&huart2,
+                          (uint8_t*)visca_version_inquiry,
+                          (uint16_t)sizeof(visca_version_inquiry),
+                          20u) != HAL_OK) {
+        eo_presence_probe_abort();
+        return RET_ERR_TX;
+    }
+
+    s_eo_probe_cam = camera_num;
+    s_eo_probe_mux_cam = current_day_camera;
+    s_eo_probe_start_ms = HAL_GetTick();
+    return RET_OK;
+}
+
+int EO_PresenceProbe_Poll(void)
+{
+    if (s_eo_probe_cam == 0xFFu) {
+        return -1;
+    }
+
+    if (current_day_camera != s_eo_probe_mux_cam) {
+        eo_presence_probe_abort();
+        return 3;  // aborted: mux disturbed by another EO command
+    }
+
+    if (day_visca_has_version_response(visca_rx_buffer, visca_rx_idx)) {
+        eo_presence_probe_abort();
+        return 1;  // present
+    }
+
+    if ((uint32_t)(HAL_GetTick() - s_eo_probe_start_ms) >= 350u) {
+        eo_presence_probe_abort();
+        return 2;  // absent / no valid version response
+    }
+
+    return 0;      // still in progress
 }
 
 

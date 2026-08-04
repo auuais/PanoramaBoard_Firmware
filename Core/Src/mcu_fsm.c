@@ -44,6 +44,8 @@ extern int send_imu_command_ex(uint8_t *tx_packet, uint32_t tx_size, uint32_t rx
 extern void Read_HDC3022_Sensor(float* temp, float* hum);
 extern void Send_UART3_Debug(const char *format, ...);
 extern int test_day_camera_controls(uint8_t camera_num);
+extern int EO_PresenceProbe_Start(uint8_t camera_num); // 0=started (non-blocking)
+extern int EO_PresenceProbe_Poll(void);  // -1 idle, 0 busy, 1 present, 2 absent, 3 aborted
 extern int Initialize_IR_Camera(uint8_t camera_num);
 extern int ir_camera_handshake(uint8_t camera_num);
 extern int IR_PresenceProbe_Start(uint8_t camera_num); // 0=started (non-blocking)
@@ -164,6 +166,9 @@ static const uint32_t ICD_CBIT_INTERVAL_MS = 1000u;
 static const uint32_t ICD_STATUS_INTERVAL_MS = 100u;
 static const uint32_t ICD_NUC_STATUS_HOLD_MS = 1500u;
 static uint8_t s_day_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
+static uint8_t s_day_bit_ok[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
+static uint8_t s_day_cbit_next_idx = 0u;
+static uint8_t s_day_probe_inflight_cam = 0xFFu; // 0xFF = no background probe running
 static uint8_t s_ir_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
 static uint8_t s_ir_bit_ok[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
 static uint8_t s_ir_cbit_next_idx = 0u;
@@ -1117,6 +1122,9 @@ void mcu_fsm_init(McuContext *ctx)
     s_icd_seq_panorama_ack = 1u;
     s_icd_seq_maintenance_ack = 1u;
     s_icd_seq_default = 1u;
+    memset(s_day_bit_ok, 0, sizeof(s_day_bit_ok));
+    s_day_cbit_next_idx = 0u;
+    s_day_probe_inflight_cam = 0xFFu;
     memset(s_ir_nuc_status_until_ms, 0, sizeof(s_ir_nuc_status_until_ms));
     s_icd_video_brightness = 0u;
     s_icd_video_contrast = 0u;
@@ -1311,12 +1319,15 @@ void mcu_fsm_step(McuContext *ctx)
             HAL_Delay(20);
             int r = test_day_camera_controls(ctx->day_idx);   // change it to return status if it doesn?�t
             uint8_t ok = (r == 0) ? 1 : 0;
+            s_day_bit_ok[ctx->day_idx] = ok;
             ui_send_init_ack(ctx->init_seq,NODE_DAY, ctx->day_idx, ok, ok ? ERR_OK : ERR_FAIL);
             // Default Shutter Speed (CAM_Shutter, step 10 = "X2" digital slow
             // shutter, one step brighter than baseline 1/30 at step 11) at
             // boot. Unlike Brightness/ExpComp, Shutter Speed stays directly
             // settable even in MANUAL/External Trigger mode.
-            (void)Apply_EO_Camera_Param((uint8_t)(ctx->day_idx + 1u), PARAM_ID_EO_AE_SHUTTER, 10u);
+            if (ok) {
+                (void)Apply_EO_Camera_Param((uint8_t)(ctx->day_idx + 1u), PARAM_ID_EO_AE_SHUTTER, 10u);
+            }
             ctx->day_idx++;
         } else {
             ctx->ir_idx = 0;
@@ -2039,6 +2050,7 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
             if (id >= 6) { err = ERR_BADARG; break; }
             // Non-destructive VISCA version inquiry (no re-init).
             ok = (test_day_camera_controls(id) == 0) ? 1 : 0;
+            s_day_bit_ok[id] = (s_day_power_on[id] && ok) ? 1u : 0u;
             err = ok ? ERR_OK : ERR_FAIL;
             break;
 
@@ -2046,6 +2058,7 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
             if (id >= 6) { err = ERR_BADARG; break; }
             // Safe: handshake ping only (was: full Initialize_IR_Camera re-init).
             ok = (ir_camera_handshake(id) == 0) ? 1 : 0;
+            s_ir_bit_ok[id] = (s_ir_power_on[id] && ok) ? 1u : 0u;
             err = ok ? ERR_OK : ERR_FAIL;
             break;
 
@@ -2703,9 +2716,74 @@ static void icd_send_maintenance_camera_burst(uint32_t seq)
     }
 }
 
-static uint8_t icd_status_from_power(uint8_t on)
+static uint8_t icd_refresh_eo_presence(uint8_t cam_idx)
 {
-    return on ? 1u : 2u;
+    if (cam_idx >= 6u) {
+        return 0u;
+    }
+
+    if (!s_day_power_on[cam_idx]) {
+        s_day_bit_ok[cam_idx] = 0u;
+        return 0u;
+    }
+
+    s_day_bit_ok[cam_idx] = (test_day_camera_controls(cam_idx) == 0) ? 1u : 0u;
+    return s_day_bit_ok[cam_idx];
+}
+
+static void icd_refresh_all_eo_presence(void)
+{
+    for (uint8_t i = 0u; i < 6u; ++i) {
+        (void)icd_refresh_eo_presence(i);
+    }
+}
+
+static void icd_service_eo_presence_probe(void)
+{
+    if (s_day_probe_inflight_cam == 0xFFu) {
+        return;
+    }
+
+    int r = EO_PresenceProbe_Poll();
+    switch (r) {
+        case 1: // completed - present
+            s_day_bit_ok[s_day_probe_inflight_cam] = 1u;
+            s_day_probe_inflight_cam = 0xFFu;
+            break;
+        case 2: // completed - absent
+            s_day_bit_ok[s_day_probe_inflight_cam] = 0u;
+            s_day_probe_inflight_cam = 0xFFu;
+            break;
+        case 3:  // aborted (mux disturbed by a command): leave bit_ok, retry later
+        case -1: // probe unexpectedly idle: stop tracking
+            s_day_probe_inflight_cam = 0xFFu;
+            break;
+        default: // 0: still in progress
+            break;
+    }
+}
+
+static void icd_start_next_eo_presence(void)
+{
+    if (s_day_probe_inflight_cam != 0xFFu) {
+        return;
+    }
+
+    uint8_t cam = s_day_cbit_next_idx;
+    s_day_cbit_next_idx = (uint8_t)((s_day_cbit_next_idx + 1u) % 6u);
+
+    if (!s_day_power_on[cam]) {
+        s_day_bit_ok[cam] = 0u;
+        return;
+    }
+    if (EO_PresenceProbe_Start(cam) == 0) {
+        s_day_probe_inflight_cam = cam;
+    }
+}
+
+static uint8_t icd_day_status_from_presence(uint8_t cam_idx)
+{
+    return (cam_idx < 6u && s_day_power_on[cam_idx] && s_day_bit_ok[cam_idx]) ? 1u : 2u;
 }
 
 static uint8_t icd_refresh_ir_presence(uint8_t cam_idx)
@@ -2913,7 +2991,7 @@ static void icd_fill_status(uint8_t p[ICD_STATUS_LEN])
     p[0] = s_icd_operation_mode;
     uint32_t now = HAL_GetTick();
     for (uint8_t i = 0u; i < 6u; ++i) {
-        p[1u + i] = icd_status_from_power(s_day_power_on[i]);
+        p[1u + i] = icd_day_status_from_presence(i);
         p[7u + i] = icd_ir_status_from_power_or_nuc(i, now);
     }
     p[13] = icd_video_select_from_mode(s_cfg_store.mode);
@@ -3001,6 +3079,7 @@ static void icd_fill_pbit(uint8_t *p, uint32_t len)
     memset(p, 0, len);
     if (len < 23u) return;
 
+    icd_refresh_all_eo_presence();
     icd_refresh_all_ir_presence();
 
     p[0] = FW_VERSION_MAJOR;
@@ -3011,7 +3090,7 @@ static void icd_fill_pbit(uint8_t *p, uint32_t len)
     p[5] = 0u;
     for (uint8_t i = 0u; i < 6u; ++i) {
         p[6u + i] = icd_ok_code(s_ir_power_on[i] && s_ir_bit_ok[i]);
-        p[12u + i] = icd_ok_code(s_day_power_on[i]);
+        p[12u + i] = icd_ok_code(s_day_power_on[i] && s_day_bit_ok[i]);
     }
     p[18] = icd_ok_code(fpga_status_ok() ? 1u : 0u);
     p[19] = 0u;
@@ -3034,7 +3113,7 @@ static void icd_fill_cbit(uint8_t p[21])
     p[0] = 0u;
     for (uint8_t i = 0u; i < 6u; ++i) {
         p[1u + i] = icd_ok_code(s_ir_power_on[i] && s_ir_bit_ok[i]);
-        p[7u + i] = icd_ok_code(s_day_power_on[i]);
+        p[7u + i] = icd_ok_code(s_day_power_on[i] && s_day_bit_ok[i]);
     }
     p[13] = icd_ok_code(imu_status_ok() ? 1u : 0u);
     p[14] = icd_clamp_u8_from_float(s_imu_temp_c, 0.0f, 85.0f);
@@ -3077,16 +3156,18 @@ static void icd_service_periodic(McuContext *ctx)
         return;
     }
 
-    // Advance any in-flight background IR presence probe (non-blocking). This
-    // runs on every service call so the probe progresses smoothly across
+    // Advance any in-flight background EO/IR presence probe (non-blocking).
+    // This runs on every service call so probes progress smoothly across
     // iterations rather than blocking the main loop.
+    icd_service_eo_presence_probe();
     icd_service_ir_presence_probe();
 
     uint32_t now = HAL_GetTick();
     if ((uint32_t)(now - s_icd_last_cbit_ms) >= ICD_CBIT_INTERVAL_MS) {
         s_icd_last_cbit_ms = now;
-        // Kick the next round-robin presence probe (non-blocking) instead of the
-        // old blocking handshake that froze the main loop for up to ~300 ms here.
+        // Kick the next round-robin presence probes (non-blocking) instead of
+        // blocking per-second handshakes that freeze the main loop.
+        icd_start_next_eo_presence();
         icd_start_next_ir_presence();
 
         uint8_t p[21];
@@ -3115,8 +3196,12 @@ static uint8_t icd_apply_camera_power_action_single(uint8_t node,
         return ICD_CAM_ACK_FAIL;
     }
 
-    if (node == NODE_IR && !on) {
-        s_ir_bit_ok[cam_idx] = 0u;
+    if (!on) {
+        if (node == NODE_DAY) {
+            s_day_bit_ok[cam_idx] = 0u;
+        } else if (node == NODE_IR) {
+            s_ir_bit_ok[cam_idx] = 0u;
+        }
     }
 
     return on ? ICD_CAM_ACK_POWER_ON_OK : ICD_CAM_ACK_POWER_OFF_OK;
