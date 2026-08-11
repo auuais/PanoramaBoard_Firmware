@@ -2152,6 +2152,24 @@ static int day_set_trigger_row_absolute(uint8_t camera_num, uint8_t row, uint16_
     return day_set_menu_row_absolute(camera_num, false, row, value, min_value, max_value);
 }
 
+/* Last OSD BRIGHTNESS this firmware drove into each camera.
+ *
+ * The row cannot be read back - CAM_ExpCompPosInq is never answered by this
+ * module - and the value field wraps rather than clamping, so there is no
+ * blind key sequence that reaches a known state. The firmware therefore has to
+ * own the value and step it relatively.
+ *
+ * EO_BRIGHTNESS_SEED must match what the cameras are actually left at, since
+ * the first command after an MCU reset steps from this assumption. The bench
+ * cameras were set to 13 to agree with it. This still needs an operator-facing
+ * "resync to the actual OSD value" path before it can be trusted after anyone
+ * adjusts BRIGHTNESS by hand from the OSD. */
+#define EO_BRIGHTNESS_SEED  13u
+static uint8_t s_eo_brightness[6] = {
+    EO_BRIGHTNESS_SEED, EO_BRIGHTNESS_SEED, EO_BRIGHTNESS_SEED,
+    EO_BRIGHTNESS_SEED, EO_BRIGHTNESS_SEED, EO_BRIGHTNESS_SEED
+};
+
 /* CAM_ExpCompPosInq (manual p.30): y0 50 00 00 0p 0q FF, pq = 0..14h.
  * Writing this parameter over VISCA does nothing on this module, but reading
  * it does report the live OSD BRIGHTNESS value - which is what lets us step
@@ -2176,17 +2194,16 @@ static int day_set_brightness_osd(uint8_t camera_num, uint16_t value)
 {
     if (value > EO_BRIGHTNESS_MAX) return RET_ERR_TX;
 
-    /* Always clear any OSD left on screen first, even if we then bail out -
-     * otherwise a failed apply strands the menu over the live video. */
-    (void)day_close_menu(camera_num);
-
     uint8_t current = 0u;
-    int rc = day_get_brightness(camera_num, &current);
-    if (rc != RET_OK) return rc;
+    if (day_get_brightness(camera_num, &current) != RET_OK || current > EO_BRIGHTNESS_MAX) {
+        /* CAM_ExpCompPosInq is not answered by this module (CAM_VersionInq is),
+         * so fall back to the value we last drove in. */
+        current = s_eo_brightness[camera_num];
+    }
     if (current > EO_BRIGHTNESS_MAX) return RET_ERR_RX;
     if (current == (uint8_t)value) return RET_OK;      /* nothing to do */
 
-    rc = day_open_exposure_menu(camera_num);
+    int rc = day_open_exposure_menu(camera_num);
     if (rc != RET_OK) return rc;
 
     rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN, EO_EXPOSURE_ROW_BRIGHTNESS);
@@ -2209,8 +2226,12 @@ static int day_set_brightness_osd(uint8_t camera_num, uint16_t value)
         return rc;
     }
 
-    return day_save_current_submenu(camera_num, EO_EXPOSURE_ROW_BRIGHTNESS,
-                                    EO_MENU_EXPOSURE_ROWS);
+    rc = day_save_current_submenu(camera_num, EO_EXPOSURE_ROW_BRIGHTNESS,
+                                  EO_MENU_EXPOSURE_ROWS);
+    if (rc == RET_OK) {
+        s_eo_brightness[camera_num] = (uint8_t)value;
+    }
+    return rc;
 }
 
 static int day_apply_eo_trigger_param(uint8_t camera_num, uint16_t param_id, uint16_t value)
