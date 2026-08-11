@@ -1321,13 +1321,11 @@ void mcu_fsm_step(McuContext *ctx)
             uint8_t ok = (r == 0) ? 1 : 0;
             s_day_bit_ok[ctx->day_idx] = ok;
             ui_send_init_ack(ctx->init_seq,NODE_DAY, ctx->day_idx, ok, ok ? ERR_OK : ERR_FAIL);
-            // Default Shutter Speed (CAM_Shutter, step 10 = "X2" digital slow
-            // shutter, one step brighter than baseline 1/30 at step 11) at
-            // boot. Unlike Brightness/ExpComp, Shutter Speed stays directly
-            // settable even in MANUAL/External Trigger mode.
-            if (ok) {
-                (void)Apply_EO_Camera_Param((uint8_t)(ctx->day_idx + 1u), PARAM_ID_EO_AE_SHUTTER, 10u);
-            }
+            // No camera settings are pushed at boot. Init only probes that the
+            // camera answers; every EO/IR parameter is applied when - and only
+            // when - the operator changes it. A boot-time default silently
+            // overwrites whatever was saved in the camera and makes it look
+            // like the controls "reset themselves".
             ctx->day_idx++;
         } else {
             ctx->ir_idx = 0;

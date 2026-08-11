@@ -1920,23 +1920,11 @@ enum {
 #define EO_MENU_TRIGGER_ROWS    6u
 #define EO_MENU_EXPOSURE_ROWS   9u
 
-#define EO_EXPOSURE_ROW_MODE        1u
+/* EXPOSURE > MODE (row 1) selects AUTO / SHUT.P / MANUAL. Nothing here drives
+ * it: the AE mode is the operator's to choose from the OSD, and BRIGHTNESS is
+ * live in AUTO and SHUT.P but inert in MANUAL, so changing it behind their
+ * back would silently disable the very control we are trying to fix. */
 #define EO_EXPOSURE_ROW_BRIGHTNESS  6u
-
-/* EXPOSURE > MODE options, left to right: AUTO / SHUTTER.PRIORITY / MANUAL */
-#define EO_EXPOSURE_MODE_AUTO       0u
-#define EO_EXPOSURE_MODE_SHUTTER_P  1u
-#define EO_EXPOSURE_MODE_MANUAL     2u
-#define EO_EXPOSURE_MODE_COUNT      3u
-/* The module has no AE-mode inquiry, and MODE is [SAVE]d to flash - so after
- * an MCU restart the camera may well still be in whatever mode the previous
- * session left it in. Start "unknown" and only claim to know once we have
- * driven the row ourselves. */
-#define EO_EXPOSURE_MODE_UNKNOWN    0xFFu
-
-/* True only when we know AE is running, i.e. when CAM_ExpComp is meaningful. */
-#define EO_EXPOSURE_MODE_IS_AE(m) \
-    ((m) == EO_EXPOSURE_MODE_AUTO || (m) == EO_EXPOSURE_MODE_SHUTTER_P)
 
 /* OSD BRIGHTNESS row: 0 (dark) ~ 20 (bright), manual p.44 - the same
  * parameter CAM_ExpComp Direct (0x4E, 0~14h) writes over VISCA. */
@@ -1976,40 +1964,66 @@ static int day_menu_repeat(uint8_t camera_num, uint8_t key, uint16_t count)
     return RET_OK;
 }
 
-static int day_menu_normalize_to_top(uint8_t camera_num, uint16_t max_rows)
+/* NOTE: there is deliberately no "normalise to top by pressing UP a lot"
+ * helper any more. The OSD cursor wraps, so over-pressing UP does not clamp at
+ * the first row - it rolls round onto the button line and leaves the position
+ * dependent on where it started. A freshly opened menu already sits on row 0,
+ * which is what the row walks below rely on. */
+
+/* Main menu as it actually renders on these modules - 7 rows above
+ * [EXIT] [SAVE] [DFLT]:
+ *   0 TRIGGER, 1 EXPOSURE, 2 WHITE BAL, 3 IMAGE,
+ *   4 INTELLIGENCE, 5 SPECIAL FUNC, 6 DISPLAY
+ *
+ * The manual's example screen (p.38) also shows FOCUS above TRIGGER, but that
+ * page only exists on modules with a motorised zoom/focus lens (its own note
+ * on p.39 says so) - these units have a fixed lens, so FOCUS is absent and
+ * every row below it shifts up by one. Confirmed by capturing the OSD off the
+ * live video feed. Counting FOCUS in is what made the EXPOSURE walk land on
+ * WHITE BAL and scribble over that page instead. */
+#define EO_MENU_MAIN_ROWS       7u
+#define EO_MAIN_ROW_TRIGGER     0u
+#define EO_MAIN_ROW_EXPOSURE    1u
+
+static int day_open_main_submenu(uint8_t camera_num, uint8_t row)
 {
-    return day_menu_repeat(camera_num, EO_MENUKEY_UP, (uint16_t)(max_rows + 2u));
+    int rc = day_menu_repeat(camera_num, EO_MENUKEY_ESC, 3u);
+    if (rc != RET_OK) return rc;
+
+    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
+    if (rc != RET_OK) return rc;
+
+    /* Do NOT try to "home" the cursor by over-pressing UP first: the main-menu
+     * cursor wraps. Measured on the bench - a freshly opened menu starts on
+     * FOCUS (row 0), and an UP x10 sweep wrapped it round onto the
+     * [EXIT][SAVE][DFLT] line, so DOWN x2 then opened TRIGGER instead of
+     * EXPOSURE and the value sweep scribbled over that page's Strobe Delay.
+     * ESC x3 above guarantees the menu is closed, so MENU reopens it at row 0
+     * and a plain DOWN x row is exact. */
+    rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN, row);
+    if (rc != RET_OK) return rc;
+
+    return day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
 }
 
 static int day_open_trigger_menu(uint8_t camera_num)
 {
-    int rc = RET_OK;
-    rc = day_menu_repeat(camera_num, EO_MENUKEY_ESC, 3u);
-    if (rc != RET_OK) return rc;
-    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
-    if (rc != RET_OK) return rc;
-    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_DOWN);
-    if (rc != RET_OK) return rc;
-    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
-    return rc;
+    return day_open_main_submenu(camera_num, EO_MAIN_ROW_TRIGGER);
 }
 
 static int day_close_menu(uint8_t camera_num)
 {
-    return day_menu_repeat(camera_num, EO_MENUKEY_ESC, 2u);
+    /* Two ESCs were not enough to dismiss the OSD after a [SAVE] - the menu
+     * was observed still painted over the live video seconds later. Unwind
+     * more levels than we can possibly be nested, since a menu left on screen
+     * is an operator-visible fault, not a cosmetic one. ESC on an already
+     * closed OSD is harmless. */
+    return day_menu_repeat(camera_num, EO_MENUKEY_ESC, 5u);
 }
 
 static int day_open_exposure_menu(uint8_t camera_num)
 {
-    int rc = RET_OK;
-    rc = day_menu_repeat(camera_num, EO_MENUKEY_ESC, 3u);
-    if (rc != RET_OK) return rc;
-    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
-    if (rc != RET_OK) return rc;
-    rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN, 2u);
-    if (rc != RET_OK) return rc;
-    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
-    return rc;
+    return day_open_main_submenu(camera_num, EO_MAIN_ROW_EXPOSURE);
 }
 
 static int day_save_current_submenu(uint8_t camera_num, uint8_t row, uint8_t item_count)
@@ -2031,13 +2045,6 @@ static int day_save_current_submenu(uint8_t camera_num, uint8_t row, uint8_t ite
     return rc;
 }
 
-/* Last EXPOSURE > MODE we drove into each camera, or _UNKNOWN if this MCU
- * session has not set it yet. */
-static uint8_t s_eo_exposure_mode[6] = {
-    EO_EXPOSURE_MODE_UNKNOWN, EO_EXPOSURE_MODE_UNKNOWN, EO_EXPOSURE_MODE_UNKNOWN,
-    EO_EXPOSURE_MODE_UNKNOWN, EO_EXPOSURE_MODE_UNKNOWN, EO_EXPOSURE_MODE_UNKNOWN
-};
-
 /* Drive one OSD row to an absolute value: open the sub-menu, home the cursor,
  * step down to `row`, run the value hard against its minimum, then step up to
  * the wanted setting and [SAVE]. Absolute rather than relative, so the result
@@ -2052,12 +2059,10 @@ static int day_set_menu_row_absolute(uint8_t camera_num, bool exposure_menu,
                            : day_open_trigger_menu(camera_num);
     if (rc != RET_OK) return rc;
 
-    rc = day_menu_normalize_to_top(camera_num, n_rows);
-    if (rc != RET_OK) {
-        (void)day_close_menu(camera_num);
-        return rc;
-    }
-
+    /* The sub-menu opens with its cursor on row 0, so step down exactly `row`
+     * times. (Sweeping UP first to "home" it wraps the cursor round onto the
+     * button line instead - that is what left the walk editing DAY&NIGHT and
+     * MODE rather than BRIGHTNESS.) */
     rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN, row);
     if (rc != RET_OK) {
         (void)day_close_menu(camera_num);
@@ -2087,20 +2092,9 @@ static int day_set_trigger_row_absolute(uint8_t camera_num, uint8_t row, uint16_
     return day_set_menu_row_absolute(camera_num, false, row, value, min_value, max_value);
 }
 
-static int day_set_exposure_mode(uint8_t camera_num, uint8_t mode)
-{
-    if (camera_num >= 6u || mode >= EO_EXPOSURE_MODE_COUNT) return RET_ERR_TX;
-
-    int rc = day_set_menu_row_absolute(camera_num, true, EO_EXPOSURE_ROW_MODE,
-                                       mode, 0u, (uint16_t)(EO_EXPOSURE_MODE_COUNT - 1u));
-    if (rc == RET_OK) {
-        s_eo_exposure_mode[camera_num] = mode;
-    }
-    return rc;
-}
-
-/* EXPOSURE > BRIGHTNESS (0~20). Slower than the VISCA CAM_ExpComp pair, but
- * it is the only route that works once AE is off, and it [SAVE]s. */
+/* EXPOSURE > BRIGHTNESS (0~20). Last-resort only: walking the OSD paints the
+ * menu over the operator's live video, so this runs solely when the camera has
+ * explicitly refused the VISCA CAM_ExpComp pair. */
 static int day_set_brightness_osd(uint8_t camera_num, uint16_t value)
 {
     if (value > EO_BRIGHTNESS_MAX) return RET_ERR_TX;
@@ -2108,19 +2102,14 @@ static int day_set_brightness_osd(uint8_t camera_num, uint16_t value)
                                      value, 0u, EO_BRIGHTNESS_MAX);
 }
 
-static int day_ensure_exposure_manual(uint8_t camera_num)
-{
-    if (camera_num < 6u && s_eo_exposure_mode[camera_num] == EO_EXPOSURE_MODE_MANUAL) {
-        return RET_OK;
-    }
-    return day_set_exposure_mode(camera_num, EO_EXPOSURE_MODE_MANUAL);
-}
-
 static int day_apply_eo_trigger_param(uint8_t camera_num, uint16_t param_id, uint16_t value)
 {
-    int rc = day_ensure_exposure_manual(camera_num);
-    if (rc != RET_OK) return rc;
-
+    /* The TRIGGER menu is only meaningful with EXPOSURE > MODE = MANUAL
+     * (manual p.39), but we deliberately do NOT switch the camera there
+     * ourselves: changing an AE mode the operator did not ask for is exactly
+     * the kind of unrequested side effect that also kills BRIGHTNESS (which is
+     * live in AUTO/SHUT.P and inert in MANUAL). Set MODE from the OSD, or add
+     * an explicit ICD command for it. */
     switch (param_id) {
         case PARAM_ID_EO_TRIGGER_MODE:
             return day_set_trigger_row_absolute(camera_num, 0u, value, 0u, 1u);
@@ -2212,12 +2201,15 @@ static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
             // [SAVE]s so the value survives a power cycle. In AE modes use the
             // fast VISCA pair, and fall back to the OSD if the camera
             // explicitly refuses it (now that error replies are detected).
-            if (camera_num >= 6u || !EO_EXPOSURE_MODE_IS_AE(s_eo_exposure_mode[camera_num])) {
-                return day_set_brightness_osd(camera_num, value);
-            }
-            int rc_on = day_send_visca_simple(camera_num, 0x04u, 0x3Eu, 0x02u);
-            int rc_pos = day_send_visca_u16_direct(camera_num, 0x04u, 0x4Eu, value);
-            if (rc_on == RET_OK && rc_pos == RET_OK) return RET_OK;
+            /* Measured on the bench (DM-G15-42, EXPOSURE MODE = SHUT.P, OSD
+             * BRIGHTNESS live at 13): CAM_ExpComp On (0x3E 0x02) followed by
+             * Direct (0x4E) is ACKed and completed by the camera and changes
+             * nothing at all - brightness 0 / 20 / 10 all produced the same
+             * tile luminance to within 0.13 counts. The VISCA route is a dead
+             * end on this module, so drive the OSD BRIGHTNESS row, which does
+             * work. It costs a few seconds and paints the menu over the live
+             * video while it runs, but it is the only mechanism that moves the
+             * picture - and it [SAVE]s, so the value survives a power cycle. */
             return day_set_brightness_osd(camera_num, value);
         }
         case PARAM_ID_EO_BLC:
