@@ -1930,6 +1930,50 @@ enum {
  * parameter CAM_ExpComp Direct (0x4E, 0~14h) writes over VISCA. */
 #define EO_BRIGHTNESS_MAX          20u
 
+/* Send a VISCA inquiry and copy out the payload of the y0 50 .. FF reply
+ * (the bytes between the 0x50 and the terminator). Returns the byte count, or
+ * a negative RET_* on failure. The reply is already sitting in visca_rx_buffer
+ * by the time send_visca_command() has seen its completion. */
+static int day_visca_inquiry(uint8_t camera_num, const uint8_t *cmd, uint8_t cmd_len,
+                             uint8_t *out, uint8_t out_max)
+{
+    int rc = day_send_visca_bytes(camera_num, cmd, cmd_len);
+    if (rc != RET_OK) return rc;
+
+    uint8_t len = visca_rx_idx;
+    uint8_t start = 0u;
+    while (start < len) {
+        uint8_t end = start;
+        while (end < len && visca_rx_buffer[end] != 0xFFu) end++;
+        if (end >= len) break;
+
+        uint8_t pkt_len = (uint8_t)(end - start + 1u);
+        if (pkt_len >= 3u &&
+            (visca_rx_buffer[start] & 0xF0u) == 0x90u &&
+            (visca_rx_buffer[start + 1u] & 0xF0u) == 0x50u) {
+            uint8_t n = (uint8_t)(pkt_len - 3u);
+            if (n > out_max) n = out_max;
+            for (uint8_t i = 0u; i < n; ++i) {
+                out[i] = visca_rx_buffer[start + 2u + i];
+            }
+            return (int)n;
+        }
+        start = (uint8_t)(end + 1u);
+    }
+    return RET_ERR_RX;
+}
+
+/* CAM_MenuModeInq (manual p.31): y0 50 02 FF = OSD on, y0 50 03 FF = off. */
+static int day_menu_is_open(uint8_t camera_num, bool *is_open)
+{
+    static const uint8_t inq[] = { 0x81u, 0x09u, 0x04u, 0x16u, 0xFFu };
+    uint8_t rsp[4];
+    int n = day_visca_inquiry(camera_num, inq, (uint8_t)sizeof(inq), rsp, (uint8_t)sizeof(rsp));
+    if (n < 1) return RET_ERR_RX;
+    *is_open = (rsp[0] == 0x02u);
+    return RET_OK;
+}
+
 static int day_send_menu_key(uint8_t camera_num, uint8_t key)
 {
     /* CAM_MENUKey carries a full byte (Up 01, Down 02, Left 04, Right 08,
@@ -1985,21 +2029,47 @@ static int day_menu_repeat(uint8_t camera_num, uint8_t key, uint16_t count)
 #define EO_MAIN_ROW_TRIGGER     0u
 #define EO_MAIN_ROW_EXPOSURE    1u
 
+/* ESC (0x20) is accepted and completed by this module but does nothing at all -
+ * the OSD stays exactly where it was. The only key that dismisses it is the
+ * MENU toggle. So press MENU and *confirm* with CAM_MenuModeInq rather than
+ * firing a fixed number of blind keystrokes: a menu left painted over the
+ * operator's video is a visible fault, and a stale open menu also made the
+ * next command's opening MENU press close the OSD instead of opening it -
+ * which is what made repeated runs land on different pages. */
+static int day_close_menu(uint8_t camera_num)
+{
+    for (uint8_t attempt = 0u; attempt < 8u; ++attempt) {
+        bool open = true;
+        if (day_menu_is_open(camera_num, &open) != RET_OK) {
+            /* Not every inquiry is implemented on this module - CAM_VersionInq
+             * answers but several others never reply. If we cannot read the
+             * menu state, fall back to one blind MENU toggle: leaving the OSD
+             * painted over the operator's video is worse than a stray press,
+             * and this is the only key that dismisses it. */
+            (void)day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
+            return RET_OK;
+        }
+        if (!open) return RET_OK;
+
+        int rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
+        if (rc != RET_OK) return rc;
+    }
+    return RET_ERR_TX;
+}
+
 static int day_open_main_submenu(uint8_t camera_num, uint8_t row)
 {
-    int rc = day_menu_repeat(camera_num, EO_MENUKEY_ESC, 3u);
+    /* Start from a known-closed OSD so that MENU below always *opens* it. */
+    int rc = day_close_menu(camera_num);
     if (rc != RET_OK) return rc;
 
     rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
     if (rc != RET_OK) return rc;
 
-    /* Do NOT try to "home" the cursor by over-pressing UP first: the main-menu
-     * cursor wraps. Measured on the bench - a freshly opened menu starts on
-     * FOCUS (row 0), and an UP x10 sweep wrapped it round onto the
-     * [EXIT][SAVE][DFLT] line, so DOWN x2 then opened TRIGGER instead of
-     * EXPOSURE and the value sweep scribbled over that page's Strobe Delay.
-     * ESC x3 above guarantees the menu is closed, so MENU reopens it at row 0
-     * and a plain DOWN x row is exact. */
+    /* Do NOT try to "home" the cursor by over-pressing UP first: the cursor
+     * wraps rather than clamping, so an UP sweep rolls it round onto the
+     * button line and leaves the landing row dependent on where it started.
+     * A freshly opened menu sits on row 0, so DOWN x row is exact. */
     rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN, row);
     if (rc != RET_OK) return rc;
 
@@ -2009,16 +2079,6 @@ static int day_open_main_submenu(uint8_t camera_num, uint8_t row)
 static int day_open_trigger_menu(uint8_t camera_num)
 {
     return day_open_main_submenu(camera_num, EO_MAIN_ROW_TRIGGER);
-}
-
-static int day_close_menu(uint8_t camera_num)
-{
-    /* Two ESCs were not enough to dismiss the OSD after a [SAVE] - the menu
-     * was observed still painted over the live video seconds later. Unwind
-     * more levels than we can possibly be nested, since a menu left on screen
-     * is an operator-visible fault, not a cosmetic one. ESC on an already
-     * closed OSD is harmless. */
-    return day_menu_repeat(camera_num, EO_MENUKEY_ESC, 5u);
 }
 
 static int day_open_exposure_menu(uint8_t camera_num)
@@ -2092,14 +2152,65 @@ static int day_set_trigger_row_absolute(uint8_t camera_num, uint8_t row, uint16_
     return day_set_menu_row_absolute(camera_num, false, row, value, min_value, max_value);
 }
 
-/* EXPOSURE > BRIGHTNESS (0~20). Last-resort only: walking the OSD paints the
- * menu over the operator's live video, so this runs solely when the camera has
- * explicitly refused the VISCA CAM_ExpComp pair. */
+/* CAM_ExpCompPosInq (manual p.30): y0 50 00 00 0p 0q FF, pq = 0..14h.
+ * Writing this parameter over VISCA does nothing on this module, but reading
+ * it does report the live OSD BRIGHTNESS value - which is what lets us step
+ * the row by an exact amount instead of sweeping blindly. */
+static int day_get_brightness(uint8_t camera_num, uint8_t *value)
+{
+    static const uint8_t inq[] = { 0x81u, 0x09u, 0x04u, 0x4Eu, 0xFFu };
+    uint8_t rsp[6];
+    int n = day_visca_inquiry(camera_num, inq, (uint8_t)sizeof(inq), rsp, (uint8_t)sizeof(rsp));
+    if (n < 4) return RET_ERR_RX;
+    *value = (uint8_t)(((rsp[2] & 0x0Fu) << 4) | (rsp[3] & 0x0Fu));
+    return RET_OK;
+}
+
+/* EXPOSURE > BRIGHTNESS (0~20), the only control that actually moves the
+ * picture on this module.
+ *
+ * NOTE: brightness is an auto-exposure trim, so it is live only when
+ * EXPOSURE > MODE is AUTO or SHUT.P. Cameras held in MANUAL for external
+ * trigger sync have the row greyed out and cannot be adjusted this way. */
 static int day_set_brightness_osd(uint8_t camera_num, uint16_t value)
 {
     if (value > EO_BRIGHTNESS_MAX) return RET_ERR_TX;
-    return day_set_menu_row_absolute(camera_num, true, EO_EXPOSURE_ROW_BRIGHTNESS,
-                                     value, 0u, EO_BRIGHTNESS_MAX);
+
+    /* Always clear any OSD left on screen first, even if we then bail out -
+     * otherwise a failed apply strands the menu over the live video. */
+    (void)day_close_menu(camera_num);
+
+    uint8_t current = 0u;
+    int rc = day_get_brightness(camera_num, &current);
+    if (rc != RET_OK) return rc;
+    if (current > EO_BRIGHTNESS_MAX) return RET_ERR_RX;
+    if (current == (uint8_t)value) return RET_OK;      /* nothing to do */
+
+    rc = day_open_exposure_menu(camera_num);
+    if (rc != RET_OK) return rc;
+
+    rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN, EO_EXPOSURE_ROW_BRIGHTNESS);
+    if (rc != RET_OK) {
+        (void)day_close_menu(camera_num);
+        return rc;
+    }
+
+    /* The value field wraps - 0..20 is modulo 21 - so running it against the
+     * end does NOT clamp at a known state, it just lands on (current - N) mod
+     * 21. Commanding 5 from 13 that way produced 17. Step the exact distance
+     * from the value the camera reports instead. */
+    if ((uint8_t)value > current) {
+        rc = day_menu_repeat(camera_num, EO_MENUKEY_RIGHT, (uint16_t)((uint8_t)value - current));
+    } else {
+        rc = day_menu_repeat(camera_num, EO_MENUKEY_LEFT, (uint16_t)(current - (uint8_t)value));
+    }
+    if (rc != RET_OK) {
+        (void)day_close_menu(camera_num);
+        return rc;
+    }
+
+    return day_save_current_submenu(camera_num, EO_EXPOSURE_ROW_BRIGHTNESS,
+                                    EO_MENU_EXPOSURE_ROWS);
 }
 
 static int day_apply_eo_trigger_param(uint8_t camera_num, uint16_t param_id, uint16_t value)
