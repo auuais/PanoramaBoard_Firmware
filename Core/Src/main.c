@@ -2036,32 +2036,43 @@ static int day_menu_repeat(uint8_t camera_num, uint8_t key, uint16_t count)
  * operator's video is a visible fault, and a stale open menu also made the
  * next command's opening MENU press close the OSD instead of opening it -
  * which is what made repeated runs land on different pages. */
+static int day_exit_menu_after_save(uint8_t camera_num);
+
 static int day_close_menu(uint8_t camera_num)
 {
-    for (uint8_t attempt = 0u; attempt < 8u; ++attempt) {
+    for (uint8_t attempt = 0u; attempt < 3u; ++attempt) {
         bool open = true;
         if (day_menu_is_open(camera_num, &open) != RET_OK) {
-            /* Not every inquiry is implemented on this module - CAM_VersionInq
-             * answers but several others never reply. If we cannot read the
-             * menu state, fall back to one blind MENU toggle: leaving the OSD
-             * painted over the operator's video is worse than a stray press,
-             * and this is the only key that dismisses it. */
+            /* Not every inquiry is implemented on this module - CAM_MenuModeInq
+             * and CAM_VersionInq answer, CAM_ExpCompPosInq never does. If we
+             * cannot read the state, one blind toggle is the best we can do. */
             (void)day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
             return RET_OK;
         }
         if (!open) return RET_OK;
 
-        int rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
+        /* The only state an interrupted walk can strand us in is the button
+         * line of a sub-menu, so use the same [BACK] -> main -> off route as a
+         * normal exit. Pressing MENU on its own here would just re-trigger the
+         * highlighted button and never dismiss anything. */
+        int rc = day_exit_menu_after_save(camera_num);
         if (rc != RET_OK) return rc;
     }
     return RET_ERR_TX;
 }
+
+/* Which main-menu row we last entered, per camera. Backing out of a sub-menu
+ * returns the cursor to that row, and the exit path needs to know how far down
+ * the [EXIT] line is from there. */
+static uint8_t s_eo_last_main_row[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
 
 static int day_open_main_submenu(uint8_t camera_num, uint8_t row)
 {
     /* Start from a known-closed OSD so that MENU below always *opens* it. */
     int rc = day_close_menu(camera_num);
     if (rc != RET_OK) return rc;
+
+    if (camera_num < 6u) s_eo_last_main_row[camera_num] = row;
 
     rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);
     if (rc != RET_OK) return rc;
@@ -2086,6 +2097,38 @@ static int day_open_exposure_menu(uint8_t camera_num)
     return day_open_main_submenu(camera_num, EO_MAIN_ROW_EXPOSURE);
 }
 
+/* Exit the OSD from the known post-[SAVE] state.
+ *
+ * After day_save_current_submenu() has pressed MENU the cursor is still on
+ * [SAVE] on the sub-menu's button line, so the way out is:
+ *   LEFT  -> [BACK]
+ *   MENU  -> back to the main menu
+ *   MENU  -> OSD off
+ * ESC does nothing at all on this module, and MENU on its own inside a
+ * sub-menu just re-triggers the highlighted button - which is why the menu
+ * used to be left painted over the live video until it timed out. Exiting
+ * properly also means the next value can be sent immediately instead of
+ * waiting out the ~75-190s idle dismissal. */
+static int day_exit_menu_after_save(uint8_t camera_num)
+{
+    int rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_LEFT);   /* [SAVE] -> [BACK] */
+    if (rc != RET_OK) return rc;
+
+    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);       /* -> main menu */
+    if (rc != RET_OK) return rc;
+
+    /* Backing out leaves the main-menu cursor on the row we entered through,
+     * so pressing MENU here would simply re-open that page - which is exactly
+     * what kept the EXPOSURE menu on screen. Walk down to the
+     * [EXIT] [SAVE] [DFLT] line and select [EXIT] instead. */
+    uint8_t row = (camera_num < 6u) ? s_eo_last_main_row[camera_num] : 0u;
+    rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN,
+                         (uint16_t)(EO_MENU_MAIN_ROWS - row));
+    if (rc != RET_OK) return rc;
+
+    return day_menu_key_and_wait(camera_num, EO_MENUKEY_MENU);     /* [EXIT] */
+}
+
 static int day_save_current_submenu(uint8_t camera_num, uint8_t row, uint8_t item_count)
 {
     int rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN, (uint16_t)(item_count - row));
@@ -2100,9 +2143,14 @@ static int day_save_current_submenu(uint8_t camera_num, uint8_t row, uint8_t ite
         (void)day_close_menu(camera_num);
         return rc;
     }
-    HAL_Delay(100);
-    (void)day_close_menu(camera_num);
-    return rc;
+    /* [SAVE] writes the settings to the camera's flash, which takes noticeably
+     * longer than the 1V command cycle - with only 100ms here the following
+     * LEFT was swallowed, the cursor stayed on [SAVE], and the exit sequence
+     * just re-saved instead of backing out. */
+    HAL_Delay(600);
+    /* Cursor is on [SAVE] here, which is the state day_exit_menu_after_save()
+     * expects. */
+    return day_exit_menu_after_save(camera_num);
 }
 
 /* Drive one OSD row to an absolute value: open the sub-menu, home the cursor,
