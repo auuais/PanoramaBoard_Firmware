@@ -2207,12 +2207,11 @@ static int day_set_trigger_row_absolute(uint8_t camera_num, uint8_t row, uint16_
  * blind key sequence that reaches a known state. The firmware therefore has to
  * own the value and step it relatively.
  *
- * EO_BRIGHTNESS_SEED must match what the cameras are actually left at, since
- * the first command after an MCU reset steps from this assumption. The bench
- * cameras were set to 13 to agree with it. This still needs an operator-facing
- * "resync to the actual OSD value" path before it can be trusted after anyone
- * adjusts BRIGHTNESS by hand from the OSD. */
-#define EO_BRIGHTNESS_SEED  13u
+ * EO_BRIGHTNESS_SEED (main.h) must match what the cameras are actually left
+ * at, since the first command after an MCU reset steps from this assumption,
+ * and the ICD maintenance snapshot is seeded with the same value. This still
+ * needs an operator-facing "resync to the actual OSD value" path before it can
+ * be trusted after anyone adjusts BRIGHTNESS by hand from the OSD. */
 static uint8_t s_eo_brightness[6] = {
     EO_BRIGHTNESS_SEED, EO_BRIGHTNESS_SEED, EO_BRIGHTNESS_SEED,
     EO_BRIGHTNESS_SEED, EO_BRIGHTNESS_SEED, EO_BRIGHTNESS_SEED

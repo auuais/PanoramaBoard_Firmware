@@ -135,6 +135,14 @@ void IMU_SPI_ResetSession(void);
 #define PARAM_ID_EO_EXT_TRIG_DELAY     0x3737
 #define PARAM_ID_EO_STROBE_DELAY       0x3838
 #define PARAM_ID_EO_STROBE_WIDTH       0x3939
+
+/* OSD BRIGHTNESS value the EO driver assumes each camera is sitting at when
+ * the MCU starts. The row cannot be read back (CAM_ExpCompPosInq is never
+ * answered) and the field wraps, so the driver has to track it. The ICD
+ * maintenance snapshot is seeded with the same number so that the first
+ * complete field set the UI sends is not mistaken for a brightness change -
+ * otherwise every mode switch triggers an OSD walk nobody asked for. */
+#define EO_BRIGHTNESS_SEED             13u
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

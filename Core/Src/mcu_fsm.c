@@ -2360,12 +2360,20 @@ static void icd_maintenance_init_defaults(void)
     // Manual, 6=One Push AWB Trigger - value 3, not 2.
     s_icd_maintenance_status[ICD_MAINT_EO_WHITE_BALANCE] = 3u;
     s_icd_maintenance_status[ICD_MAINT_EO_GAMMA] = 0u;
+    // Brightness must start out agreeing with what the EO driver assumes the
+    // camera's OSD row is at (EO_BRIGHTNESS_SEED). Applying it is a ~3.5s OSD
+    // walk that paints the menu over the live video, so a mismatch here makes
+    // the first full field set the UI sends - which it re-sends on every mode
+    // change - look like a brightness edit and kick off a walk nobody asked
+    // for.
+    s_icd_maintenance_status[ICD_MAINT_EO_BRIGHTNESS] = EO_BRIGHTNESS_SEED;
 
     // Seed every camera's own remembered snapshot with the same baseline
     // defaults (the memset above already zeroed everything else to 0, which
     // matches the rest of the defaults above).
     for (uint8_t i = 0u; i < 6u; ++i) {
         s_icd_eo_cam_maint[i][ICD_MAINT_EO_WHITE_BALANCE] = 3u;
+        s_icd_eo_cam_maint[i][ICD_MAINT_EO_BRIGHTNESS] = EO_BRIGHTNESS_SEED;
     }
 }
 
