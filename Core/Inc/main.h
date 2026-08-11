@@ -136,6 +136,26 @@ void IMU_SPI_ResetSession(void);
 #define PARAM_ID_EO_STROBE_DELAY       0x3838
 #define PARAM_ID_EO_STROBE_WIDTH       0x3939
 
+/* ---- Manual EO OSD remote ------------------------------------------------
+ * CAM_MENUKey codes (manual p.26). These are full bytes, not 0-0xF register
+ * nibbles - masking them to a nibble turns ENTER and BACK into 0x00. The PC
+ * app sends one of these per button press over the legacy console channel
+ * (CMD_EO_OSD_KEY), so the OSD can be driven by hand while watching the video.
+ *
+ * ENTER is the module's "MENU" key: it opens the OSD, selects the highlighted
+ * row, and activates [SAVE]/[EXIT]. BACK is "ESC", which on these modules is
+ * accepted but does nothing - to leave a page use [BACK]/[EXIT] on its button
+ * line. */
+#define EO_OSD_KEY_UP                  0x01u
+#define EO_OSD_KEY_DOWN                0x02u
+#define EO_OSD_KEY_LEFT                0x04u
+#define EO_OSD_KEY_RIGHT               0x08u
+#define EO_OSD_KEY_ENTER               0x10u
+#define EO_OSD_KEY_BACK                0x20u
+
+/* camera_sel: 0 = all EO cameras, 1..6 = that camera. */
+int EO_SendOsdKey(uint8_t camera_sel, uint8_t key);
+
 /* OSD BRIGHTNESS value the EO driver assumes each camera is sitting at when
  * the MCU starts. The row cannot be read back (CAM_ExpCompPosInq is never
  * answered) and the field wraps, so the driver has to track it. The ICD

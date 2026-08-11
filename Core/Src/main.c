@@ -2610,6 +2610,40 @@ void IR_Nuc_OnOperationEnter(void)
     }
 }
 
+/* Manual OSD remote: send exactly one CAM_MENUKey press and nothing else.
+ *
+ * This deliberately performs no navigation of its own - no menu opening, no
+ * row counting, no [SAVE]. The operator is the state machine here, pressing
+ * one key at a time while watching the video, which is the only reliable way
+ * to work a menu whose cursor and value fields both wrap and whose layout
+ * differs from the manual. */
+int EO_SendOsdKey(uint8_t camera_sel, uint8_t key)
+{
+    switch (key) {
+        case EO_OSD_KEY_UP:
+        case EO_OSD_KEY_DOWN:
+        case EO_OSD_KEY_LEFT:
+        case EO_OSD_KEY_RIGHT:
+        case EO_OSD_KEY_ENTER:
+        case EO_OSD_KEY_BACK:
+            break;
+        default:
+            return RET_ERR_TX;
+    }
+
+    if (camera_sel == 0u) {
+        int worst_rc = RET_OK;
+        for (uint8_t cam = 0u; cam < 6u; ++cam) {
+            int rc = day_send_menu_key(cam, key);
+            if (rc != RET_OK) worst_rc = rc;
+        }
+        return worst_rc;
+    }
+
+    if (camera_sel > 6u) return RET_ERR_TX;
+    return day_send_menu_key((uint8_t)(camera_sel - 1u), key);
+}
+
 int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value)
 {
     int rc = RET_OK;
@@ -3172,13 +3206,27 @@ static void ui_process_bytes(const uint8_t *data, uint16_t len)
     for (uint16_t i = 0; i < len; i++) {
         uint8_t b = data[i];
 
+        /* Both protocols share this UART. icd_process_byte() claims *any*
+         * 0x83 as a possible start-of-message, so a 0x83 occurring naturally
+         * inside a COBS legacy frame (in the CRC, say) used to be swallowed
+         * and the legacy frame silently corrupted. Only let the ICD parser
+         * keep a byte once it has actually matched the full 4-byte SOM;
+         * until then the byte is offered to the legacy accumulator as well.
+         * Each parser validates its own framing and CRC, so the overlap is
+         * harmless. */
+        const bool icd_in_frame = icd_acc_active && (icd_acc_len >= 4u);
+
         if (icd_acc_active || b == 0x83u) {
-            if (icd_process_byte(b)) {
+            if (icd_process_byte(b) && icd_in_frame) {
                 continue;
             }
         }
 
-#if !ICD_ONLY_UI_PROTOCOL
+        /* Legacy COBS frames are still accumulated and parsed even in
+         * ICD-only mode, but mcu_on_ui_payload() drops everything except the
+         * manual OSD remote command - see the filter at the top of it. That
+         * bench tool has to reach the cameras while the customer ICD link is
+         * running, and it needs a transport that is not the customer ICD. */
         if (b == 0x00) {
             // delimiter -> parse current frame if any
             if (ui_acc_len > 0) {
@@ -3200,9 +3248,6 @@ static void ui_process_bytes(const uint8_t *data, uint16_t len)
             // overflow -> drop
             ui_acc_reset();
         }
-#else
-        ui_acc_reset();
-#endif
     }
 }
 
