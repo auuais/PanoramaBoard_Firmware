@@ -2285,6 +2285,46 @@ void IR_Nuc_OnOperationEnter(void)
     }
 }
 
+/* Manual OSD remote: send exactly one CAM_MENUKey press and nothing else.
+ *
+ * This deliberately calls day_send_visca_simple() rather than reusing
+ * day_send_menu_key(). That helper goes through day_send_visca_u8(), which
+ * masks its value to the low nibble for the 0-0xF register writes elsewhere -
+ * so ENTER (0x10) and BACK (0x20) both collapse to 0x00, which is why the OSD
+ * could never be opened. Bypassing it here means the existing automatic menu
+ * walkers keep their current behaviour exactly; only this new path is live.
+ *
+ * Nothing is automated on purpose. The OSD cursor and value fields wrap rather
+ * than clamp, and the main menu on these fixed-lens units has no FOCUS row, so
+ * blind key sequences derived from the manual land on the wrong page. The
+ * operator watching the video is the reliable state machine. */
+int EO_SendOsdKey(uint8_t camera_sel, uint8_t key)
+{
+    switch (key) {
+        case EO_OSD_KEY_UP:
+        case EO_OSD_KEY_DOWN:
+        case EO_OSD_KEY_LEFT:
+        case EO_OSD_KEY_RIGHT:
+        case EO_OSD_KEY_ENTER:
+        case EO_OSD_KEY_BACK:
+            break;
+        default:
+            return RET_ERR_TX;
+    }
+
+    if (camera_sel == 0u) {
+        int worst_rc = RET_OK;
+        for (uint8_t cam = 0u; cam < 6u; ++cam) {
+            int rc = day_send_visca_simple(cam, 0x04u, 0x16u, key);
+            if (rc != RET_OK) worst_rc = rc;
+        }
+        return worst_rc;
+    }
+
+    if (camera_sel > 6u) return RET_ERR_TX;
+    return day_send_visca_simple((uint8_t)(camera_sel - 1u), 0x04u, 0x16u, key);
+}
+
 int Apply_EO_Camera_Param(uint8_t camera_sel, uint16_t param_id, uint16_t value)
 {
     int rc = RET_OK;
@@ -2847,13 +2887,36 @@ static void ui_process_bytes(const uint8_t *data, uint16_t len)
     for (uint16_t i = 0; i < len; i++) {
         uint8_t b = data[i];
 
+        /* Both protocols share this UART. icd_process_byte() claims *any* 0x83
+         * as a possible start-of-message, so a 0x83 occurring naturally inside
+         * a COBS legacy frame (in its CRC, say) was swallowed and that frame
+         * silently corrupted. Only let the ICD parser keep a byte once it has
+         * actually matched the full 4-byte SOM; before that the byte is offered
+         * to the legacy accumulator as well. Each parser validates its own
+         * framing and CRC, so the overlap is harmless. */
+        const bool icd_in_frame = icd_acc_active && (icd_acc_len >= 4u);
+
         if (icd_acc_active || b == 0x83u) {
-            if (icd_process_byte(b)) {
+            if (icd_process_byte(b) && icd_in_frame) {
+                /* Confirmed ICD traffic. Discard any half-built legacy frame:
+                 * the 4 SOM bytes of every ICD frame necessarily fall through
+                 * to the legacy accumulator (icd_in_frame only goes true on
+                 * the 5th byte), and ICD payload zeros are consumed here, so
+                 * the legacy side never sees a 0x00 delimiter to resync on.
+                 * Without this reset the accumulator slowly fills with SOM
+                 * debris ahead of the next real legacy frame and that frame
+                 * fails to parse - intermittently, depending on timing. */
+                ui_acc_reset();
                 continue;
             }
         }
 
-#if !ICD_ONLY_UI_PROTOCOL
+        /* Legacy COBS frames are parsed even in ICD-only mode, but
+         * mcu_on_ui_payload() accepts only CMD_EO_OSD_KEY - see the filter at
+         * the top of it. The manual OSD remote needs to reach the cameras while
+         * the customer ICD link is live, and cannot ride on the customer ICD
+         * without changing it. Nothing else about the legacy console is
+         * reachable. */
         if (b == 0x00) {
             // delimiter -> parse current frame if any
             if (ui_acc_len > 0) {
@@ -2875,9 +2938,6 @@ static void ui_process_bytes(const uint8_t *data, uint16_t len)
             // overflow -> drop
             ui_acc_reset();
         }
-#else
-        ui_acc_reset();
-#endif
     }
 }
 

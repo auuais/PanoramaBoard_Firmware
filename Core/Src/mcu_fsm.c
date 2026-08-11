@@ -97,6 +97,10 @@ extern volatile uint32_t g_imu_drdy_edges_total;
 #define CMD_GET_CONFIG   0x30
 #define CMD_APPLY_CONFIG 0x31
 #define CMD_CAMERA_CONTROL 0x32
+/* Manual EO OSD remote - one key press per command, payload
+ * [cmd][camera 0=all,1..6][EO_OSD_KEY_*]. Deliberately on the legacy console
+ * channel: the customer ICD (0x22xx) is not touched by it. */
+#define CMD_EO_OSD_KEY   0x33
 
 #define ICD_RITA_PIPA_MODE_CONTROL       0x2201u
 #define ICD_RITA_PIPA_CAMERA_CONTROL     0x2202u
@@ -1785,6 +1789,18 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
 
     const uint8_t *d = &p[4];
 
+#if ICD_ONLY_UI_PROTOCOL
+    /* The customer ICD is the only PC-facing protocol in normal operation. The
+     * single exception is the manual EO OSD remote, which has to reach the
+     * cameras while the ICD link is live and cannot ride on the customer ICD
+     * without changing it. Accept that one command and silently drop every
+     * other legacy frame, so nothing else about the old console is brought
+     * back to life by accident. */
+    if (msg_type != MSG_CMD || plen < 1u || d[0] != CMD_EO_OSD_KEY) {
+        return;
+    }
+#endif
+
     // Allow CMD_INIT_SYSTEM, CMD_GET_CONFIG, CMD_GET_VERSION, and CMD_PING from any state.
     // For any other command, reply BUSY until OPERATION.
     if (ctx->state != ST_OPERATION) {
@@ -1836,6 +1852,14 @@ void mcu_on_ui_payload(McuContext *ctx, const uint8_t *p, uint16_t n)
 
 
 
+
+    case CMD_EO_OSD_KEY: {
+        // [0]=cmd, [1]=camera (0 = all EO, 1..6), [2]=EO_OSD_KEY_*
+        if (plen < 3u) { ui_send_resp_simple(seq, ERR_BADARG); break; }
+        int rc = EO_SendOsdKey(d[1], d[2]);
+        ui_send_resp_simple(seq, (rc == 0) ? ERR_OK : ERR_FAIL);
+        break;
+    }
 
     case CMD_GET_CONFIG: {
         ui_send_cfg_bank(CFG_BANK_EO);

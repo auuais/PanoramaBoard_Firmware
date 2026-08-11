@@ -135,6 +135,26 @@ void IMU_SPI_ResetSession(void);
 #define PARAM_ID_EO_EXT_TRIG_DELAY     0x3737
 #define PARAM_ID_EO_STROBE_DELAY       0x3838
 #define PARAM_ID_EO_STROBE_WIDTH       0x3939
+
+/* ---- Manual EO OSD remote ------------------------------------------------
+ * CAM_MENUKey codes (module manual p.26). The PC app sends one of these per
+ * button press over the legacy console channel (CMD_EO_OSD_KEY) so the OSD can
+ * be driven by hand while watching the video. No navigation is automated: the
+ * operator is the state machine.
+ *
+ * ENTER is the module's "MENU" key - it opens the OSD, selects the highlighted
+ * row, and activates [BACK]/[SAVE]/[DFLT]/[EXIT]. BACK is "ESC", which these
+ * modules accept but ignore; to leave a page, move to its [BACK]/[EXIT] button
+ * and press ENTER. */
+#define EO_OSD_KEY_UP                  0x01u
+#define EO_OSD_KEY_DOWN                0x02u
+#define EO_OSD_KEY_LEFT                0x04u
+#define EO_OSD_KEY_RIGHT               0x08u
+#define EO_OSD_KEY_ENTER               0x10u
+#define EO_OSD_KEY_BACK                0x20u
+
+/* camera_sel: 0 = all EO cameras, 1..6 = that camera. */
+int EO_SendOsdKey(uint8_t camera_sel, uint8_t key);
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus
