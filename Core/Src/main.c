@@ -1064,17 +1064,87 @@ void parse_and_print_version_response(uint8_t* data, uint8_t len) {
             current_day_camera, model_code, fw_major, fw_minor);
 }
 
+/* Classify the VISCA reply stream sitting in visca_rx_buffer.
+ *
+ * Reply packets are  y0 QR .. FF  (manual p.21):
+ *   Q = 4 -> Receive ACK, 5 -> Completion, 6 -> Error, R = socket number.
+ * Error payloads are y0 6R pp FF, e.g. pp = 02 (syntax error),
+ * 41 (command not executable - what the module returns when a command is
+ * refused because the current mode does not support it).
+ *
+ * Returns  1 = completion seen, -1 = error reply seen (code in *err_code),
+ *          0 = only an ACK / nothing conclusive yet.  *saw_ack is set if any
+ * ACK packet was present. */
+static int day_visca_classify_reply(const uint8_t *data, uint8_t len,
+                                    uint8_t *err_code, bool *saw_ack)
+{
+    uint8_t start = 0u;
+    int result = 0;
+
+    if (saw_ack != NULL) *saw_ack = false;
+    if (err_code != NULL) *err_code = 0u;
+
+    while (start < len) {
+        uint8_t end = start;
+        while (end < len && data[end] != 0xFFu) end++;
+        if (end >= len) break;                       /* packet still incomplete */
+
+        uint8_t pkt_len = (uint8_t)(end - start + 1u);
+        if (pkt_len >= 3u && (data[start] & 0xF0u) == 0x90u) {
+            switch (data[start + 1u] & 0xF0u) {
+                case 0x40u:
+                    if (saw_ack != NULL) *saw_ack = true;
+                    break;
+                case 0x50u:
+                    result = 1;                      /* completion / inquiry reply */
+                    break;
+                case 0x60u:
+                    if (err_code != NULL && pkt_len >= 4u) *err_code = data[start + 2u];
+                    return -1;                       /* error wins immediately */
+                default:
+                    break;
+            }
+        }
+        start = (uint8_t)(end + 1u);
+    }
+    return result;
+}
+
 // was: void wait_for_visca_ack_and_completion(...)
 int wait_for_visca_ack_and_completion(uint32_t timeout_ms, int parse_version)
 {
     uint32_t start = HAL_GetTick();
+    uint8_t err_code = 0u;
+    bool saw_ack = false;
 
-    // Example: wait until visca_rx_ready set by RX ISR/parser
-    while (!visca_rx_ready) {
+    /* Wait for a *conclusive* reply, not merely "some byte arrived".
+     *
+     * This used to return RET_OK as soon as visca_rx_ready went high, which
+     * the RX ISR sets on the first 0xFF terminator - i.e. on the bare ACK, and
+     * equally on an Error reply. Every EO command therefore reported success
+     * even when the camera refused it, which is why the Exposure controls
+     * looked like they applied while nothing changed on the image. */
+    for (;;) {
+        /* visca_rx_buffer itself is not volatile - it is filled by the UART RX
+         * ISR, so stop the compiler caching its contents across iterations of
+         * this poll. (visca_rx_idx is volatile and re-read on its own.) */
+        __asm volatile ("" ::: "memory");
+
+        int cls = day_visca_classify_reply(visca_rx_buffer, visca_rx_idx, &err_code, &saw_ack);
+        if (cls < 0) {
+            Send_UART3_Debug("VISCA error reply 0x%02X\r\n", err_code);
+            return RET_ERR_RX;
+        }
+        if (cls > 0) break;                          /* completion received */
+
         if ((HAL_GetTick() - start) > timeout_ms) {
-        	Send_UART3_Debug("RET Timeout");
-        	return RET_ERR_TIMEOUT;
-
+            if (saw_ack) {
+                /* Command was accepted; some modules never send the trailing
+                 * completion. Treat as success rather than a false failure. */
+                break;
+            }
+            Send_UART3_Debug("RET Timeout");
+            return RET_ERR_TIMEOUT;
         }
     }
 
@@ -1832,9 +1902,56 @@ enum {
     EO_MENUKEY_ESC = 0x20u,
 };
 
+/* OSD sub-menu geometry (manual pp.39, 43-44).
+ *
+ * TRIGGER has 6 selectable rows:
+ *   0 Trigger Mode, 1 TrigIn Polari, 2 StrOut Polari,
+ *   3 ExtTrig Delay, 4 Strobe Delay, 5 Strobe Width
+ *
+ * EXPOSURE has 9:
+ *   0 LENS, 1 MODE, 2 AGC, 3 SHUT SPEED, 4 DSS,
+ *   5 FLICKERLESS, 6 BRIGHTNESS, 7 BLC, 8 DAY&NIGHT
+ *
+ * Row `n_rows` is the trailing [BACK] [SAVE] [DFLT] button line, which is
+ * where day_save_current_submenu() has to land before it presses RIGHT+MENU.
+ * EXPOSURE was being driven with the TRIGGER row count (7), so "save" stopped
+ * on the BLC row instead: RIGHT toggled BLC on and MENU opened its sub-menu,
+ * so the exposure change was never committed and BLC got clobbered. */
+#define EO_MENU_TRIGGER_ROWS    6u
+#define EO_MENU_EXPOSURE_ROWS   9u
+
+#define EO_EXPOSURE_ROW_MODE        1u
+#define EO_EXPOSURE_ROW_BRIGHTNESS  6u
+
+/* EXPOSURE > MODE options, left to right: AUTO / SHUTTER.PRIORITY / MANUAL */
+#define EO_EXPOSURE_MODE_AUTO       0u
+#define EO_EXPOSURE_MODE_SHUTTER_P  1u
+#define EO_EXPOSURE_MODE_MANUAL     2u
+#define EO_EXPOSURE_MODE_COUNT      3u
+/* The module has no AE-mode inquiry, and MODE is [SAVE]d to flash - so after
+ * an MCU restart the camera may well still be in whatever mode the previous
+ * session left it in. Start "unknown" and only claim to know once we have
+ * driven the row ourselves. */
+#define EO_EXPOSURE_MODE_UNKNOWN    0xFFu
+
+/* True only when we know AE is running, i.e. when CAM_ExpComp is meaningful. */
+#define EO_EXPOSURE_MODE_IS_AE(m) \
+    ((m) == EO_EXPOSURE_MODE_AUTO || (m) == EO_EXPOSURE_MODE_SHUTTER_P)
+
+/* OSD BRIGHTNESS row: 0 (dark) ~ 20 (bright), manual p.44 - the same
+ * parameter CAM_ExpComp Direct (0x4E, 0~14h) writes over VISCA. */
+#define EO_BRIGHTNESS_MAX          20u
+
 static int day_send_menu_key(uint8_t camera_num, uint8_t key)
 {
-    return day_send_visca_u8(camera_num, 0x04u, 0x16u, key);
+    /* CAM_MENUKey carries a full byte (Up 01, Down 02, Left 04, Right 08,
+     * Menu 10, ESC 20 - manual p.26), not a 0-0xF register nibble.
+     * day_send_visca_u8() masks to the low nibble, which silently turned both
+     * Menu (0x10) and ESC (0x20) into 0x00 - so the OSD was never opened,
+     * never navigated and never saved. Every OSD-driven setting (the trigger
+     * rows and the EXPOSURE MODE -> MANUAL switch) was a no-op because of
+     * this. Same masking trap as the D-Zoom Tele/Wide 0x27/0x37 case below. */
+    return day_send_visca_simple(camera_num, 0x04u, 0x16u, key);
 }
 
 static int day_menu_wait(void)
@@ -1914,22 +2031,41 @@ static int day_save_current_submenu(uint8_t camera_num, uint8_t row, uint8_t ite
     return rc;
 }
 
-static int day_set_trigger_row_absolute(uint8_t camera_num, uint8_t row, uint16_t value, uint16_t min_value, uint16_t max_value)
+/* Last EXPOSURE > MODE we drove into each camera, or _UNKNOWN if this MCU
+ * session has not set it yet. */
+static uint8_t s_eo_exposure_mode[6] = {
+    EO_EXPOSURE_MODE_UNKNOWN, EO_EXPOSURE_MODE_UNKNOWN, EO_EXPOSURE_MODE_UNKNOWN,
+    EO_EXPOSURE_MODE_UNKNOWN, EO_EXPOSURE_MODE_UNKNOWN, EO_EXPOSURE_MODE_UNKNOWN
+};
+
+/* Drive one OSD row to an absolute value: open the sub-menu, home the cursor,
+ * step down to `row`, run the value hard against its minimum, then step up to
+ * the wanted setting and [SAVE]. Absolute rather than relative, so the result
+ * does not depend on what the row happened to be showing beforehand. */
+static int day_set_menu_row_absolute(uint8_t camera_num, bool exposure_menu,
+                                     uint8_t row, uint16_t value,
+                                     uint16_t min_value, uint16_t max_value)
 {
-    int rc = day_open_trigger_menu(camera_num);
+    const uint8_t n_rows = exposure_menu ? EO_MENU_EXPOSURE_ROWS : EO_MENU_TRIGGER_ROWS;
+
+    int rc = exposure_menu ? day_open_exposure_menu(camera_num)
+                           : day_open_trigger_menu(camera_num);
     if (rc != RET_OK) return rc;
-    rc = day_menu_normalize_to_top(camera_num, 6u);
+
+    rc = day_menu_normalize_to_top(camera_num, n_rows);
     if (rc != RET_OK) {
         (void)day_close_menu(camera_num);
         return rc;
     }
+
     rc = day_menu_repeat(camera_num, EO_MENUKEY_DOWN, row);
     if (rc != RET_OK) {
         (void)day_close_menu(camera_num);
         return rc;
     }
 
-    rc = day_menu_repeat(camera_num, EO_MENUKEY_LEFT, (uint16_t)(max_value + 2u));
+    /* Sweep to the row minimum (+2 margin), then back up to `value`. */
+    rc = day_menu_repeat(camera_num, EO_MENUKEY_LEFT, (uint16_t)(max_value - min_value + 2u));
     if (rc != RET_OK) {
         (void)day_close_menu(camera_num);
         return rc;
@@ -1943,39 +2079,41 @@ static int day_set_trigger_row_absolute(uint8_t camera_num, uint8_t row, uint16_
         }
     }
 
-    return day_save_current_submenu(camera_num, row, 6u);
+    return day_save_current_submenu(camera_num, row, n_rows);
+}
+
+static int day_set_trigger_row_absolute(uint8_t camera_num, uint8_t row, uint16_t value, uint16_t min_value, uint16_t max_value)
+{
+    return day_set_menu_row_absolute(camera_num, false, row, value, min_value, max_value);
+}
+
+static int day_set_exposure_mode(uint8_t camera_num, uint8_t mode)
+{
+    if (camera_num >= 6u || mode >= EO_EXPOSURE_MODE_COUNT) return RET_ERR_TX;
+
+    int rc = day_set_menu_row_absolute(camera_num, true, EO_EXPOSURE_ROW_MODE,
+                                       mode, 0u, (uint16_t)(EO_EXPOSURE_MODE_COUNT - 1u));
+    if (rc == RET_OK) {
+        s_eo_exposure_mode[camera_num] = mode;
+    }
+    return rc;
+}
+
+/* EXPOSURE > BRIGHTNESS (0~20). Slower than the VISCA CAM_ExpComp pair, but
+ * it is the only route that works once AE is off, and it [SAVE]s. */
+static int day_set_brightness_osd(uint8_t camera_num, uint16_t value)
+{
+    if (value > EO_BRIGHTNESS_MAX) return RET_ERR_TX;
+    return day_set_menu_row_absolute(camera_num, true, EO_EXPOSURE_ROW_BRIGHTNESS,
+                                     value, 0u, EO_BRIGHTNESS_MAX);
 }
 
 static int day_ensure_exposure_manual(uint8_t camera_num)
 {
-    int rc = day_open_exposure_menu(camera_num);
-    if (rc != RET_OK) return rc;
-
-    rc = day_menu_normalize_to_top(camera_num, 7u);
-    if (rc != RET_OK) {
-        (void)day_close_menu(camera_num);
-        return rc;
+    if (camera_num < 6u && s_eo_exposure_mode[camera_num] == EO_EXPOSURE_MODE_MANUAL) {
+        return RET_OK;
     }
-
-    rc = day_menu_key_and_wait(camera_num, EO_MENUKEY_DOWN); /* MODE row */
-    if (rc != RET_OK) {
-        (void)day_close_menu(camera_num);
-        return rc;
-    }
-
-    rc = day_menu_repeat(camera_num, EO_MENUKEY_LEFT, 3u);
-    if (rc != RET_OK) {
-        (void)day_close_menu(camera_num);
-        return rc;
-    }
-
-    rc = day_menu_repeat(camera_num, EO_MENUKEY_RIGHT, 2u); /* AUTO -> SHUT.P -> MANUAL */
-    if (rc != RET_OK) {
-        (void)day_close_menu(camera_num);
-        return rc;
-    }
-
-    return day_save_current_submenu(camera_num, 1u, 7u);
+    return day_set_exposure_mode(camera_num, EO_EXPOSURE_MODE_MANUAL);
 }
 
 static int day_apply_eo_trigger_param(uint8_t camera_num, uint16_t param_id, uint16_t value)
@@ -2057,14 +2195,30 @@ static int apply_eo_param_single(uint8_t camera_num, uint16_t param_id, uint16_t
         case PARAM_ID_EO_AE_SHUTTER:
             return day_send_visca_u16_direct(camera_num, 0x04u, 0x4Au, value);
         case PARAM_ID_EO_BRIGHTNESS: {
-            // Datasheet CAM_ExpComp (the OSD "Brightness" control) ignores Direct
-            // position writes (0x4E) unless compensation mode is first enabled
-            // via 0x3E 0x02 ("On"). Best-effort: always still issue the Direct
-            // write even if the "On" command's ACK wait fails/times out, so a
-            // flaky/missing ACK on the enable command can't silently swallow
-            // the actual brightness change.
-            (void)day_send_visca_simple(camera_num, 0x04u, 0x3Eu, 0x02u);
-            return day_send_visca_u16_direct(camera_num, 0x04u, 0x4Eu, value);
+            // "Brightness" is CAM_ExpComp (manual p.24) - an *auto-exposure*
+            // compensation offset, and the same thing the OSD shows as
+            // EXPOSURE > BRIGHTNESS 0~20 (p.44). Two conditions must hold for
+            // the Direct position write (0x4E) to change anything:
+            //   1. compensation must be switched on first, CAM_ExpComp On
+            //      (0x3E 0x02), and
+            //   2. the camera must actually be running AE.
+            // Condition 2 is the one that defeats us: the TRIGGER menu
+            // requires EXPOSURE > MODE = MANUAL (p.39), and with AE off there
+            // is no compensation term to offset, so 0x4E is accepted and
+            // ignored however it is framed.
+            //
+            // So when the camera is in MANUAL, go through the OSD BRIGHTNESS
+            // row instead - it is the only route that still bites, and it
+            // [SAVE]s so the value survives a power cycle. In AE modes use the
+            // fast VISCA pair, and fall back to the OSD if the camera
+            // explicitly refuses it (now that error replies are detected).
+            if (camera_num >= 6u || !EO_EXPOSURE_MODE_IS_AE(s_eo_exposure_mode[camera_num])) {
+                return day_set_brightness_osd(camera_num, value);
+            }
+            int rc_on = day_send_visca_simple(camera_num, 0x04u, 0x3Eu, 0x02u);
+            int rc_pos = day_send_visca_u16_direct(camera_num, 0x04u, 0x4Eu, value);
+            if (rc_on == RET_OK && rc_pos == RET_OK) return RET_OK;
+            return day_set_brightness_osd(camera_num, value);
         }
         case PARAM_ID_EO_BLC:
             // ICD encoding: 0=N/A (no-op, leave as-is), 1=On, 2=Off.
@@ -2401,7 +2555,7 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     mcu_ui_log(&g_ctx, "Verify PDVO: NV4=%d NV5=%d NV7=%d NV76=%d\r\n", nv4,nv5,nv7,nv76);
 
     // --- 30 fps ---
-    IR_SetNV(16,1);       // NV#16 Frame Rate = 1 => 30 Hz
+    IR_SetNV(16,0);       // NV#16 Frame Rate = 1 => 30 Hz
     int nv16=-1; IR_GetNV(16,&nv16);
     mcu_ui_log(&g_ctx, "Verify FrameRate: NV16=%d\r\n", nv16);
 
