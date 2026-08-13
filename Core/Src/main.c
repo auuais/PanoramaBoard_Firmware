@@ -2429,9 +2429,14 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     IR_SetNV(4, 0);        // NV#4 RS-170 = disable
     IR_SetNV(5, 1);        // NV#5 PDVO = enable
     IR_SetNV(76, 0);
+    //Spatial Noise Enable 1 & 2
+    IR_SetNV(185, 0);
+    IR_SetNV(186, 0);
 
 
-
+    s_ir_nuc_mode[camera_num] = IR_NUC_MODE_DISABLED;
+//    s_ir_nuc_interval_min[camera_num] = IR_NUC_DEFAULT_INTERVAL_MIN;
+//    s_ir_nuc_next_due_ms[camera_num] = 0u;
 
 
 
@@ -2446,16 +2451,15 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     mcu_ui_log(&g_ctx, "Verify FrameRate: NV16=%d\r\n", nv16);
 
     // --- Genlock slave / input ---
-    IR_SetNV(17, 1);       // NV#17 Genlock Direction = input (slave mode)
-    IR_SetNV(18, 0);       // NV#18 Genlock Mode = 0 (slave)
+    IR_SetNV(17, 0);       // NV#17 Genlock Direction = input (slave mode)
+    IR_SetNV(18, 1);       // NV#18 Genlock Mode = 0 (slave)
+
 
     int nv17=-1,nv18=-1;
     IR_GetNV(17,&nv17); IR_GetNV(18,&nv18);
     mcu_ui_log(&g_ctx, "Verify Genlock: NV17=%d NV18=%d\r\n", nv17, nv18);
 
-    s_ir_nuc_mode[camera_num] = IR_NUC_MODE_DISABLED;
-    s_ir_nuc_interval_min[camera_num] = IR_NUC_DEFAULT_INTERVAL_MIN;
-    s_ir_nuc_next_due_ms[camera_num] = 0u;
+
 
     if (IR_SetAutoCalibration(0u) != RET_OK) {
         mcu_ui_log(&g_ctx, "IR Camera %d auto NUC disable failed\r\n", camera_num);
