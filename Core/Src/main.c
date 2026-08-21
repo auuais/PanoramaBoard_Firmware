@@ -2458,16 +2458,36 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     int nv16=-1; IR_GetNV(16,&nv16);
     mcu_ui_log(&g_ctx, "Verify FrameRate: NV16=%d\r\n", nv16);
 
+
+
+    // --- Boot defaults (Tenum 640 Software ICD, Table 72) ---
+    // Screen Inversion: Normal (NV#2 Video Invert / NV#3 Video Revert, both disabled)
+    IR_SetNV(2, 0);
+    IR_SetNV(3, 0);
+    // ICE Mode Gain/Level Bias at Power Up (NV#39/#40, ICD default 2047)
+    IR_SetNV(39, 2047);
+    IR_SetNV(40, 2047);
+    // ICE Strength (NV#79, ICD default 3)
+    IR_SetNV(79, 3);
+    // 8-Bit Scene Colorization Color Pallet Selection at power up (NV#45, 0)
+    IR_SetNV(45, 0);
+    // Polarity at Power Up: White-Hot (NV#38, 0=White-Hot)
+    IR_SetNV(38, 0);
+    // Zoom Magnification Power On Value: 1.00x (NV#67, 0=1.00X)
+    IR_SetNV(67, 0);
+    // Temporal Noise Reduction Enable/Threshold (NV#89/#90)
+    IR_SetNV(89, 1);
+    IR_SetNV(90, 6);
+
+
     // --- Genlock slave / input ---
-    IR_SetNV(17, 0);       // NV#17 Genlock Direction = input (slave mode)
-    IR_SetNV(18, 1);       // NV#18 Genlock Mode = 0 (slave)
+        IR_SetNV(17, 0);       // NV#17 Genlock Direction = input (slave mode)
+        IR_SetNV(18, 1);       // NV#18 Genlock Mode = 0 (slave)
 
 
-    int nv17=-1,nv18=-1;
-    IR_GetNV(17,&nv17); IR_GetNV(18,&nv18);
-    mcu_ui_log(&g_ctx, "Verify Genlock: NV17=%d NV18=%d\r\n", nv17, nv18);
-
-
+        int nv17=-1,nv18=-1;
+        IR_GetNV(17,&nv17); IR_GetNV(18,&nv18);
+        mcu_ui_log(&g_ctx, "Verify Genlock: NV17=%d NV18=%d\r\n", nv17, nv18);
 
     if (IR_SetAutoCalibration(0u) != RET_OK) {
         mcu_ui_log(&g_ctx, "IR Camera %d auto NUC disable failed\r\n", camera_num);
