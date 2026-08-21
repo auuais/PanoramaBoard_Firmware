@@ -2358,11 +2358,11 @@ int Initialize_IR_Camera(uint8_t camera_num) {
 
     // Factory reset NV ??restores all NV parameters to defaults before writing ours
     {
-        int r = IR_FactoryResetNV();
-        if (r != 0) {
-            mcu_ui_log(&g_ctx, "IR cam %d: FactoryResetNV FAILED ??continuing anyway\r\n", camera_num);
-        }
-        HAL_Delay(10);
+//        int r = IR_FactoryResetNV();
+//        if (r != 0) {
+//            mcu_ui_log(&g_ctx, "IR cam %d: FactoryResetNV FAILED ??continuing anyway\r\n", camera_num);
+//        }
+//        HAL_Delay(10);
     }
 
     // Enable Verbose Mode
@@ -2429,10 +2429,18 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     IR_SetNV(4, 0);        // NV#4 RS-170 = disable
     IR_SetNV(5, 1);        // NV#5 PDVO = enable
     IR_SetNV(76, 0);
+
     //Spatial Noise Enable 1 & 2
     IR_SetNV(185, 0);
     IR_SetNV(186, 0);
 
+//    Custom Lense calibration enable
+    IR_SetNV(63, 1);
+    IR_SetNV(64, 0);
+
+//    Auto NUC Enable, Interval
+    IR_SetNV(35, 0);
+    IR_SetNV(5, 5);
 
     s_ir_nuc_mode[camera_num] = IR_NUC_MODE_DISABLED;
 //    s_ir_nuc_interval_min[camera_num] = IR_NUC_DEFAULT_INTERVAL_MIN;
