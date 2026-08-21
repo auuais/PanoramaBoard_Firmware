@@ -177,6 +177,7 @@ static uint8_t s_ir_power_on[6] = { 1u, 1u, 1u, 1u, 1u, 1u };
 static uint8_t s_ir_bit_ok[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
 static uint8_t s_ir_cbit_next_idx = 0u;
 static uint8_t s_ir_probe_inflight_cam = 0xFFu;  // 0xFF = no background probe running
+static uint8_t s_ir_pending_boot_nuc[6] = {0u, 0u, 0u, 0u, 0u, 0u};
 static uint32_t s_ir_nuc_status_until_ms[6] = {0};
 static uint8_t s_icd_video_brightness = 0u;
 static uint8_t s_icd_video_contrast = 0u;
@@ -2846,6 +2847,14 @@ static void icd_service_ir_presence_probe(void)
     switch (r) {
         case 1: // completed - present
             s_ir_bit_ok[s_ir_probe_inflight_cam] = 1u;
+            if (s_ir_pending_boot_nuc[s_ir_probe_inflight_cam]) {
+                s_ir_pending_boot_nuc[s_ir_probe_inflight_cam] = 0u;
+                // One-off, triggered by a UI power-on action, not part of the
+                // periodic 1 Hz CBIT sweep - a brief block here (same cost as
+                // the existing manual NUC trigger) is acceptable.
+                (void)Apply_IR_Camera_Param((uint8_t)(s_ir_probe_inflight_cam + 1u),
+                                             PARAM_ID_IR_NUC_TRIGGER, 3u);
+            }
             s_ir_probe_inflight_cam = 0xFFu;
             break;
         case 2: // completed - absent
@@ -3226,6 +3235,13 @@ static uint8_t icd_apply_camera_power_action_single(uint8_t node,
         } else if (node == NODE_IR) {
             s_ir_bit_ok[cam_idx] = 0u;
         }
+    } else if (node == NODE_IR) {
+        // camera_power_set() above is only a GPIO toggle - no handshake or
+        // NV reconfiguration happens on power-on. Flag this camera so the
+        // next background presence probe that confirms it responding also
+        // fires a fresh NUC, since re-powering clears whatever flat-field
+        // calibration it had cached. Consumed in icd_service_ir_presence_probe().
+        s_ir_pending_boot_nuc[cam_idx] = 1u;
     }
 
     return on ? ICD_CAM_ACK_POWER_ON_OK : ICD_CAM_ACK_POWER_OFF_OK;

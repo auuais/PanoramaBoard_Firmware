@@ -2454,7 +2454,7 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     mcu_ui_log(&g_ctx, "Verify PDVO: NV4=%d NV5=%d NV7=%d NV76=%d\r\n", nv4,nv5,nv7,nv76);
 
     // --- 30 fps ---
-    IR_SetNV(16,1);       // NV#16 Frame Rate = 1 => 30 Hz
+    IR_SetNV(16,0);       // NV#16 Frame Rate = 1 => 30 Hz
     int nv16=-1; IR_GetNV(16,&nv16);
     mcu_ui_log(&g_ctx, "Verify FrameRate: NV16=%d\r\n", nv16);
 
@@ -2476,6 +2476,17 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     }
 
     s_ir_camera_present[camera_num] = true;
+
+    // Run an initial 1-point NUC now that the camera is confirmed present and
+    // configured, so it starts up with a fresh flat-field correction instead
+    // of whatever was cached from its last power cycle. Mux is already
+    // pointed at this camera from the init sequence above.
+    if (IR_RunNucTrigger(camera_num, 3u) != RET_OK) {
+        mcu_ui_log(&g_ctx, "IR Camera %d boot NUC failed\r\n", camera_num);
+    } else {
+        mcu_ui_log(&g_ctx, "IR Camera %d boot NUC triggered\r\n", camera_num);
+    }
+
     mcu_ui_log(&g_ctx, "IR Camera %d initialization complete\r\n", camera_num);
     return RET_OK;
 }
