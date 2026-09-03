@@ -2436,7 +2436,7 @@ int Initialize_IR_Camera(uint8_t camera_num) {
 
 //    Custom Lense calibration enable
     IR_SetNV(63, 1);
-    IR_SetNV(64, 0);
+    IR_SetNV(64, 1);
 
 //    Auto NUC Enable, Interval
     IR_SetNV(35, 0);
