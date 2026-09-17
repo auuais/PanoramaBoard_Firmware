@@ -462,6 +462,8 @@ static bool cfg_mode_uses_vsync(uint8_t mode)
     return (mode == 0x01u || mode == 0x02u);
 }
 
+#define CFG_CAM_OFFSET_MAX_CD 1000
+
 static void cfg_set_bank_defaults(ParamBankQ16* bank, uint8_t which)
 {
     if (which == CFG_BANK_IR) {
@@ -477,7 +479,9 @@ static void cfg_set_bank_defaults(ParamBankQ16* bank, uint8_t which)
     }
 
     static const uint16_t kEoYawCd[CFG_CAM_COUNT]   = {     0u,  6000u, 12000u, 18000u, 24000u, 30000u };
-    static const int16_t  kEoPitchCd[CFG_CAM_COUNT] = {  -500,   500,  -500,   500,  -500,   500 };
+    /* Zero, as in parameters_unified.ini [eo_offset].  The old +-500 pattern was
+     * a placeholder the FPGA ignored; the roll/pitch renderer applies it. */
+    static const int16_t  kEoPitchCd[CFG_CAM_COUNT] = {     0,     0,     0,     0,     0,     0 };
     static const int16_t  kEoRollCd[CFG_CAM_COUNT]  = {     0,     0,     0,     0,     0,     0 };
     memcpy(bank->yaw_cd, kEoYawCd, sizeof(kEoYawCd));
     memcpy(bank->pitch_cd, kEoPitchCd, sizeof(kEoPitchCd));
@@ -504,8 +508,10 @@ static bool cfg_bank_values_valid(const ParamBankQ16* bank)
     if (!bank) return false;
 
     for (uint8_t i = 0; i < CFG_CAM_COUNT; ++i) {
-        if (bank->pitch_cd[i] < -500 || bank->pitch_cd[i] > 500) return false;
-        if (bank->roll_cd[i] < -500 || bank->roll_cd[i] > 500) return false;
+        /* The FPGA applies pitch/roll offsets live up to +-10.00 deg
+         * (RpOffsetSync / RpTables clamp to the same limit). */
+        if (bank->pitch_cd[i] < -CFG_CAM_OFFSET_MAX_CD || bank->pitch_cd[i] > CFG_CAM_OFFSET_MAX_CD) return false;
+        if (bank->roll_cd[i] < -CFG_CAM_OFFSET_MAX_CD || bank->roll_cd[i] > CFG_CAM_OFFSET_MAX_CD) return false;
     }
 
     if (bank->overlap_px > 1920u) return false;
@@ -2427,6 +2433,67 @@ static uint8_t icd_apply_eo_maint_u8(uint8_t cam_sel, uint8_t offset, uint16_t p
     return (rc == 0) ? ERR_OK : ((rc == -2) ? ERR_BUSY : ERR_FAIL);
 }
 
+/* Per-camera static pose offsets from the trailing Roll/Pitch/Heading of 0x2204
+ * (SAPC ICD 0.93: three UINT16, 0xFFFF = N/A).  The values are signed
+ * centi-degrees, as 0x2211 reports them.  They apply to the camera(s) named by
+ * each sensor's Selected Cam ID (0 = all six, 1..6 = one camera); a sensor
+ * whose ID is 0xFF is not addressed.  Roll and pitch go to the FPGA, which
+ * rebuilds its panorama tables from them, and are saved to flash.  Heading is
+ * accepted but not applied: the panorama maps are built with the yaw layout
+ * fixed, so a yaw offset has nothing to act on.
+ */
+static uint8_t icd_apply_camera_offsets(uint8_t ir_sel, uint8_t eo_sel,
+                                        uint16_t roll_u, uint16_t pitch_u)
+{
+    const int16_t roll  = (int16_t)roll_u;
+    const int16_t pitch = (int16_t)pitch_u;
+
+    if (roll_u != 0xFFFFu && (roll < -CFG_CAM_OFFSET_MAX_CD || roll > CFG_CAM_OFFSET_MAX_CD)) {
+        return ERR_BADARG;
+    }
+    if (pitch_u != 0xFFFFu && (pitch < -CFG_CAM_OFFSET_MAX_CD || pitch > CFG_CAM_OFFSET_MAX_CD)) {
+        return ERR_BADARG;
+    }
+
+    ParamStoreBlob prev = s_cfg_store;
+    bool pushed_eo = false;
+    bool pushed_ir = false;
+
+    for (uint8_t pass = 0u; pass < 2u; ++pass) {
+        const uint8_t bank = (pass == 0u) ? CFG_BANK_EO : CFG_BANK_IR;
+        const uint8_t sel  = (pass == 0u) ? eo_sel : ir_sel;
+        if (sel > 6u) continue;                          /* 0xFF: not addressed */
+
+        ParamBankQ16* b = cfg_bank_mut(bank);
+        bool changed = false;
+        for (uint8_t i = 0u; i < CFG_CAM_COUNT; ++i) {
+            if (sel != 0u && sel != (uint8_t)(i + 1u)) continue;
+            if (pitch_u != 0xFFFFu && b->pitch_cd[i] != pitch) { b->pitch_cd[i] = pitch; changed = true; }
+            if (roll_u  != 0xFFFFu && b->roll_cd[i]  != roll)  { b->roll_cd[i]  = roll;  changed = true; }
+        }
+        if (!changed) continue;
+
+        if (fpga_push_bank(bank, cfg_bank_const(bank)) != CFG_APPLY_OK) {
+            s_cfg_store = prev;
+            if (pushed_eo) (void)fpga_push_bank(CFG_BANK_EO, cfg_bank_const(CFG_BANK_EO));
+            (void)fpga_push_bank(bank, cfg_bank_const(bank));
+            return ERR_FAIL;
+        }
+        if (bank == CFG_BANK_EO) pushed_eo = true; else pushed_ir = true;
+    }
+
+    if (pushed_eo || pushed_ir) {
+        s_cfg_store.write_count = prev.write_count + 1u;
+        if (!cfg_save_to_flash()) {
+            s_cfg_store = prev;
+            if (pushed_eo) (void)fpga_push_bank(CFG_BANK_EO, cfg_bank_const(CFG_BANK_EO));
+            if (pushed_ir) (void)fpga_push_bank(CFG_BANK_IR, cfg_bank_const(CFG_BANK_IR));
+            return ERR_FAIL;
+        }
+    }
+    return ERR_OK;
+}
+
 static uint8_t icd_apply_maintenance_payload(const uint8_t *payload, uint16_t payload_len)
 {
     if (payload == NULL || payload_len < ICD_MAINT_LEN) {
@@ -2440,6 +2507,23 @@ static uint8_t icd_apply_maintenance_payload(const uint8_t *payload, uint16_t pa
     uint8_t prev[ICD_MAINT_LEN];
     memcpy(prev, s_icd_maintenance_status, ICD_MAINT_LEN);
     memcpy(s_icd_maintenance_status, payload, ICD_MAINT_LEN);
+
+    /* Selected Cam ID 0xFF = N/A (SAPC ICD 0.93): that sensor is not addressed,
+     * so keep its stored fields and selection exactly as they were and none of
+     * them registers as changed.  Used by the pose editor, which addresses one
+     * sensor at a time. */
+    const uint8_t ir_sel_raw = payload[ICD_MAINT_SELECTED_IR_CAM];
+    const uint8_t eo_sel_raw = payload[ICD_MAINT_SELECTED_EO_CAM];
+    if (ir_sel_raw == 0xFFu) {
+        s_icd_maintenance_status[ICD_MAINT_SELECTED_IR_CAM] = prev[ICD_MAINT_SELECTED_IR_CAM];
+        memcpy(&s_icd_maintenance_status[ICD_MAINT_IR_FIELD_OFF],
+               &prev[ICD_MAINT_IR_FIELD_OFF], ICD_MAINT_IR_FIELD_LEN);
+    }
+    if (eo_sel_raw == 0xFFu) {
+        s_icd_maintenance_status[ICD_MAINT_SELECTED_EO_CAM] = prev[ICD_MAINT_SELECTED_EO_CAM];
+        memcpy(&s_icd_maintenance_status[ICD_MAINT_EO_FIELD_OFF],
+               &prev[ICD_MAINT_EO_FIELD_OFF], ICD_MAINT_EO_FIELD_LEN);
+    }
 
     uint8_t overall = ERR_OK;
     uint8_t ir_cam = s_icd_maintenance_status[ICD_MAINT_SELECTED_IR_CAM];
@@ -2638,6 +2722,15 @@ static uint8_t icd_apply_maintenance_payload(const uint8_t *payload, uint16_t pa
     } else {
         memcpy(&s_icd_eo_cam_maint[eo_cam - 1u][ICD_MAINT_EO_FIELD_OFF],
                &s_icd_maintenance_status[ICD_MAINT_EO_FIELD_OFF], ICD_MAINT_EO_FIELD_LEN);
+    }
+
+    if (payload_len >= (uint16_t)(ICD_MAINT_LEN + 6u)) {
+        const uint16_t roll_u  = icd_read_u16(&payload[ICD_MAINT_LEN]);
+        const uint16_t pitch_u = icd_read_u16(&payload[ICD_MAINT_LEN + 2u]);
+        if (roll_u != 0xFFFFu || pitch_u != 0xFFFFu) {
+            err = icd_apply_camera_offsets(ir_sel_raw, eo_sel_raw, roll_u, pitch_u);
+            if (err != ERR_OK) overall = err;
+        }
     }
 
     return overall;
