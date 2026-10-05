@@ -2481,8 +2481,8 @@ int Initialize_IR_Camera(uint8_t camera_num) {
 
 
     // --- Genlock slave / input ---
-        IR_SetNV(17, 0);       // NV#17 Genlock Direction = input (slave mode)
-        IR_SetNV(18, 1);       // NV#18 Genlock Mode = 0 (slave)
+        IR_SetNV(17, 1);       // NV#17 Genlock Direction = input (slave mode)
+        IR_SetNV(18, 0);       // NV#18 Genlock Mode = 0 (slave)
 
 
         int nv17=-1,nv18=-1;
