@@ -33,7 +33,7 @@
 
 #define IR_NUC_MODE_DISABLED          0u
 #define IR_NUC_MODE_AUTO              1u
-#define IR_NUC_DEFAULT_INTERVAL_MIN   3u
+#define IR_NUC_DEFAULT_INTERVAL_MIN   5u
 #define IR_NUC_MIN_INTERVAL_MIN       1u
 #define IR_NUC_MAX_INTERVAL_MIN      10u
 #define IR_NUC_STAGGER_MS            20u
@@ -228,9 +228,14 @@ volatile bool ir_camera_data_received_flag = false;
 volatile uint16_t ir_camera_received_bytes = 0;
 uint8_t ir_camera_rx_buffer[128];
 uint8_t current_ir_camera = 0;  // Currently selected IR camera (0-5)
+/* Periodic NUC is on by default, every IR_NUC_DEFAULT_INTERVAL_MIN minutes.
+ * The MCU drives it (the camera's own auto-calibration stays off, NV#35 = 0 in
+ * the init below), so "enabled" means this scheduler runs a sweep per camera.
+ * The UI can switch a camera off at run time; that choice is not stored, so a
+ * power cycle returns to enabled. */
 static uint8_t s_ir_nuc_mode[6] = {
-    IR_NUC_MODE_DISABLED, IR_NUC_MODE_DISABLED, IR_NUC_MODE_DISABLED,
-    IR_NUC_MODE_DISABLED, IR_NUC_MODE_DISABLED, IR_NUC_MODE_DISABLED
+    IR_NUC_MODE_AUTO, IR_NUC_MODE_AUTO, IR_NUC_MODE_AUTO,
+    IR_NUC_MODE_AUTO, IR_NUC_MODE_AUTO, IR_NUC_MODE_AUTO
 };
 static uint8_t s_ir_nuc_interval_min[6] = {
     IR_NUC_DEFAULT_INTERVAL_MIN, IR_NUC_DEFAULT_INTERVAL_MIN, IR_NUC_DEFAULT_INTERVAL_MIN,
@@ -2442,9 +2447,15 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     IR_SetNV(35, 0);
     IR_SetNV(5, 5);
 
-    s_ir_nuc_mode[camera_num] = IR_NUC_MODE_DISABLED;
-//    s_ir_nuc_interval_min[camera_num] = IR_NUC_DEFAULT_INTERVAL_MIN;
-//    s_ir_nuc_next_due_ms[camera_num] = 0u;
+    /* Keep whatever mode is configured for this camera -- forcing DISABLED
+     * here used to undo the user's choice on every re-init, and would now undo
+     * the default.  The camera has just lost its flat-field calibration, so an
+     * enabled camera starts a fresh interval from now. */
+    if (s_ir_nuc_mode[camera_num] == IR_NUC_MODE_AUTO) {
+        IR_NucScheduleCameraFromNow(camera_num);
+    } else {
+        s_ir_nuc_next_due_ms[camera_num] = 0u;
+    }
 
 
 
