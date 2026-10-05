@@ -36,7 +36,6 @@
 #define IR_NUC_DEFAULT_INTERVAL_MIN   5u
 #define IR_NUC_MIN_INTERVAL_MIN       1u
 #define IR_NUC_MAX_INTERVAL_MIN      10u
-#define IR_NUC_STAGGER_MS            20u
 
 /* IIM-46234 command packets are always exactly 20 bytes (from ATMEL ref SIZE_PACKET_CMD) */
 #define IMU_CMD_PACKET_SIZE  20u
@@ -1648,44 +1647,47 @@ static bool IR_TargetIsPresent(uint8_t camera_sel)
     return s_ir_camera_present[camera_sel - 1u];
 }
 
-static int IR_RunNucTrigger(uint8_t camera_num, uint16_t trigger_value)
+/* NUC is fire and forget: send the shutter command and move on.  Waiting for
+ * the ACK cost up to 500 ms per camera and the sweep added a 20 ms stagger on
+ * top, so a six-camera sweep could block the main loop for seconds; the
+ * cameras were already observed to actuate the shutter when the ACK does not
+ * come back, and the old code treated that timeout as success anyway, so the
+ * ACK told us nothing.  The cameras now fire as close together as the mux
+ * allows.
+ *
+ * Any ACK that does arrive is left in the RX buffer; every command that waits
+ * for one calls IR_ArmRx() first, which clears it. */
+static int IR_FireNucTrigger(uint8_t camera_num, uint16_t trigger_value)
 {
     uint8_t p[2] = { 0x00u, (uint8_t)trigger_value };
-    uint16_t ack_code = 0u;
 
     if (camera_num >= 6u || !s_ir_camera_present[camera_num]) {
         return RET_ERR_RX;
     }
 
-    IR_ArmRx();
-    if (Send_IR_Camera_Command(0x27u, p, 2u) != RET_OK) {
-        return RET_ERR_TX;
+    select_ir_camera(camera_num);
+    return Send_IR_Camera_Command(0x27u, p, 2u);
+}
+
+static int IR_FireDisableAutoNuc(uint8_t camera_num)
+{
+    uint8_t p[2] = { 0x00u, 0x00u };
+
+    if (camera_num >= 6u || !s_ir_camera_present[camera_num]) {
+        return RET_ERR_RX;
     }
 
-    if (IR_WaitPacket(500u) != 0) {
-        /* This command is observed to actuate the shutter on current cameras
-         * even when the protocol ACK is not returned. Treat timeout as
-         * accepted for known-present cameras so the operator-visible action
-         * is not falsely reported as failure. */
-        return RET_OK;
-    }
-
-    if (IR_FindPacket(0x02, 0x02, &ack_code) == 0 && ack_code == 0x27u) {
-        return RET_OK;
-    }
-
-    return RET_OK;
+    select_ir_camera(camera_num);
+    return Send_IR_Camera_Command(0x26u, p, 2u);
 }
 
 static int IR_DisableAutoNucCamera(uint8_t camera_num)
 {
     if (camera_num >= 6u) return RET_ERR_RX;
 
-    select_ir_camera(camera_num);
-    if (IR_SetAutoCalibration(0u) != RET_OK) {
-        return RET_ERR_RX;
-    }
-    return RET_OK;
+    /* Sent, not waited for, like the trigger: it precedes every sweep and its
+     * ACK gates nothing. */
+    return (IR_FireDisableAutoNuc(camera_num) == RET_OK) ? RET_OK : RET_ERR_RX;
 }
 
 static int IR_DisableAutoNucTargets(uint8_t camera_sel)
@@ -1729,17 +1731,15 @@ static int IR_RunSequentialNucSweep(uint8_t camera_sel, const char *reason, uint
         if (!s_ir_camera_present[cam]) {
             continue;
         }
-        select_ir_camera(cam);
-        int rc = IR_RunNucTrigger(cam, trigger_value);
+        int rc = IR_FireNucTrigger(cam, trigger_value);
         if (rc != RET_OK) {
             if (first_error == RET_OK) first_error = rc;
-            snprintf(msg, sizeof(msg), "IR NUC cam %u trigger failed rc=%d\r\n",
+            snprintf(msg, sizeof(msg), "IR NUC cam %u send failed rc=%d\r\n",
                      (unsigned)cam, rc);
             mcu_ui_log(&g_ctx, "%s", msg);
         } else {
             success_count++;
         }
-        HAL_Delay(IR_NUC_STAGGER_MS);
     }
 
     if (success_count > 0u) {
@@ -2512,7 +2512,7 @@ int Initialize_IR_Camera(uint8_t camera_num) {
     // configured, so it starts up with a fresh flat-field correction instead
     // of whatever was cached from its last power cycle. Mux is already
     // pointed at this camera from the init sequence above.
-    if (IR_RunNucTrigger(camera_num, 3u) != RET_OK) {
+    if (IR_FireNucTrigger(camera_num, 3u) != RET_OK) {
         mcu_ui_log(&g_ctx, "IR Camera %d boot NUC failed\r\n", camera_num);
     } else {
         mcu_ui_log(&g_ctx, "IR Camera %d boot NUC triggered\r\n", camera_num);
